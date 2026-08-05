@@ -3,7 +3,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pi
 
 // Imports do Firebase (SDK Modular)
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc } from "firebase/firestore";
+import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc } from "firebase/firestore";
 
 // Suas chaves de acesso ao Firebase
 const firebaseConfig = {
@@ -68,8 +68,11 @@ function App() {
   const [novoVendedorNome, setNovoVendedorNome] = useState('');
   const [mostrarFormAdmin, setMostrarFormAdmin] = useState(null); 
   const [novoMotivo, setNovoMotivo] = useState('');
-  
   const [erroPermissaoFirebase, setErroPermissaoFirebase] = useState(false); 
+
+  // Novos estados para edição dinâmica de Telefones
+  const [editandoTels, setEditandoTels] = useState(false);
+  const [telsTemp, setTelsTemp] = useState([]);
 
   const [loteForm, setLoteForm] = useState({ uf: '', cidade: '', atual: 'TODOS', novoResponsavel: '' });
   const [leadsSelecionadosLote, setLeadsSelecionadosLote] = useState([]);
@@ -78,6 +81,15 @@ function App() {
   const [modalFinalizar, setModalFinalizar] = useState(null); 
   const [motivoPerda, setMotivoPerda] = useState('');
   const [draggedLeadId, setDraggedLeadId] = useState(null);
+
+  // Controle de exclusão
+  const [leadParaExcluir, setLeadParaExcluir] = useState(null);
+
+  // Resetar a edição de telefones ao trocar de cliente
+  useEffect(() => {
+      setEditandoTels(false);
+      setTelsTemp([]);
+  }, [leadSelecionadoId]);
 
   useEffect(() => {
     const lidarComErroFirebase = (error) => {
@@ -190,6 +202,28 @@ function App() {
     return (l.nome?.toLowerCase().includes(termo) || l['CPF/CNPJ']?.includes(termo) || l.cidade?.toLowerCase().includes(termo) || l.uf?.toLowerCase().includes(termo) || l.telefone?.includes(termo));
   });
 
+  // Função Robusta para ler CSV: Ignora os separadores (;) que estiverem dentro de aspas duplas
+  const parseCSVLine = (text, delimiter) => {
+    let ret = [];
+    let inQuote = false;
+    let value = '';
+    for (let i = 0; i < text.length; i++) {
+        let ch = text[i];
+        if (inQuote) {
+            if (ch === '"') {
+                if (i + 1 < text.length && text[i+1] === '"') { value += '"'; i++; } 
+                else { inQuote = false; }
+            } else { value += ch; }
+        } else {
+            if (ch === '"') { inQuote = true; } 
+            else if (ch === delimiter) { ret.push(value.trim()); value = ''; } 
+            else { value += ch; }
+        }
+    }
+    ret.push(value.trim());
+    return ret;
+  };
+
   const lidarUploadCSV = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -199,12 +233,12 @@ function App() {
       setUploadProgresso('Lendo arquivo CSV...');
       const lines = event.target.result.split('\n');
       const delimiter = lines[0].includes(';') ? ';' : ',';
-      const headers = lines[0].split(delimiter).map(h => h.trim().replace(/"/g, ''));
+      const headers = parseCSVLine(lines[0], delimiter).map(h => h.replace(/"/g, ''));
       
       const novosLeads = [];
       for (let i = 1; i < lines.length; i++) {
         if (!lines[i].trim() || lines[i].replace(/;/g, '').trim() === '') continue;
-        const currentLine = lines[i].split(delimiter).map(val => val.trim().replace(/"/g, ''));
+        const currentLine = parseCSVLine(lines[i], delimiter).map(val => val.replace(/"/g, ''));
         if (currentLine.length < 2) continue;
         
         let obj = { etapa_funil: ETAPAS.LEAD, data_criacao: Date.now() };
@@ -212,13 +246,20 @@ function App() {
           if (h.toLowerCase() !== 'id' && h.trim() !== '') {
             let keyName = h;
             let hLower = h.toLowerCase();
+            let val = currentLine[idx] || '';
             
             // Mapeamento Inteligente: Reconhece colunas de Vendedor e vincula automático
             if (hLower === 'vendedor_responsavel' || hLower === 'vendedor responsável' || hLower === 'responsavel' || hLower === 'vendedor') {
                 keyName = 'responsavel';
             }
             
-            obj[keyName] = currentLine[idx] || '';
+            // Scanner de Telefones: Separa os múltiplos números em uma Lista (Array)
+            if (hLower === 'telefone' || hLower === 'telefones' || hLower === 'celular' || hLower === 'contato') {
+                obj.telefones = val.split(/[;,\/]+/).map(t => t.trim()).filter(t => t !== '');
+                obj.telefone = obj.telefones[0] || ''; // Mantém o principal
+            } else {
+                obj[keyName] = val;
+            }
           }
         });
         
@@ -793,9 +834,16 @@ function App() {
                          {leadAtual['CPF/CNPJ'] || 'Documento Não Informado'}
                        </span>
                     </div>
-                    <span className="px-3 md:px-4 py-1.5 bg-[#eef2ff] text-[#4338ca] text-[10px] md:text-xs font-bold rounded-xl border border-[#c7d2fe] shadow-sm">
-                      Dono da Carteira: {leadAtual.responsavel || 'Sem dono'}
-                    </span>
+                    <div className="flex gap-2">
+                        <span className="px-3 md:px-4 py-1.5 bg-[#eef2ff] text-[#4338ca] text-[10px] md:text-xs font-bold rounded-xl border border-[#c7d2fe] shadow-sm">
+                          Dono da Carteira: {leadAtual.responsavel || 'Sem dono'}
+                        </span>
+                        {isAdmin && (
+                            <button onClick={() => setLeadParaExcluir(leadAtual)} className="px-3 md:px-4 py-1.5 bg-red-50 text-red-600 hover:bg-red-600 hover:text-white text-[10px] md:text-xs font-bold rounded-xl border border-red-200 transition-colors shadow-sm">
+                                Excluir Revenda
+                            </button>
+                        )}
+                    </div>
                   </div>
                   
                   <h1 className="text-3xl md:text-5xl font-black text-[#0f172a] mb-6 md:mb-8 tracking-tight">{leadAtual.nome || 'Sem Nome'}</h1>
@@ -805,9 +853,54 @@ function App() {
                       <div className="text-slate-400">📍</div>
                       <span className="font-semibold text-slate-700 text-sm md:text-lg">{leadAtual.cidade || '-'} - {leadAtual.uf || '-'}</span>
                     </div>
-                    <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
-                      <div className="text-slate-400">📞</div>
-                      <span className="font-semibold text-slate-700 text-sm md:text-lg">{leadAtual.telefone || 'Sem telefone'}</span>
+                    
+                    <div className="bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
+                      <div className="flex justify-between items-center mb-3">
+                         <div className="flex items-center gap-2 text-slate-400">
+                             📞 <span className="text-xs font-bold uppercase tracking-wider">Telefones</span>
+                         </div>
+                         {!editandoTels ? (
+                             <button onClick={() => { setTelsTemp(leadAtual.telefones?.length > 0 ? [...leadAtual.telefones] : (leadAtual.telefone ? [leadAtual.telefone] : [])); setEditandoTels(true); }} className="bg-white border border-slate-200 text-blue-600 px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-blue-50 transition-colors">Editar</button>
+                         ) : (
+                             <div className="flex gap-2">
+                                 <button onClick={() => setEditandoTels(false)} className="bg-white border border-slate-200 text-slate-500 px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-slate-50">Cancelar</button>
+                                 <button onClick={async () => {
+                                     const limpos = telsTemp.map(t => t.trim()).filter(t => t !== '');
+                                     try {
+                                         await updateDoc(doc(db, "leads", leadAtual.id), { telefones: limpos, telefone: limpos[0] || '' });
+                                         setEditandoTels(false);
+                                         mostrarMensagem('Telefones salvos!');
+                                     } catch(e) { mostrarMensagem('Erro ao salvar', true); }
+                                 }} className="bg-emerald-500 text-white px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-emerald-600">Salvar</button>
+                             </div>
+                         )}
+                      </div>
+                      
+                      {!editandoTels ? (
+                         <div className="flex flex-col gap-2">
+                             {(() => {
+                                 const displayTels = leadAtual.telefones?.length > 0 ? leadAtual.telefones : (leadAtual.telefone ? [leadAtual.telefone] : []);
+                                 if (displayTels.length === 0) return <span className="font-semibold text-slate-700 text-sm md:text-base">Sem telefone cadastrado</span>;
+                                 
+                                 return displayTels.map((tel, idx) => (
+                                     <a key={idx} href={`https://wa.me/55${tel.replace(/\D/g, '')}`} target="_blank" rel="noreferrer" className="font-semibold text-slate-700 text-sm md:text-base hover:text-blue-600 flex items-center gap-2 bg-white p-2.5 rounded-xl border border-slate-200 shadow-sm w-fit transition-all hover:border-blue-300">
+                                         {tel}
+                                         <span className="text-[10px] bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-bold">WhatsApp</span>
+                                     </a>
+                                 ));
+                             })()}
+                         </div>
+                      ) : (
+                         <div className="flex flex-col gap-2">
+                             {telsTemp.map((tel, idx) => (
+                                 <div key={idx} className="flex gap-2 items-center">
+                                     <input type="text" className="flex-1 border-2 border-slate-200 p-2.5 rounded-xl text-sm font-semibold outline-none focus:border-blue-500 bg-white" value={tel} onChange={e => { const n = [...telsTemp]; n[idx] = e.target.value; setTelsTemp(n); }} placeholder="Ex: 11999999999" />
+                                     <button onClick={() => { const n = [...telsTemp]; n.splice(idx, 1); setTelsTemp(n); }} className="bg-red-50 text-red-500 hover:bg-red-100 p-2.5 rounded-xl font-bold transition-colors">✕</button>
+                                 </div>
+                             ))}
+                             <button onClick={() => setTelsTemp([...telsTemp, ''])} className="mt-1 text-xs font-bold text-blue-600 bg-blue-50 border border-blue-100 py-3 rounded-xl hover:bg-blue-100 transition-colors border-dashed w-full text-center">+ Adicionar Número</button>
+                         </div>
+                      )}
                     </div>
                   </div>
 
@@ -997,6 +1090,31 @@ function App() {
               <button onClick={() => setModalFinalizar(null)} className="flex-1 px-4 py-3 md:py-3.5 bg-slate-100 text-slate-600 font-bold rounded-xl hover:bg-slate-200 text-sm md:text-base">Cancelar</button>
               <button onClick={processarFinalizacao} className={`flex-1 px-4 py-3 md:py-3.5 text-white font-bold rounded-xl shadow-md text-sm md:text-base ${modalFinalizar.type === 'ganho' ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-red-600 hover:bg-red-500'}`}>
                 Confirmar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Excluir Lead (Somente Admin) */}
+      {leadParaExcluir && (
+        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[70] p-4 backdrop-blur-sm">
+          <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl border-t-8 border-red-500">
+            <h3 className="text-xl md:text-2xl font-black mb-2 text-slate-900">Excluir Revenda</h3>
+            <p className="text-slate-600 mb-6 font-medium text-sm md:text-base">Tem certeza que deseja excluir <strong>{leadParaExcluir.nome}</strong>? Esta ação apagará todo o histórico e não poderá ser desfeita.</p>
+            <div className="flex gap-3">
+              <button onClick={() => setLeadParaExcluir(null)} className="flex-1 px-4 py-3 md:py-3.5 bg-slate-100 text-slate-600 font-bold rounded-xl hover:bg-slate-200 text-sm md:text-base">Cancelar</button>
+              <button onClick={async () => {
+                  try {
+                      await deleteDoc(doc(db, "leads", leadParaExcluir.id));
+                      setLeadSelecionadoId(null);
+                      setLeadParaExcluir(null);
+                      mostrarMensagem('Revenda excluída permanentemente!');
+                  } catch(e) { 
+                      mostrarMensagem('Erro ao excluir revenda.', true); 
+                  }
+              }} className="flex-1 px-4 py-3 md:py-3.5 text-white font-bold rounded-xl shadow-md bg-red-600 hover:bg-red-700 text-sm md:text-base">
+                Sim, Excluir
               </button>
             </div>
           </div>
