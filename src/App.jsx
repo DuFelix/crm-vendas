@@ -1,11 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, CartesianGrid, Legend, LabelList } from 'recharts';
 
-// Imports do Firebase (SDK Modular)
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc } from "firebase/firestore";
 
-// Suas chaves de acesso ao Firebase
 const firebaseConfig = {
   apiKey: "AIzaSyDJs8Gzdb2eaop_7NLFb7qSuIduyhE5DDs",
   authDomain: "crm-vendas-4f4d2.firebaseapp.com",
@@ -36,7 +34,6 @@ const DEFAULT_MOTIVOS_PERDA = [
   '[OPERACIONAL] Exclusividade com a bandeira da distribuidora'
 ];
 
-// Paleta de Cores Oficiais do Brand Book
 const BRAND = {
   blue: '#2D6FEF',
   blueDark: '#1B438F',
@@ -111,12 +108,12 @@ const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
            const marker = window.L.marker([lat, lng], { icon: customIcon }).addTo(map);
            marker.on('click', () => onMarkerClick(lead.id));
         } else {
-           let color = BRAND.gray; // 1. Lead (Cinza Mediano Oficial)
+           let color = BRAND.gray;
            if (lead.etapa_funil === ETAPAS.APRESENTACAO) color = BRAND.blueLight; 
-           else if (lead.etapa_funil === ETAPAS.NEGOCIACAO) color = BRAND.yellow; // Amarelo Caramelo
-           else if (lead.etapa_funil === ETAPAS.CADASTRO) color = BRAND.blue; // Azul Principal
+           else if (lead.etapa_funil === ETAPAS.NEGOCIACAO) color = BRAND.yellow;
+           else if (lead.etapa_funil === ETAPAS.CADASTRO) color = BRAND.blue;
            else if (lead.etapa_funil === ETAPAS.TREINAMENTO) color = BRAND.blueDark; 
-           else if (lead.status_venda === 'Perdido') color = '#ef4444'; // Vermelho Semântico
+           else if (lead.status_venda === 'Perdido') color = '#ef4444';
 
            const marker = window.L.circleMarker([lat, lng], {
              radius: 8,
@@ -154,6 +151,7 @@ function App() {
   
   const [leadSelecionadoId, setLeadSelecionadoId] = useState(null);
   const [busca, setBusca] = useState('');
+  const [filtroDistribuidora, setFiltroDistribuidora] = useState('todas');
   
   const [visaoAtual, setVisaoAtual] = useState('lista'); 
   const [visaoAnterior, setVisaoAnterior] = useState('lista'); 
@@ -188,10 +186,10 @@ function App() {
   const [veioDoMapa, setVeioDoMapa] = useState(false);
 
   const [modalNovoLead, setModalNovoLead] = useState(false);
-  const [formNovoLead, setFormNovoLead] = useState({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '' });
+  const [formNovoLead, setFormNovoLead] = useState({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '', distribuidora: '' });
 
   const [modalLote, setModalLote] = useState(false);
-  const [loteFiltros, setLoteFiltros] = useState({ uf: '', cidade: '', etapa: '', responsavel: '' });
+  const [loteFiltros, setLoteFiltros] = useState({ uf: '', cidade: '', etapa: '', responsavel: '', distribuidora: '' });
   const [loteSelecionados, setLoteSelecionados] = useState([]);
   const [loteNovoResponsavel, setLoteNovoResponsavel] = useState('');
 
@@ -325,10 +323,25 @@ function App() {
   const leadsFiltradosGeral = leads.filter(l => {
     const matchDono = isAdmin || (l.responsavel && l.responsavel.toLowerCase() === vendedor.toLowerCase());
     if (!matchDono) return false;
+
+    const dist = l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira || '';
+    if (filtroDistribuidora !== 'todas' && dist.toLowerCase() !== filtroDistribuidora.toLowerCase()) {
+      return false;
+    }
+
     if (!busca) return true;
     const termo = busca.toLowerCase();
-    return (l.nome?.toLowerCase().includes(termo) || l['CPF/CNPJ']?.includes(termo) || l.cidade?.toLowerCase().includes(termo) || l.uf?.toLowerCase().includes(termo) || l.telefone?.includes(termo));
+    return (
+      l.nome?.toLowerCase().includes(termo) ||
+      l['CPF/CNPJ']?.includes(termo) ||
+      l.cidade?.toLowerCase().includes(termo) ||
+      l.uf?.toLowerCase().includes(termo) ||
+      l.telefone?.includes(termo) ||
+      dist.toLowerCase().includes(termo)
+    );
   });
+
+  const listaDistribuidoras = [...new Set(leads.map(l => l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira).filter(Boolean))].sort();
 
   const parseCSVLine = (text, delimiter) => {
     let ret = [];
@@ -378,6 +391,9 @@ function App() {
             if (hLower === 'vendedor_responsavel' || hLower === 'vendedor responsável' || hLower === 'responsavel' || hLower === 'vendedor') {
                 keyName = 'responsavel';
             }
+            if (hLower === 'distribuidora' || hLower === 'bandeira' || hLower === 'distribuidor' || hLower === 'marca') {
+                keyName = 'distribuidora';
+            }
             if (hLower === 'telefone' || hLower === 'telefones' || hLower === 'celular' || hLower === 'contato') {
                 obj.telefones = val.split(/[;,\/]+/).map(t => t.trim()).filter(t => t !== '');
                 obj.telefone = obj.telefones[0] || ''; 
@@ -390,6 +406,7 @@ function App() {
         if (!obj.nome && obj.Nome) obj.nome = obj.Nome;
         if (!obj.cidade && obj.Cidade) obj.cidade = obj.Cidade;
         if (!obj.uf && obj.UF) obj.uf = obj.UF;
+        if (!obj.distribuidora && obj.Bandeira) obj.distribuidora = obj.Bandeira;
         
         if (obj.nome && obj.nome !== 'Sem Nome' && obj.nome !== '') novosLeads.push(obj);
       }
@@ -427,13 +444,13 @@ function App() {
       histFiltrado = historicoGeral.filter(h => h.timestamp >= umaSemanaAtras.getTime());
     }
 
-    let csvContent = "Data,Vendedor,Revenda,CNPJ,Cidade,UF,Etapa Funil,Status Venda,Motivo Perda,Canal,Pessoa Contatada,Observacao\n";
+    let csvContent = "Data,Vendedor,Revenda,CNPJ,Distribuidora,Cidade,UF,Etapa Funil,Status Venda,Motivo Perda,Canal,Pessoa Contatada,Observacao\n";
     
     histFiltrado.forEach(h => {
       const lead = leads.find(l => l.id === h.id_lead) || {};
       const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
       
-      csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(lead.nome)},${limpaStr(lead['CPF/CNPJ'])},${limpaStr(lead.cidade)},${limpaStr(lead.uf)},${limpaStr(lead.etapa_funil)},${limpaStr(lead.status_venda)},${limpaStr(lead.motivo_perda)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
+      csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(lead.nome)},${limpaStr(lead['CPF/CNPJ'])},${limpaStr(lead.distribuidora || lead.bandeira)},${limpaStr(lead.cidade)},${limpaStr(lead.uf)},${limpaStr(lead.etapa_funil)},${limpaStr(lead.status_venda)},${limpaStr(lead.motivo_perda)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
     });
 
     const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: "text/csv;charset=utf-8;" });
@@ -504,13 +521,14 @@ function App() {
         telefone: formNovoLead.telefone,
         telefones: formNovoLead.telefone ? [formNovoLead.telefone] : [],
         'CPF/CNPJ': formNovoLead.cnpj,
+        distribuidora: formNovoLead.distribuidora,
         cidade: formNovoLead.cidade,
         uf: formNovoLead.uf,
         etapa_funil: ETAPAS.LEAD,
         data_criacao: Date.now(),
         responsavel: isAdmin ? '' : vendedor 
       });
-      setFormNovoLead({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '' });
+      setFormNovoLead({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '', distribuidora: '' });
       setModalNovoLead(false);
       mostrarMensagem('Novo lead cadastrado com sucesso!');
     } catch(e) {
@@ -671,7 +689,7 @@ function App() {
 
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
-         <button onClick={voltarVisao} className={`mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold text-[${BRAND.gray}] hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit`}>
+         <button onClick={voltarVisao} className={`mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit`} style={{color: BRAND.gray}}>
             ← Voltar
          </button>
          <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
@@ -829,7 +847,6 @@ function App() {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-100 w-full" style={{backgroundColor: BRAND.blueLight}}>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700;800&display=swap'); * { font-family: 'Lexend', sans-serif; }`}</style>
-        {/* Forma de "Janela" Appgas (Canto Superior Direito e Inferior Esquerdo Retos, Resto Arredondado) */}
         <div className="bg-white p-6 md:p-10 shadow-2xl w-full mx-4 max-w-md text-center relative overflow-hidden rounded-tl-[40px] rounded-br-[40px] rounded-tr-xl rounded-bl-xl border-t-8" style={{borderTopColor: BRAND.blue}}>
           <div className="mb-6 flex justify-center mt-2">
             <div className="w-16 h-16 rounded-2xl shadow-lg text-white font-black text-2xl flex items-center justify-center rotate-3" style={{backgroundColor: BRAND.blue}}>
@@ -905,19 +922,32 @@ function App() {
             <span className="text-[10px] md:text-xs font-bold text-white">{leadsFiltradosGeral.length} revendas</span>
           </div>
 
-          <div className="relative">
-            <input type="text" placeholder="Buscar revenda ou documento..." className="w-full text-[11px] md:text-sm border border-white/20 text-white p-3 md:p-3.5 pl-9 md:pl-10 rounded-xl focus:outline-none placeholder-white/50 font-medium shadow-inner" style={{backgroundColor: BRAND.blueDark}} value={busca} onChange={(e) => setBusca(e.target.value)} />
+          <div className="relative mb-2">
+            <input type="text" placeholder="Buscar revenda, doc ou distribuidora..." className="w-full text-[11px] md:text-sm border border-white/20 text-white p-3 md:p-3.5 pl-9 md:pl-10 rounded-xl focus:outline-none placeholder-white/50 font-medium shadow-inner" style={{backgroundColor: BRAND.blueDark}} value={busca} onChange={(e) => setBusca(e.target.value)} />
             <svg className="w-4 h-4 text-white/50 absolute left-3 md:left-3.5 top-3 md:top-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
           </div>
-        </div>
 
-        <div className="md:hidden p-4 text-white shrink-0" style={{backgroundColor: BRAND.blue}}>
-           <div className="relative">
-            <input type="text" placeholder="Buscar revenda ou documento..." className="w-full text-xs border border-white/20 text-white p-3 pl-9 rounded-xl focus:outline-none placeholder-white/50 font-medium" style={{backgroundColor: BRAND.blueDark}} value={busca} onChange={(e) => setBusca(e.target.value)} />
-            <svg className="w-4 h-4 text-white/50 absolute left-3 top-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+          {/* Filtro de Distribuidoras */}
+          <div className="relative">
+            <select className="w-full text-[11px] md:text-xs font-bold border border-white/20 text-white p-2.5 rounded-xl outline-none shadow-inner cursor-pointer" style={{backgroundColor: BRAND.blueDark}} value={filtroDistribuidora} onChange={e => setFiltroDistribuidora(e.target.value)}>
+               <option value="todas">🏢 Distribuidora: Todas</option>
+               {listaDistribuidoras.map(d => <option key={d} value={d}>🏢 {d}</option>)}
+            </select>
           </div>
         </div>
 
+        <div className="md:hidden p-4 text-white shrink-0 space-y-2" style={{backgroundColor: BRAND.blue}}>
+           <div className="relative">
+            <input type="text" placeholder="Buscar revenda, doc ou distribuidora..." className="w-full text-xs border border-white/20 text-white p-3 pl-9 rounded-xl focus:outline-none placeholder-white/50 font-medium" style={{backgroundColor: BRAND.blueDark}} value={busca} onChange={(e) => setBusca(e.target.value)} />
+            <svg className="w-4 h-4 text-white/50 absolute left-3 top-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+          </div>
+          <select className="w-full text-xs font-bold border border-white/20 text-white p-2.5 rounded-xl outline-none" style={{backgroundColor: BRAND.blueDark}} value={filtroDistribuidora} onChange={e => setFiltroDistribuidora(e.target.value)}>
+             <option value="todas">🏢 Distribuidora: Todas</option>
+             {listaDistribuidoras.map(d => <option key={d} value={d}>🏢 {d}</option>)}
+          </select>
+        </div>
+
+        {/* Views Tabs Navigation */}
         <div className="flex bg-slate-100 p-1.5 mx-4 mt-4 rounded-xl gap-1 shrink-0 overflow-x-auto relative">
           <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' && !leadAtual ? BRAND.blue : BRAND.gray}}>Lista</button>
           <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' && !leadAtual ? BRAND.blue : BRAND.gray}}>Kanban</button>
@@ -926,6 +956,7 @@ function App() {
           <button onClick={() => mudarVisao('appgas')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'appgas' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'appgas' ? BRAND.blue : BRAND.gray}}>Appgas</button>
         </div>
 
+        {/* Sidebar Action Buttons */}
         <div className="px-4 py-3 shrink-0 border-b border-slate-100">
            <button onClick={() => { setModalNovoLead(true); fecharMenuMobile(); }} className="w-full text-white text-[10px] md:text-xs font-bold py-2.5 md:py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-all hover:-translate-y-0.5 mb-2" style={{backgroundColor: BRAND.blue}}>
              + Cadastrar Novo Lead
@@ -951,14 +982,25 @@ function App() {
           )}
         </div>
 
+        {/* Render Leads List View */}
         {!leadAtual && visaoAtual === 'lista' && (
           <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
             {leadsFiltradosGeral.slice(0, 100).map(lead => {
               const urg = getUrgency(lead);
+              const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
               return (
                 <div key={lead.id} onClick={() => { setLeadSelecionadoId(lead.id); setVeioDoMapa(false); fecharMenuMobile(); }} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
                   <h3 className="font-bold text-xs md:text-sm mb-1 truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
-                  <p className="text-[10px] md:text-xs mb-3 truncate" style={{color: BRAND.gray}}>{lead.cidade ? `${lead.cidade} - ${lead.uf}` : '-'}</p>
+                  
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    <p className="text-[10px] md:text-xs truncate" style={{color: BRAND.gray}}>{lead.cidade ? `📍 ${lead.cidade} - ${lead.uf}` : '-'}</p>
+                    {distNome && (
+                       <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate">
+                          🏢 {distNome}
+                       </span>
+                    )}
+                  </div>
+
                   <div className="flex justify-between items-center mb-2">
                     <span className={`px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase ${lead.telefone ? 'bg-[#f0fdf4] text-[#166534] border-[#bbf7d0]' : 'bg-slate-50 text-slate-500 border-slate-200'}`}>{lead.telefone ? 'Com Tel' : 'Sem Tel'}</span>
                     <span className="text-[9px] md:text-[10px] font-extrabold uppercase px-2 py-1 rounded-lg border" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue, borderColor: `${BRAND.blue}30`}}>{lead.responsavel || 'SEM DONO'}</span>
@@ -1022,13 +1064,21 @@ function App() {
                   
                   <h1 className="text-3xl md:text-5xl font-black mb-6 md:mb-8 tracking-tight" style={{color: BRAND.black}}>{leadAtual.nome || 'Sem Nome'}</h1>
                   
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 md:gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
                     <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
                       <div className="text-slate-400">📍</div>
-                      <span className="font-semibold text-sm md:text-lg" style={{color: BRAND.black}}>{leadAtual.cidade || '-'} - {leadAtual.uf || '-'}</span>
+                      <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.cidade || '-'} - {leadAtual.uf || '-'}</span>
+                    </div>
+
+                    <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
+                      <div className="text-blue-500">🏢</div>
+                      <div>
+                        <p className="text-[10px] uppercase font-bold" style={{color: BRAND.gray}}>Distribuidora</p>
+                        <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.distribuidora || leadAtual.bandeira || 'Não informada'}</span>
+                      </div>
                     </div>
                     
-                    <div className="bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
+                    <div className="bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9] sm:col-span-2 md:col-span-1">
                       <div className="flex justify-between items-center mb-3">
                          <div className="flex items-center gap-2" style={{color: BRAND.gray}}>
                              📞 <span className="text-xs font-bold uppercase tracking-wider">Telefones</span>
@@ -1168,9 +1218,14 @@ function App() {
                   <div className="flex-1 overflow-y-auto p-2 md:p-3 space-y-3 md:space-y-4">
                     {leadsEtapa.map(lead => {
                       const urg = getUrgency(lead);
+                      const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
                       return (
                         <div key={lead.id} draggable onDragStart={(e) => setDraggedLeadId(lead.id)} className={`bg-white p-4 md:p-5 rounded-xl md:rounded-2xl border-2 shadow-sm cursor-grab ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400' : 'border-[#e2e8f0]'}`}>
-                          <div className="text-[9px] md:text-[10px] font-black uppercase bg-slate-50 px-2 py-1 rounded-md mb-2 truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</div>
+                          <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-slate-50 px-2 py-1 rounded-md mb-2">
+                             <span className="truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</span>
+                             {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
+                          </div>
+                          
                           <h4 className="font-black text-sm md:text-base mb-2 md:mb-3 leading-tight truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h4>
                           <div className={`text-[10px] md:text-[11px] font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg mb-3 md:mb-4 text-center border ${urg.css}`}>{urg.texto}</div>
                           
@@ -1363,7 +1418,7 @@ function App() {
            </div>
         )}
 
-      {/* Modais */}
+      {}
       {modalFinalizar && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
           <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl">
@@ -1456,6 +1511,7 @@ function App() {
                <input type="text" placeholder="Nome do Cliente / Revenda *" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.nome} onChange={e => setFormNovoLead({...formNovoLead, nome: e.target.value})} />
                <input type="text" placeholder="WhatsApp / Telefone" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.telefone} onChange={e => setFormNovoLead({...formNovoLead, telefone: e.target.value})} />
                <input type="text" placeholder="CPF ou CNPJ" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.cnpj} onChange={e => setFormNovoLead({...formNovoLead, cnpj: e.target.value})} />
+               <input type="text" placeholder="Distribuidora / Bandeira (Ex: Ultragaz, Liquigás...)" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.distribuidora} onChange={e => setFormNovoLead({...formNovoLead, distribuidora: e.target.value})} />
                <div className="flex gap-3">
                  <input type="text" placeholder="Cidade" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.cidade} onChange={e => setFormNovoLead({...formNovoLead, cidade: e.target.value})} />
                  <input type="text" placeholder="UF" className="w-24 border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none text-center" style={{color: BRAND.black}} value={formNovoLead.uf} maxLength={2} onChange={e => setFormNovoLead({...formNovoLead, uf: e.target.value.toUpperCase()})} />
@@ -1472,15 +1528,16 @@ function App() {
         </div>
       )}
 
+      {}
       {modalLote && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
-          <div className="bg-white rounded-3xl max-w-3xl w-full shadow-2xl flex flex-col max-h-[90vh] overflow-hidden border-t-8" style={{borderTopColor: BRAND.yellow}}>
+          <div className="bg-white rounded-3xl max-w-4xl w-full shadow-2xl flex flex-col max-h-[90vh] overflow-hidden border-t-8" style={{borderTopColor: BRAND.yellow}}>
              
              <div className="p-6 md:p-8 shrink-0 bg-white border-b border-slate-100">
                 <h3 className="text-xl md:text-2xl font-black mb-2" style={{color: BRAND.black}}>Transferência em Lote</h3>
-                <p className="text-sm font-medium mb-6" style={{color: BRAND.gray}}>Filtre a base, selecione os clientes e transfira de uma só vez.</p>
+                <p className="text-sm font-medium mb-6" style={{color: BRAND.gray}}>Filtre a base por localização, estapas ou distribuidoras e transfira com 1 clique.</p>
                 
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                    <select className="border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={loteFiltros.uf} onChange={e => setLoteFiltros({...loteFiltros, uf: e.target.value})}>
                       <option value="">Todos os Estados</option>
                       {[...new Set(leads.map(l => l.uf).filter(Boolean))].sort().map(uf => <option key={uf} value={uf}>{uf}</option>)}
@@ -1489,11 +1546,15 @@ function App() {
                       <option value="">Todas as Cidades</option>
                       {[...new Set(leads.filter(l => !loteFiltros.uf || l.uf === loteFiltros.uf).map(l => l.cidade).filter(Boolean))].sort().map(cid => <option key={cid} value={cid}>{cid}</option>)}
                    </select>
+                   <select className="border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={loteFiltros.distribuidora} onChange={e => setLoteFiltros({...loteFiltros, distribuidora: e.target.value})}>
+                      <option value="">Todas Distribuidoras</option>
+                      {listaDistribuidoras.map(d => <option key={d} value={d}>{d}</option>)}
+                   </select>
                    <select className="border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={loteFiltros.etapa} onChange={e => setLoteFiltros({...loteFiltros, etapa: e.target.value})}>
                       <option value="">Qualquer Etapa</option>
                       {Object.values(ETAPAS).map(e => <option key={e} value={e}>{e}</option>)}
                    </select>
-                   <select className="border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none bg-blue-50" style={{color: BRAND.blueDark}} value={loteFiltros.responsavel} onChange={e => setLoteFiltros({...loteFiltros, responsavel: e.target.value})}>
+                   <select className="border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none bg-blue-50 col-span-2 md:col-span-1" style={{color: BRAND.blueDark}} value={loteFiltros.responsavel} onChange={e => setLoteFiltros({...loteFiltros, responsavel: e.target.value})}>
                       <option value="">Qualquer Vendedor</option>
                       <option value="SEM_DONO">Sem Dono</option>
                       {vendedores.map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
@@ -1507,6 +1568,10 @@ function App() {
                       if (loteFiltros.uf && l.uf !== loteFiltros.uf) return false;
                       if (loteFiltros.cidade && l.cidade !== loteFiltros.cidade) return false;
                       if (loteFiltros.etapa && (l.etapa_funil || ETAPAS.LEAD) !== loteFiltros.etapa) return false;
+                      
+                      const dist = l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira || '';
+                      if (loteFiltros.distribuidora && dist.toLowerCase() !== loteFiltros.distribuidora.toLowerCase()) return false;
+
                       if (loteFiltros.responsavel) {
                           if (loteFiltros.responsavel === 'SEM_DONO' && l.responsavel) return false;
                           if (loteFiltros.responsavel !== 'SEM_DONO' && l.responsavel !== loteFiltros.responsavel) return false;
@@ -1527,20 +1592,25 @@ function App() {
                        </div>
                        
                        <div className="space-y-2">
-                          {filtrados.map(lead => (
-                             <div key={lead.id} onClick={() => {
-                                 setLoteSelecionados(prev => prev.includes(lead.id) ? prev.filter(id => id !== lead.id) : [...prev, lead.id])
-                             }} className={`p-4 rounded-xl border flex items-center gap-4 cursor-pointer transition-colors ${loteSelecionados.includes(lead.id) ? 'bg-[#2D6FEF]/10 border-[#2D6FEF]' : 'bg-white border-slate-200'}`}>
-                                <div className={`w-5 h-5 rounded flex items-center justify-center border-2 ${loteSelecionados.includes(lead.id) ? 'bg-[#2D6FEF] border-[#2D6FEF]' : 'border-slate-300'}`}>
-                                   {loteSelecionados.includes(lead.id) && <svg className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>}
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                   <p className="font-bold text-sm truncate" style={{color: BRAND.black}}>{lead.nome}</p>
-                                   <p className="text-xs truncate" style={{color: BRAND.gray}}>{lead.cidade} - {lead.uf} | {lead.etapa_funil || ETAPAS.LEAD}</p>
-                                </div>
-                                <span className="text-[10px] font-bold px-2 py-1 rounded bg-slate-100" style={{color: BRAND.gray}}>{lead.responsavel || 'Sem Dono'}</span>
-                             </div>
-                          ))}
+                          {filtrados.map(lead => {
+                             const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
+                             return (
+                               <div key={lead.id} onClick={() => {
+                                   setLoteSelecionados(prev => prev.includes(lead.id) ? prev.filter(id => id !== lead.id) : [...prev, lead.id])
+                               }} className={`p-4 rounded-xl border flex items-center gap-4 cursor-pointer transition-colors ${loteSelecionados.includes(lead.id) ? 'bg-[#2D6FEF]/10 border-[#2D6FEF]' : 'bg-white border-slate-200'}`}>
+                                  <div className={`w-5 h-5 rounded flex items-center justify-center border-2 ${loteSelecionados.includes(lead.id) ? 'bg-[#2D6FEF] border-[#2D6FEF]' : 'border-slate-300'}`}>
+                                     {loteSelecionados.includes(lead.id) && <svg className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>}
+                                  </div>
+                                  <div className="flex-1 min-w-0">
+                                     <p className="font-bold text-sm truncate" style={{color: BRAND.black}}>{lead.nome}</p>
+                                     <p className="text-xs truncate" style={{color: BRAND.gray}}>
+                                       {lead.cidade} - {lead.uf} | {lead.etapa_funil || ETAPAS.LEAD} {distNome ? ` | 🏢 ${distNome}` : ''}
+                                     </p>
+                                  </div>
+                                  <span className="text-[10px] font-bold px-2 py-1 rounded bg-slate-100" style={{color: BRAND.gray}}>{lead.responsavel || 'Sem Dono'}</span>
+                               </div>
+                             );
+                          })}
                           {filtrados.length === 0 && <p className="text-center py-10 font-bold" style={{color: BRAND.gray}}>Nenhum cliente atende aos filtros atuais.</p>}
                        </div>
                      </>
