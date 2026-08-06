@@ -175,6 +175,7 @@ function App() {
 
   const [editandoTels, setEditandoTels] = useState(false);
   const [telsTemp, setTelsTemp] = useState([]);
+  const [buscandoCNPJ, setBuscandoCNPJ] = useState(false);
   
   const [novoComentario, setNovoComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
   const [modalFinalizar, setModalFinalizar] = useState(null); 
@@ -511,6 +512,52 @@ function App() {
     } catch (e) {
         console.error("Erro ao gravar histórico", e);
     }
+  };
+
+  const consultarCNPJ = async () => {
+      if (!leadAtual['CPF/CNPJ']) return mostrarMensagem('CNPJ não cadastrado.', true);
+      const cnpjLimpo = leadAtual['CPF/CNPJ'].replace(/\D/g, '');
+      if (cnpjLimpo.length !== 14) return mostrarMensagem('CNPJ inválido (14 dígitos).', true);
+
+      setBuscandoCNPJ(true);
+      mostrarMensagem('Consultando Receita Federal...');
+
+      try {
+          const res = await fetch(`https://brasilapi.com.br/api/cnpj/v1/${cnpjLimpo}`);
+          if (!res.ok) throw new Error('CNPJ não encontrado');
+          const dados = await res.json();
+
+          let novoEndereco = dados.logradouro || '';
+          if (dados.numero) novoEndereco += `, ${dados.numero}`;
+          if (dados.complemento) novoEndereco += ` - ${dados.complemento}`;
+
+          const atualizacoes = {
+              razao_social: dados.razao_social || leadAtual.razao_social || '',
+              endereco: novoEndereco,
+              bairro: dados.bairro || leadAtual.bairro || '',
+              cidade: dados.municipio || leadAtual.cidade || '',
+              uf: dados.uf || leadAtual.uf || '',
+              cep: dados.cep || leadAtual.cep || ''
+          };
+
+          if (dados.ddd_telefone_1) {
+              const telReceita = dados.ddd_telefone_1.replace(/\D/g, '');
+              if (telReceita) {
+                  const telsAtuais = leadAtual.telefones || (leadAtual.telefone ? [leadAtual.telefone] : []);
+                  if (!telsAtuais.some(t => t.replace(/\D/g, '') === telReceita)) {
+                      atualizacoes.telefones = [...telsAtuais, dados.ddd_telefone_1];
+                      atualizacoes.telefone = atualizacoes.telefones[0];
+                  }
+              }
+          }
+
+          await updateDoc(doc(db, "leads", leadAtual.id), atualizacoes);
+          mostrarMensagem('Dá um Appgas! Dados da Receita sincronizados!');
+      } catch (erro) {
+          mostrarMensagem('Erro ao buscar CNPJ.', true);
+      } finally {
+          setBuscandoCNPJ(false);
+      }
   };
 
   const salvarNovoLead = async () => {
@@ -996,7 +1043,7 @@ function App() {
                     <p className="text-[10px] md:text-xs truncate" style={{color: BRAND.gray}}>{lead.cidade ? `📍 ${lead.cidade} - ${lead.uf}` : '-'}</p>
                     {distNome && (
                        <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate">
-                          🏢 {distNome}
+                         🏢 {distNome}
                        </span>
                     )}
                   </div>
@@ -1032,8 +1079,13 @@ function App() {
                        <span className="px-3 md:px-4 py-1.5 text-[10px] md:text-xs font-black rounded-xl border uppercase tracking-widest shadow-sm" style={{backgroundColor: `${BRAND.yellow}20`, color: BRAND.black, borderColor: BRAND.yellow}}>
                          Classe {leadAtual['Classe Revenda'] || 'C'}
                        </span>
-                       <span className="px-3 md:px-4 py-1.5 bg-slate-50 text-[10px] md:text-xs font-bold rounded-xl border border-slate-200 shadow-sm" style={{color: BRAND.gray}}>
+                       <span className="px-3 md:px-4 py-1.5 bg-slate-50 text-[10px] md:text-xs font-bold rounded-xl border border-slate-200 shadow-sm flex items-center gap-2" style={{color: BRAND.gray}}>
                          {leadAtual['CPF/CNPJ'] || 'Documento Não Informado'}
+                         {leadAtual['CPF/CNPJ'] && leadAtual['CPF/CNPJ'].replace(/\D/g, '').length === 14 && (
+                             <button onClick={consultarCNPJ} disabled={buscandoCNPJ} className="text-white px-2 py-0.5 rounded text-[9px] transition-colors font-bold flex items-center gap-1 hover:opacity-80" style={{backgroundColor: BRAND.blue}}>
+                                 {buscandoCNPJ ? '⏳ Buscando...' : '🔍 Buscar na Receita'}
+                             </button>
+                         )}
                        </span>
                     </div>
                     
@@ -1062,12 +1114,18 @@ function App() {
                     </div>
                   </div>
                   
-                  <h1 className="text-3xl md:text-5xl font-black mb-6 md:mb-8 tracking-tight" style={{color: BRAND.black}}>{leadAtual.nome || 'Sem Nome'}</h1>
+                  <h1 className="text-3xl md:text-5xl font-black mb-1 tracking-tight" style={{color: BRAND.black}}>{leadAtual.nome || 'Sem Nome'}</h1>
+                  {leadAtual.razao_social && <p className="text-sm font-semibold mb-6 uppercase tracking-wider" style={{color: BRAND.gray}}>{leadAtual.razao_social}</p>}
+                  {!leadAtual.razao_social && <div className="mb-6 md:mb-8"></div>}
                   
                   <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
                     <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
                       <div className="text-slate-400">📍</div>
-                      <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.cidade || '-'} - {leadAtual.uf || '-'}</span>
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.endereco ? leadAtual.endereco : `${leadAtual.cidade || '-'} - ${leadAtual.uf || '-'}`}</span>
+                        {leadAtual.bairro && <span className="text-xs mt-0.5" style={{color: BRAND.gray}}>{leadAtual.bairro} • CEP: {leadAtual.cep}</span>}
+                        {leadAtual.endereco && <span className="text-xs font-bold mt-1" style={{color: BRAND.gray}}>{leadAtual.cidade} - {leadAtual.uf}</span>}
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
@@ -1387,7 +1445,7 @@ function App() {
                                  
                                  {v.nome.toLowerCase() !== 'admin' && (
                                      <button onClick={() => setVendedorParaExcluir(v)} className="px-3 md:px-4 py-1.5 md:py-2 rounded-lg text-[10px] md:text-xs font-bold bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">
-                                        🗑️ Excluir
+                                       🗑️ Excluir
                                      </button>
                                  )}
                               </div>
