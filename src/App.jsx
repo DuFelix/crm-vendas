@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, CartesianGrid, Legend } from 'recharts';
+import React, { useState, useEffect, useRef } from 'react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, CartesianGrid, Legend, LabelList } from 'recharts';
 
 // Imports do Firebase (SDK Modular)
 import { initializeApp } from "firebase/app";
@@ -15,7 +15,6 @@ const firebaseConfig = {
   appId: "1:602048749228:web:bd93de7fe0d618938f0909"
 };
 
-// Inicializando Firebase
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
@@ -39,15 +38,93 @@ const DEFAULT_MOTIVOS_PERDA = [
 
 const CORES_GRAFICO = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8'];
 
+const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
+  const mapRef = useRef(null);
+  const [leafletLoaded, setLeafletLoaded] = useState(false);
+
+  useEffect(() => {
+    if (window.L) {
+      setLeafletLoaded(true);
+      return;
+    }
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(link);
+
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    script.onload = () => setLeafletLoaded(true);
+    document.head.appendChild(script);
+  }, []);
+
+  useEffect(() => {
+    if (!leafletLoaded || !window.L) return;
+
+    if (!mapRef.current) {
+      const initCenter = initialView?.center || [-14.235, -51.925];
+      const initZoom = initialView?.zoom || 4;
+      
+      const map = window.L.map('mapa-leads').setView(initCenter, initZoom);
+      window.L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+        attribution: '© OpenStreetMap contributors'
+      }).addTo(map);
+      
+      map.on('moveend', () => {
+        onMapChange({ center: map.getCenter(), zoom: map.getZoom() });
+      });
+      
+      mapRef.current = map;
+    }
+
+    const map = mapRef.current;
+    
+    // Limpa marcadores antigos para recriar com as cores atualizadas
+    map.eachLayer((layer) => {
+      if (layer instanceof window.L.CircleMarker) map.removeLayer(layer);
+    });
+
+    leads.forEach(lead => {
+      const lat = parseFloat(lead.latitude || lead.lat);
+      const lng = parseFloat(lead.longitude || lead.lng || lead.lon);
+      
+      if (!isNaN(lat) && !isNaN(lng)) {
+        let color = '#3b82f6'; 
+        if (lead.etapa_funil === ETAPAS.LEAD || !lead.etapa_funil) color = '#94a3b8'; // Cinza para lead novo
+        else if (lead.etapa_funil === ETAPAS.APRESENTACAO) color = '#eab308'; // Amarelo
+        else if (lead.etapa_funil === ETAPAS.NEGOCIACAO) color = '#f97316'; // Laranja
+        else if (lead.etapa_funil === ETAPAS.CADASTRO) color = '#a855f7'; // Roxo
+        else if (lead.etapa_funil === ETAPAS.TREINAMENTO) color = '#ec4899'; // Rosa
+        else if (lead.status_venda === 'Ganho') color = '#10b981'; // Verde
+        else if (lead.status_venda === 'Perdido') color = '#ef4444'; // Vermelho
+
+        const marker = window.L.circleMarker([lat, lng], {
+          radius: 8,
+          fillColor: color,
+          color: '#ffffff',
+          weight: 2,
+          opacity: 1,
+          fillOpacity: 0.8
+        }).addTo(map);
+
+        marker.on('click', () => onMarkerClick(lead.id));
+      }
+    });
+  }, [leafletLoaded, leads, initialView, onMapChange, onMarkerClick]);
+
+  return (
+    <div id="mapa-leads" className="w-full h-full rounded-2xl border border-slate-200 shadow-sm z-0 relative">
+      {!leafletLoaded && <div className="absolute inset-0 flex items-center justify-center bg-slate-100 z-10"><p className="animate-pulse font-bold text-slate-500">Carregando Mapa...</p></div>}
+    </div>
+  );
+};
+
 function App() {
   const [vendedor, setVendedor] = useState('');
   const [logado, setLogado] = useState(false);
   const [carregandoDados, setCarregandoDados] = useState(true);
-  
-  // Controle Mobile
   const [menuMobileAberto, setMenuMobileAberto] = useState(false);
 
-  // Dados do Firebase
   const [leads, setLeads] = useState([]);
   const [historicoGeral, setHistoricoGeral] = useState([]);
   const [vendedores, setVendedores] = useState([]);
@@ -66,26 +143,32 @@ function App() {
   const [filtroExportacao, setFiltroExportacao] = useState('mes');
 
   const [novoVendedorNome, setNovoVendedorNome] = useState('');
-  const [mostrarFormAdmin, setMostrarFormAdmin] = useState(null); 
   const [novoMotivo, setNovoMotivo] = useState('');
   const [erroPermissaoFirebase, setErroPermissaoFirebase] = useState(false); 
 
-  // Novos estados para edição dinâmica de Telefones
   const [editandoTels, setEditandoTels] = useState(false);
   const [telsTemp, setTelsTemp] = useState([]);
-
-  const [loteForm, setLoteForm] = useState({ uf: '', cidade: '', atual: 'TODOS', novoResponsavel: '' });
-  const [leadsSelecionadosLote, setLeadsSelecionadosLote] = useState([]);
   
   const [novoComentario, setNovoComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
   const [modalFinalizar, setModalFinalizar] = useState(null); 
   const [motivoPerda, setMotivoPerda] = useState('');
   const [draggedLeadId, setDraggedLeadId] = useState(null);
-
-  // Controle de exclusão
   const [leadParaExcluir, setLeadParaExcluir] = useState(null);
 
-  // Resetar a edição de telefones ao trocar de cliente
+  // Memória do Mapa
+  const [mapaVisao, setMapaVisao] = useState({ center: [-14.235, -51.925], zoom: 4 });
+  const [veioDoMapa, setVeioDoMapa] = useState(false);
+
+  // Modal Novo Lead
+  const [modalNovoLead, setModalNovoLead] = useState(false);
+  const [formNovoLead, setFormNovoLead] = useState({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '' });
+
+  // Modal Lote
+  const [modalLote, setModalLote] = useState(false);
+  const [loteFiltros, setLoteFiltros] = useState({ uf: '', cidade: '', etapa: '', responsavel: '' });
+  const [loteSelecionados, setLoteSelecionados] = useState([]);
+  const [loteNovoResponsavel, setLoteNovoResponsavel] = useState('');
+
   useEffect(() => {
       setEditandoTels(false);
       setTelsTemp([]);
@@ -202,7 +285,6 @@ function App() {
     return (l.nome?.toLowerCase().includes(termo) || l['CPF/CNPJ']?.includes(termo) || l.cidade?.toLowerCase().includes(termo) || l.uf?.toLowerCase().includes(termo) || l.telefone?.includes(termo));
   });
 
-  // Função Robusta para ler CSV: Ignora os separadores (;) que estiverem dentro de aspas duplas
   const parseCSVLine = (text, delimiter) => {
     let ret = [];
     let inQuote = false;
@@ -248,15 +330,13 @@ function App() {
             let hLower = h.toLowerCase();
             let val = currentLine[idx] || '';
             
-            // Mapeamento Inteligente: Reconhece colunas de Vendedor e vincula automático
             if (hLower === 'vendedor_responsavel' || hLower === 'vendedor responsável' || hLower === 'responsavel' || hLower === 'vendedor') {
                 keyName = 'responsavel';
             }
             
-            // Scanner de Telefones: Separa os múltiplos números em uma Lista (Array)
             if (hLower === 'telefone' || hLower === 'telefones' || hLower === 'celular' || hLower === 'contato') {
                 obj.telefones = val.split(/[;,\/]+/).map(t => t.trim()).filter(t => t !== '');
-                obj.telefone = obj.telefones[0] || ''; // Mantém o principal
+                obj.telefone = obj.telefones[0] || ''; 
             } else {
                 obj[keyName] = val;
             }
@@ -299,8 +379,8 @@ function App() {
     if (filtroExportacao === 'mes') {
       histFiltrado = historicoGeral.filter(h => new Date(h.timestamp).getMonth() === now.getMonth() && new Date(h.timestamp).getFullYear() === now.getFullYear());
     } else if (filtroExportacao === 'semana') {
-      const umaSemanaAtras = new Date(now.setDate(now.getDate() - 7)).getTime();
-      histFiltrado = historicoGeral.filter(h => h.timestamp >= umaSemanaAtras);
+      const umaSemanaAtras = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+      histFiltrado = historicoGeral.filter(h => h.timestamp >= umaSemanaAtras.getTime());
     }
 
     let csvContent = "Data,Vendedor,Revenda,CNPJ,Cidade,UF,Etapa Funil,Status Venda,Motivo Perda,Canal,Pessoa Contatada,Observacao\n";
@@ -338,6 +418,28 @@ function App() {
       setNovoComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
       mostrarMensagem('Histórico salvo na Nuvem!');
     } catch (e) { mostrarMensagem('Erro ao salvar.', true); }
+  };
+
+  const salvarNovoLead = async () => {
+    if(!formNovoLead.nome.trim()) return mostrarMensagem('O nome é obrigatório.', true);
+    try {
+      await addDoc(collection(db, "leads"), {
+        nome: formNovoLead.nome,
+        telefone: formNovoLead.telefone,
+        telefones: formNovoLead.telefone ? [formNovoLead.telefone] : [],
+        'CPF/CNPJ': formNovoLead.cnpj,
+        cidade: formNovoLead.cidade,
+        uf: formNovoLead.uf,
+        etapa_funil: ETAPAS.LEAD,
+        data_criacao: Date.now(),
+        responsavel: isAdmin ? '' : vendedor // Vendedor comum já amarra para si mesmo
+      });
+      setFormNovoLead({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '' });
+      setModalNovoLead(false);
+      mostrarMensagem('Novo lead cadastrado com sucesso!');
+    } catch(e) {
+      mostrarMensagem('Erro ao cadastrar lead.', true);
+    }
   };
 
   const onDrop = async (e, novaEtapa) => {
@@ -399,15 +501,20 @@ function App() {
       const tDate = new Date(timestamp);
       if (isMes) return tDate.getMonth() === now.getMonth() && tDate.getFullYear() === now.getFullYear();
       if (isSemana) {
-        const oneWeekAgo = new Date(now.setDate(now.getDate() - 7));
-        return tDate >= oneWeekAgo;
+        // Correção do BUG Matemático da semana!
+        const umaSemanaAtras = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+        return tDate >= umaSemanaAtras;
       }
       return true;
     };
 
     let baseLeads = leads.filter(l => {
-      const donoMatch = filtroVendedorDash === 'todos' ? true : l.responsavel === filtroVendedorDash;
-      return donoMatch;
+      // Correção: Ignora maiúsculas e minúsculas no filtro do Vendedor
+      if (!isAdmin) {
+         return l.responsavel && l.responsavel.toLowerCase() === vendedor.toLowerCase();
+      }
+      if (filtroVendedorDash === 'todos') return true;
+      return l.responsavel && l.responsavel.toLowerCase() === filtroVendedorDash.toLowerCase();
     });
 
     const leadsAtivos = baseLeads.filter(l => l.etapa_funil !== ETAPAS.FINALIZADO);
@@ -465,7 +572,8 @@ function App() {
 
     const META_POR_VENDEDOR = 20;
     const COMISSAO_REVENDA = 300;
-    const metaAtual = filtroVendedorDash === 'todos' ? META_POR_VENDEDOR * vendedores.filter(v=>v.ativo).length : META_POR_VENDEDOR;
+    const qtdeVendedores = vendedores.filter(v=>v.ativo).length || 1;
+    const metaAtual = filtroVendedorDash === 'todos' ? META_POR_VENDEDOR * qtdeVendedores : META_POR_VENDEDOR;
     const valorComissao = leadsConvertidos.length * COMISSAO_REVENDA;
 
     return (
@@ -495,12 +603,14 @@ function App() {
                 </div>
                 <div className="h-56 md:h-64">
                     <ResponsiveContainer width="100%" height="100%">
-                       <BarChart data={dataFunil} layout="vertical" margin={{ left: 40, right: 20 }}>
+                       <BarChart data={dataFunil} layout="vertical" margin={{ left: 40, right: 40, top: 10, bottom: 10 }}>
                           <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/>
                           <XAxis type="number" />
                           <YAxis dataKey="name" type="category" width={90} tick={{fontSize: 11, fill: '#64748b', fontWeight: 'bold'}} />
                           <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
-                          <Bar dataKey="qtde" fill="#3b82f6" radius={[0, 4, 4, 0]} />
+                          <Bar dataKey="qtde" fill="#3b82f6" radius={[0, 4, 4, 0]}>
+                              <LabelList dataKey="qtde" position="right" fill="#64748b" fontSize={12} fontWeight="bold" />
+                          </Bar>
                        </BarChart>
                     </ResponsiveContainer>
                 </div>
@@ -694,7 +804,6 @@ function App() {
 
   return (
     <div className="flex flex-col md:flex-row h-screen bg-slate-100 font-sans text-slate-800 overflow-hidden w-full">
-      {/* Toast Notifications */}
       {toastMsg && (
         <div className={`absolute top-4 md:top-6 right-4 md:right-8 z-[100] text-white px-4 md:px-5 py-3 rounded-2xl shadow-xl text-xs md:text-sm font-bold flex items-center gap-3 border ${toastErro ? 'bg-red-500 border-red-600' : 'bg-slate-900 border-slate-700'}`}>
           {toastMsg}
@@ -706,7 +815,7 @@ function App() {
         </div>
       )}
 
-      {/* Header Mobile (Top Bar) */}
+      {/* Header Mobile */}
       <div className="md:hidden flex items-center justify-between bg-[#1e2336] text-white p-4 shrink-0 w-full z-40 shadow-md h-16 absolute top-0">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-indigo-500 rounded-full flex items-center justify-center text-sm font-black shadow-inner">
@@ -723,12 +832,9 @@ function App() {
         </button>
       </div>
 
-      {/* Fundo Escuro Mobile (Backdrop) */}
-      {menuMobileAberto && (
-        <div className="fixed inset-0 bg-slate-900/60 z-30 md:hidden backdrop-blur-sm" onClick={fecharMenuMobile}></div>
-      )}
+      {menuMobileAberto && <div className="fixed inset-0 bg-slate-900/60 z-30 md:hidden backdrop-blur-sm" onClick={fecharMenuMobile}></div>}
 
-      {/* Menu Lateral (Sidebar) */}
+      {/* Sidebar */}
       <div className={`${menuMobileAberto ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 fixed md:relative z-40 md:z-20 w-[85%] sm:w-80 md:w-80 bg-white border-r border-slate-200 flex flex-col shadow-2xl md:shadow-lg h-full pt-16 md:pt-0`}>
         <div className="p-4 md:p-6 bg-[#1e2336] text-white shrink-0 rounded-br-[32px] md:rounded-br-[40px] hidden md:block">
           <div className="flex items-center justify-between mb-4">
@@ -754,7 +860,6 @@ function App() {
           </div>
         </div>
 
-        {/* Versão simplificada da busca no topo pro Mobile se necessário, mas o Menu cobre */}
         <div className="md:hidden p-4 bg-[#1e2336] text-white shrink-0">
            <div className="relative">
             <input type="text" placeholder="Buscar revenda ou documento..." className="w-full bg-[#151928] text-xs border border-slate-700 text-white p-3 pl-9 rounded-xl focus:outline-none focus:border-indigo-500 placeholder-slate-400 font-medium" value={busca} onChange={(e) => setBusca(e.target.value)} />
@@ -763,39 +868,44 @@ function App() {
         </div>
 
         <div className="flex bg-slate-100 p-1.5 mx-4 mt-4 rounded-xl gap-1 shrink-0 overflow-x-auto">
-          <button onClick={() => {setVisaoAtual('lista'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[70px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' && !leadAtual ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Lista</button>
-          <button onClick={() => {setVisaoAtual('kanban'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[70px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' && !leadAtual ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Kanban</button>
-          <button onClick={() => {setVisaoAtual('dashboard'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[70px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Métricas</button>
+          <button onClick={() => {setVisaoAtual('lista'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' && !leadAtual ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Lista</button>
+          <button onClick={() => {setVisaoAtual('kanban'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' && !leadAtual ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Kanban</button>
+          <button onClick={() => {setVisaoAtual('dashboard'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Métricas</button>
+          <button onClick={() => {setVisaoAtual('mapa'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' && !leadAtual ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Mapa</button>
+          <button onClick={() => {setVisaoAtual('appgas'); setLeadSelecionadoId(null); fecharMenuMobile();}} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'appgas' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>Appgas</button>
         </div>
 
-        {isAdmin && (
-          <div className="px-4 py-3 shrink-0 border-b border-slate-100 space-y-2 mt-2">
-            <button onClick={() => {setVisaoAtual('gerenciar'); fecharMenuMobile();}} className="w-full bg-[#1e2336] hover:bg-slate-900 text-white text-[10px] md:text-xs font-bold py-2.5 md:py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-colors">
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-              Gerenciar Vendedores
-            </button>
-            <div className="flex gap-2">
-              <button className="flex-1 bg-white border border-slate-200 text-slate-600 text-[10px] md:text-xs font-bold py-2 md:py-2.5 rounded-xl shadow-sm">+ Unitário</button>
-              <button onClick={() => setMostrarFormAdmin(mostrarFormAdmin === 'lote' ? null : 'lote')} className="flex-1 bg-[#2563eb] text-white text-[10px] md:text-xs font-bold py-2 md:py-2.5 rounded-xl shadow-sm hover:bg-blue-700 flex justify-center items-center gap-1">
-                 ⇄ Lote
+        <div className="px-4 py-3 shrink-0 border-b border-slate-100">
+           <button onClick={() => { setModalNovoLead(true); fecharMenuMobile(); }} className="w-full bg-blue-600 hover:bg-blue-700 text-white text-[10px] md:text-xs font-bold py-2.5 md:py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-colors mb-2">
+             + Cadastrar Novo Lead
+           </button>
+           
+           {isAdmin && (
+            <div className="space-y-2 mt-2 pt-2 border-t border-slate-100">
+              <button onClick={() => {setVisaoAtual('gerenciar'); fecharMenuMobile();}} className="w-full bg-[#1e2336] hover:bg-slate-900 text-white text-[10px] md:text-xs font-bold py-2.5 md:py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-colors">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                Gerenciar Vendedores
               </button>
+              <button onClick={() => setModalLote(true)} className="w-full bg-orange-500 text-white text-[10px] md:text-xs font-bold py-2 md:py-2.5 rounded-xl shadow-sm hover:bg-orange-600 flex justify-center items-center gap-1 transition-colors">
+                 ⇄ Transferência em Lote
+              </button>
+              <div>
+                <input type="file" accept=".csv" onChange={(e) => { lidarUploadCSV(e); fecharMenuMobile(); }} className="hidden" id="csv-upload" />
+                <label htmlFor="csv-upload" className="w-full bg-[#10b981] hover:bg-emerald-600 text-white text-[10px] md:text-xs font-bold py-2.5 md:py-3 rounded-xl shadow-sm cursor-pointer flex justify-center items-center gap-2 transition-colors">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                  Subir Planilha CSV
+                </label>
+              </div>
             </div>
-            <div>
-              <input type="file" accept=".csv" onChange={(e) => { lidarUploadCSV(e); fecharMenuMobile(); }} className="hidden" id="csv-upload" />
-              <label htmlFor="csv-upload" className="w-full bg-[#10b981] hover:bg-emerald-600 text-white text-[10px] md:text-xs font-bold py-2.5 md:py-3 rounded-xl shadow-sm cursor-pointer flex justify-center items-center gap-2 transition-colors">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                Subir Planilha CSV
-              </label>
-            </div>
-          </div>
-        )}
+          )}
+        </div>
 
         {!leadAtual && visaoAtual === 'lista' && (
           <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
             {leadsFiltradosGeral.slice(0, 100).map(lead => {
               const urg = getUrgency(lead);
               return (
-                <div key={lead.id} onClick={() => { setLeadSelecionadoId(lead.id); fecharMenuMobile(); }} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border-2 shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400' : 'border-[#e2e8f0]'}`}>
+                <div key={lead.id} onClick={() => { setLeadSelecionadoId(lead.id); setVeioDoMapa(false); fecharMenuMobile(); }} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border-2 shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400' : 'border-[#e2e8f0]'}`}>
                   <h3 className="font-bold text-slate-900 text-xs md:text-sm mb-1 truncate">{lead.nome || 'Sem Nome'}</h3>
                   <p className="text-[10px] md:text-xs text-slate-400 mb-3 truncate">{lead.cidade ? `${lead.cidade} - ${lead.uf}` : '-'}</p>
                   <div className="flex justify-between items-center mb-2">
@@ -812,13 +922,14 @@ function App() {
         )}
       </div>
 
-      {/* Conteúdo Principal */}
+      {/* Área Principal Dinâmica */}
       <div className="flex-1 bg-slate-100 relative h-full flex flex-col min-w-0 overflow-hidden pt-16 md:pt-0">
         
+        {/* Detalhes do Lead */}
         {leadAtual ? (
           <div className="flex-1 p-4 md:p-8 overflow-y-auto">
             <div className="max-w-4xl mx-auto pb-20">
-              <button onClick={() => setLeadSelecionadoId(null)} className="mb-4 md:mb-6 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold text-slate-600 hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors">
+              <button onClick={() => { setLeadSelecionadoId(null); if (veioDoMapa) setVisaoAtual('mapa'); }} className="mb-4 md:mb-6 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold text-slate-600 hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors">
                 ← Voltar
               </button>
 
@@ -834,10 +945,24 @@ function App() {
                          {leadAtual['CPF/CNPJ'] || 'Documento Não Informado'}
                        </span>
                     </div>
-                    <div className="flex gap-2">
-                        <span className="px-3 md:px-4 py-1.5 bg-[#eef2ff] text-[#4338ca] text-[10px] md:text-xs font-bold rounded-xl border border-[#c7d2fe] shadow-sm">
-                          Dono da Carteira: {leadAtual.responsavel || 'Sem dono'}
-                        </span>
+                    
+                    <div className="flex gap-2 items-center">
+                        <div className="flex items-center bg-[#eef2ff] border border-[#c7d2fe] rounded-xl overflow-hidden shadow-sm">
+                            <span className="px-3 py-1.5 text-[#4338ca] text-[10px] md:text-xs font-bold border-r border-[#c7d2fe]">Dono:</span>
+                            {isAdmin ? (
+                                <select className="bg-transparent text-[#4338ca] text-[10px] md:text-xs font-bold px-2 py-1.5 outline-none cursor-pointer hover:bg-[#e0e7ff]"
+                                        value={leadAtual.responsavel || ''} 
+                                        onChange={(e) => {
+                                            updateDoc(doc(db, "leads", leadAtual.id), { responsavel: e.target.value });
+                                            mostrarMensagem('Vendedor alterado!');
+                                        }}>
+                                    <option value="">Sem Dono</option>
+                                    {vendedores.map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
+                                </select>
+                            ) : (
+                                <span className="px-3 py-1.5 text-[#4338ca] text-[10px] md:text-xs font-bold">{leadAtual.responsavel || 'Sem dono'}</span>
+                            )}
+                        </div>
                         {isAdmin && (
                             <button onClick={() => setLeadParaExcluir(leadAtual)} className="px-3 md:px-4 py-1.5 bg-red-50 text-red-600 hover:bg-red-600 hover:text-white text-[10px] md:text-xs font-bold rounded-xl border border-red-200 transition-colors shadow-sm">
                                 Excluir Revenda
@@ -904,7 +1029,6 @@ function App() {
                     </div>
                   </div>
 
-                  {/* Alterar Etapa Mobile/Rápido */}
                   <div className="mt-4 flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-[#f8fafc] p-4 rounded-2xl border border-slate-200">
                      <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Etapa Atual:</span>
                      <select 
@@ -999,7 +1123,7 @@ function App() {
                           
                           <div className="grid grid-cols-3 gap-1.5 md:gap-2">
                             {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={() => setModalFinalizar({type: 'perda', lead})} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">👎</button>}
-                            <button onClick={() => setLeadSelecionadoId(lead.id)} className={`py-1.5 md:py-2 bg-[#eff6ff] text-[#2563eb] hover:bg-blue-600 hover:text-white rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`}>Abrir</button>
+                            <button onClick={() => { setLeadSelecionadoId(lead.id); setVeioDoMapa(false); }} className={`py-1.5 md:py-2 bg-[#eff6ff] text-[#2563eb] hover:bg-blue-600 hover:text-white rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`}>Abrir</button>
                             {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={() => setModalFinalizar({type: 'ganho', lead})} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">🏆</button>}
                           </div>
                         </div>
@@ -1012,11 +1136,42 @@ function App() {
           </div>
         ) : visaoAtual === 'dashboard' ? (
           renderDashboard()
+        ) : visaoAtual === 'mapa' ? (
+          <div className="flex-1 p-4 md:p-6 h-full flex flex-col">
+             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm mb-4 shrink-0 flex items-center justify-between">
+                <div>
+                   <h2 className="text-lg md:text-xl font-black text-slate-800">Mapa Geográfico</h2>
+                   <p className="text-[10px] md:text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">Radar de Oportunidades ({leadsFiltradosGeral.length} leads mapeados)</p>
+                </div>
+             </div>
+             <div className="flex-1 rounded-2xl overflow-hidden shadow-sm border border-slate-200">
+                <MapaDinamico 
+                    leads={leadsFiltradosGeral} 
+                    initialView={mapaVisao}
+                    onMapChange={(view) => setMapaVisao(view)}
+                    onMarkerClick={(id) => { setLeadSelecionadoId(id); setVeioDoMapa(true); }} 
+                />
+             </div>
+          </div>
+        ) : visaoAtual === 'appgas' ? (
+          <div className="flex-1 p-4 md:p-10 h-full bg-slate-50 flex items-center justify-center">
+             <div className="bg-white p-10 rounded-[32px] shadow-sm border border-slate-200 max-w-lg w-full text-center">
+                <div className="bg-indigo-50 w-20 h-20 rounded-2xl flex items-center justify-center mx-auto mb-6 text-indigo-600 shadow-inner">
+                   <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                </div>
+                <h2 className="text-2xl font-black text-slate-800 mb-3">Portal Appgas</h2>
+                <p className="text-slate-500 text-sm mb-8 leading-relaxed">
+                   Você está prestes a abrir o painel administrativo oficial. A conexão é segura e sua sessão será mantida na nova aba.
+                </p>
+                <a href="https://admin.appgas.com/" target="_blank" rel="noreferrer" className="block w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 rounded-xl transition-all shadow-md text-lg">
+                   Abrir admin.appgas.com ↗
+                </a>
+             </div>
+          </div>
         ) : visaoAtual === 'gerenciar' && isAdmin ? (
           <div className="flex-1 p-4 md:p-8 bg-slate-50 overflow-y-auto">
              <h2 className="text-2xl md:text-3xl font-black text-slate-900 mb-6 md:mb-8">Painel de Configurações</h2>
              
-             {/* PAINEL DE EXPORTAÇÃO PARA IA DE VOLTA! */}
              <div className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-sm mb-6 md:mb-8">
                 <h3 className="text-sm font-bold text-slate-500 uppercase tracking-widest mb-4 flex items-center gap-2">🤖 Inteligência Artificial</h3>
                 <div className="flex flex-col sm:flex-row gap-3">
@@ -1070,7 +1225,7 @@ function App() {
            </div>
         )}
 
-      {/* Modal Finalização */}
+      {}
       {modalFinalizar && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
           <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl">
@@ -1096,7 +1251,6 @@ function App() {
         </div>
       )}
 
-      {/* Modal Excluir Lead (Somente Admin) */}
       {leadParaExcluir && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[70] p-4 backdrop-blur-sm">
           <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl border-t-8 border-red-500">
@@ -1119,6 +1273,159 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {modalLote && (
+          <div className="fixed inset-0 bg-slate-900/70 flex items-center justify-center z-[80] p-4 backdrop-blur-sm">
+             <div className="bg-white rounded-3xl max-w-4xl w-full shadow-2xl flex flex-col h-[85vh] border border-slate-200 overflow-hidden">
+                <div className="bg-orange-50 p-6 border-b border-orange-100 flex justify-between items-center shrink-0">
+                    <div>
+                        <h3 className="text-2xl font-black text-orange-600">Transferência em Lote</h3>
+                        <p className="text-sm font-medium text-slate-500 mt-1">Filtre os leads e transfira para um novo vendedor.</p>
+                    </div>
+                    <button onClick={() => setModalLote(false)} className="text-slate-400 hover:text-slate-700 bg-white p-2 rounded-xl shadow-sm">✕</button>
+                </div>
+                
+                <div className="p-4 bg-slate-50 border-b border-slate-200 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 shrink-0">
+                    <select className="border border-slate-300 rounded-xl p-2.5 text-sm font-bold text-slate-700 outline-none" value={loteFiltros.uf} onChange={e => setLoteFiltros({...loteFiltros, uf: e.target.value})}>
+                        <option value="">Todos os Estados (UF)</option>
+                        {[...new Set(leads.map(l => l.uf).filter(Boolean))].sort().map(uf => <option key={uf} value={uf}>{uf}</option>)}
+                    </select>
+                    <select className="border border-slate-300 rounded-xl p-2.5 text-sm font-bold text-slate-700 outline-none" value={loteFiltros.cidade} onChange={e => setLoteFiltros({...loteFiltros, cidade: e.target.value})}>
+                        <option value="">Todas as Cidades</option>
+                        {[...new Set(leads.filter(l => !loteFiltros.uf || l.uf === loteFiltros.uf).map(l => l.cidade).filter(Boolean))].sort().map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                    <select className="border border-slate-300 rounded-xl p-2.5 text-sm font-bold text-slate-700 outline-none" value={loteFiltros.responsavel} onChange={e => setLoteFiltros({...loteFiltros, responsavel: e.target.value})}>
+                        <option value="">Qualquer Dono (Dono Atual)</option>
+                        <option value="SEM_DONO">Sem Dono</option>
+                        {vendedores.map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
+                    </select>
+                    <select className="border border-slate-300 rounded-xl p-2.5 text-sm font-bold text-slate-700 outline-none" value={loteFiltros.etapa} onChange={e => setLoteFiltros({...loteFiltros, etapa: e.target.value})}>
+                        <option value="">Todo o Funil</option>
+                        {Object.values(ETAPAS).map(e => <option key={e} value={e}>{e}</option>)}
+                    </select>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 space-y-2 bg-slate-100">
+                    {(() => {
+                        const lista = leads.filter(l => {
+                            if(loteFiltros.uf && l.uf !== loteFiltros.uf) return false;
+                            if(loteFiltros.cidade && l.cidade !== loteFiltros.cidade) return false;
+                            if(loteFiltros.etapa && l.etapa_funil !== loteFiltros.etapa) return false;
+                            if(loteFiltros.responsavel) {
+                                if(loteFiltros.responsavel === 'SEM_DONO' && l.responsavel) return false;
+                                if(loteFiltros.responsavel !== 'SEM_DONO' && l.responsavel !== loteFiltros.responsavel) return false;
+                            }
+                            return true;
+                        });
+                        
+                        if(lista.length === 0) return <p className="text-center text-slate-400 mt-10 font-bold">Nenhum lead atende a estes filtros.</p>;
+                        
+                        return (
+                            <>
+                                <div className="flex justify-between items-center px-2 mb-3">
+                                    <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">{lista.length} Leads Encontrados</span>
+                                    <button onClick={() => {
+                                        if(loteSelecionados.length === lista.length) setLoteSelecionados([]);
+                                        else setLoteSelecionados(lista.map(l => l.id));
+                                    }} className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg hover:bg-blue-100">
+                                        {loteSelecionados.length === lista.length ? 'Desmarcar Todos' : 'Selecionar Todos desta página'}
+                                    </button>
+                                </div>
+                                {lista.map(l => (
+                                    <label key={l.id} className={`flex items-center gap-4 p-3 rounded-xl border cursor-pointer transition-colors ${loteSelecionados.includes(l.id) ? 'bg-orange-50 border-orange-200' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
+                                        <input type="checkbox" className="w-5 h-5 accent-orange-500 cursor-pointer" checked={loteSelecionados.includes(l.id)} onChange={(e) => {
+                                            if(e.target.checked) setLoteSelecionados([...loteSelecionados, l.id]);
+                                            else setLoteSelecionados(loteSelecionados.filter(id => id !== l.id));
+                                        }} />
+                                        <div className="flex-1 min-w-0 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                            <div>
+                                                <p className="font-bold text-slate-800 text-sm truncate">{l.nome}</p>
+                                                <p className="text-xs text-slate-500">{l.cidade}/{l.uf}</p>
+                                            </div>
+                                            <div className="flex gap-2 text-[10px] font-bold">
+                                                <span className="bg-slate-100 px-2 py-1 rounded-md border text-slate-500">{l.responsavel || 'SEM DONO'}</span>
+                                                <span className="bg-blue-50 px-2 py-1 rounded-md border text-blue-600 truncate max-w-[120px]">{l.etapa_funil || ETAPAS.LEAD}</span>
+                                            </div>
+                                        </div>
+                                    </label>
+                                ))}
+                            </>
+                        )
+                    })()}
+                </div>
+                
+                <div className="p-4 bg-white border-t border-slate-200 shrink-0 flex flex-col sm:flex-row gap-4 items-center justify-between">
+                    <div className="flex items-center gap-3 w-full sm:w-auto">
+                        <span className="font-black text-slate-700 text-sm">Transferir para:</span>
+                        <select className="border-2 border-slate-200 p-2.5 rounded-xl font-bold text-sm outline-none bg-slate-50 flex-1 sm:flex-none" value={loteNovoResponsavel} onChange={e => setLoteNovoResponsavel(e.target.value)}>
+                            <option value="">Selecione...</option>
+                            <option value="REMOVER">⚠️ Retirar o Dono (Deixar vago)</option>
+                            {vendedores.map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
+                        </select>
+                    </div>
+                    <button onClick={async () => {
+                        if(loteSelecionados.length === 0) return mostrarMensagem('Selecione ao menos um lead!', true);
+                        if(!loteNovoResponsavel) return mostrarMensagem('Selecione o novo vendedor!', true);
+                        
+                        const val = loteNovoResponsavel === 'REMOVER' ? '' : loteNovoResponsavel;
+                        const batch = writeBatch(db);
+                        loteSelecionados.forEach(id => {
+                            batch.update(doc(db, "leads", id), { responsavel: val });
+                        });
+                        await batch.commit();
+                        setLoteSelecionados([]);
+                        setModalLote(false);
+                        mostrarMensagem(`${loteSelecionados.length} leads transferidos com sucesso!`);
+                    }} className="w-full sm:w-auto bg-orange-500 hover:bg-orange-600 text-white font-black px-6 py-3 rounded-xl shadow-md transition-colors">
+                        Aplicar Transferência ({loteSelecionados.length})
+                    </button>
+                </div>
+             </div>
+          </div>
+      )}
+
+      {modalNovoLead && (
+         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[90] p-4 backdrop-blur-sm">
+            <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl overflow-hidden border-t-8 border-blue-600">
+               <div className="p-6 md:p-8">
+                  <h3 className="text-xl md:text-2xl font-black text-slate-900 mb-2">Cadastrar Lead</h3>
+                  <p className="text-sm font-medium text-slate-500 mb-6">Preencha os dados iniciais do cliente.</p>
+                  
+                  <div className="space-y-4">
+                     <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Nome da Revenda *</label>
+                        <input type="text" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold text-slate-800 outline-none focus:border-blue-500 bg-slate-50 focus:bg-white" value={formNovoLead.nome} onChange={e => setFormNovoLead({...formNovoLead, nome: e.target.value})} placeholder="Ex: Gás do João" />
+                     </div>
+                     <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Telefone Principal</label>
+                        <input type="text" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold text-slate-800 outline-none focus:border-blue-500 bg-slate-50 focus:bg-white" value={formNovoLead.telefone} onChange={e => setFormNovoLead({...formNovoLead, telefone: e.target.value})} placeholder="Ex: 11999999999" />
+                     </div>
+                     <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">CNPJ ou CPF</label>
+                        <input type="text" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold text-slate-800 outline-none focus:border-blue-500 bg-slate-50 focus:bg-white" value={formNovoLead.cnpj} onChange={e => setFormNovoLead({...formNovoLead, cnpj: e.target.value})} placeholder="Ex: 00.000.000/0001-00" />
+                     </div>
+                     <div className="grid grid-cols-2 gap-3">
+                        <div>
+                           <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Cidade</label>
+                           <input type="text" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold text-slate-800 outline-none focus:border-blue-500 bg-slate-50 focus:bg-white" value={formNovoLead.cidade} onChange={e => setFormNovoLead({...formNovoLead, cidade: e.target.value})} placeholder="Ex: São Paulo" />
+                        </div>
+                        <div>
+                           <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Estado (UF)</label>
+                           <input type="text" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold text-slate-800 outline-none focus:border-blue-500 bg-slate-50 focus:bg-white uppercase" maxLength="2" value={formNovoLead.uf} onChange={e => setFormNovoLead({...formNovoLead, uf: e.target.value})} placeholder="Ex: SP" />
+                        </div>
+                     </div>
+                  </div>
+                  
+                  <div className="flex gap-3 mt-8">
+                     <button onClick={() => setModalNovoLead(false)} className="flex-1 px-4 py-3 bg-slate-100 text-slate-600 font-bold rounded-xl hover:bg-slate-200 text-sm">Cancelar</button>
+                     <button onClick={salvarNovoLead} className="flex-1 px-4 py-3 text-white font-bold rounded-xl shadow-md bg-blue-600 hover:bg-blue-700 text-sm">
+                        Cadastrar Lead
+                     </button>
+                  </div>
+               </div>
+            </div>
+         </div>
       )}
 
       </div>
