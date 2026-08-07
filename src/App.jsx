@@ -16,7 +16,6 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
-// ETAPAS ATUALIZADAS com a nova fase "Primeiro contato"
 const ETAPAS = {
   LEAD: '1. Lead',
   PRIMEIRO_CONTATO: 'Primeiro contato',
@@ -46,7 +45,17 @@ const BRAND = {
   white: '#FFFFFF',
 };
 
-const CORES_GRAFICO = [BRAND.blue, BRAND.yellow, BRAND.blueLight, BRAND.blueDark, BRAND.gray];
+const CORES_GRAFICO = [BRAND.blue, BRAND.yellow, BRAND.blueLight, BRAND.blueDark, BRAND.gray, '#ABC5F9'];
+
+const getNextBusinessDay = (date = new Date()) => {
+  let nextDay = new Date(date);
+  nextDay.setDate(nextDay.getDate() + 1);
+  while (nextDay.getDay() === 0 || nextDay.getDay() === 6) {
+      nextDay.setDate(nextDay.getDate() + 1);
+  }
+  nextDay.setHours(10, 0, 0, 0); 
+  return nextDay;
+};
 
 const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
   const mapRef = useRef(null);
@@ -110,8 +119,8 @@ const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
            const marker = window.L.marker([lat, lng], { icon: customIcon }).addTo(map);
            marker.on('click', () => onMarkerClick(lead.id));
         } else {
-           let color = BRAND.gray; // Padrão (Lead Novo)
-           if (lead.etapa_funil === ETAPAS.PRIMEIRO_CONTATO) color = '#ABC5F9'; // Azul claro brand
+           let color = BRAND.gray;
+           if (lead.etapa_funil === ETAPAS.PRIMEIRO_CONTATO) color = '#ABC5F9';
            else if (lead.etapa_funil === ETAPAS.APRESENTACAO) color = BRAND.blueLight; 
            else if (lead.etapa_funil === ETAPAS.NEGOCIACAO) color = BRAND.yellow;
            else if (lead.etapa_funil === ETAPAS.CADASTRO) color = BRAND.blue;
@@ -176,24 +185,12 @@ function App() {
   const [vendedorNovaSenha, setVendedorNovaSenha] = useState('');
   const [vendedorParaExcluir, setVendedorParaExcluir] = useState(null);
 
-  const [modalLote, setModalLote] = useState(false);
-  const [loteFiltros, setLoteFiltros] = useState({ uf: '', cidade: '', etapa: '', responsavel: '', distribuidora: '' });
-  const [loteSelecionados, setLoteSelecionados] = useState([]);
-  const [loteNovoResponsavel, setLoteNovoResponsavel] = useState('');
-
-  // Memórias de Rolagem da Tela
-  const listaRef = useRef(null);
-  const kanbanRef = useRef(null);
-  const kanbanColsRefs = useRef({});
-  const scrollPosRef = useRef({ lista: 0, kanban: 0, kanbanCols: {} });
-
   const [editandoTels, setEditandoTels] = useState(false);
   const [telsTemp, setTelsTemp] = useState([]);
   const [buscandoCNPJ, setBuscandoCNPJ] = useState(false);
   
   const [novoComentario, setNovoComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
   const [modalFinalizar, setModalFinalizar] = useState(null); 
-  const [modalConfirmacaoWA, setModalConfirmacaoWA] = useState(null);
   const [motivoPerda, setMotivoPerda] = useState('');
   const [draggedLeadId, setDraggedLeadId] = useState(null);
   const [leadParaExcluir, setLeadParaExcluir] = useState(null);
@@ -204,20 +201,18 @@ function App() {
   const [modalNovoLead, setModalNovoLead] = useState(false);
   const [formNovoLead, setFormNovoLead] = useState({ nome: '', telefone: '', cnpj: '', cidade: '', uf: '', distribuidora: '' });
 
-  useEffect(() => {
-    if (!leadSelecionadoId) {
-      if (visaoAtual === 'lista' && listaRef.current) {
-        listaRef.current.scrollTop = scrollPosRef.current.lista;
-      } else if (visaoAtual === 'kanban' && kanbanRef.current) {
-        kanbanRef.current.scrollLeft = scrollPosRef.current.kanban;
-        Object.keys(kanbanColsRefs.current).forEach(etapa => {
-          if (kanbanColsRefs.current[etapa]) {
-            kanbanColsRefs.current[etapa].scrollTop = scrollPosRef.current.kanbanCols[etapa] || 0;
-          }
-        });
-      }
-    }
-  }, [visaoAtual, leadSelecionadoId]);
+  const [modalLote, setModalLote] = useState(false);
+  const [loteFiltros, setLoteFiltros] = useState({ uf: '', cidade: '', etapa: '', responsavel: '', distribuidora: '' });
+  const [loteSelecionados, setLoteSelecionados] = useState([]);
+  const [loteNovoResponsavel, setLoteNovoResponsavel] = useState('');
+
+  const [itensVisiveisLista, setItensVisiveisLista] = useState(100);
+  const [modalContatoConfirma, setModalContatoConfirma] = useState(null);
+
+  const listaRef = useRef(null);
+  const kanbanRef = useRef(null);
+  const scrollPosLista = useRef(0);
+  const scrollPosKanban = useRef(0);
 
   useEffect(() => {
       setEditandoTels(false);
@@ -277,9 +272,21 @@ function App() {
     fecharMenuMobile();
   };
 
+  const abrirCardLead = (id) => {
+    if (visaoAtual === 'lista' && listaRef.current) scrollPosLista.current = listaRef.current.scrollTop;
+    if (visaoAtual === 'kanban' && kanbanRef.current) scrollPosKanban.current = kanbanRef.current.scrollTop;
+    
+    setLeadSelecionadoId(id);
+    setVeioDoMapa(visaoAtual === 'mapa');
+    fecharMenuMobile();
+  };
+
   const voltarVisao = () => {
-    setVisaoAtual(visaoAnterior);
     setLeadSelecionadoId(null);
+    setTimeout(() => {
+        if (visaoAtual === 'lista' && listaRef.current) listaRef.current.scrollTop = scrollPosLista.current;
+        if (visaoAtual === 'kanban' && kanbanRef.current) kanbanRef.current.scrollTop = scrollPosKanban.current;
+    }, 50);
   };
 
   const handleLogin = (e) => {
@@ -351,7 +358,9 @@ function App() {
     if (!matchDono) return false;
 
     const dist = l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira || '';
-    if (filtroDistribuidora !== 'todas' && dist.toLowerCase() !== filtroDistribuidora.toLowerCase()) return false;
+    if (filtroDistribuidora !== 'todas' && dist.toLowerCase() !== filtroDistribuidora.toLowerCase()) {
+      return false;
+    }
 
     if (!busca) return true;
     const termo = busca.toLowerCase();
@@ -368,13 +377,20 @@ function App() {
   const listaDistribuidoras = [...new Set(leads.map(l => l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira).filter(Boolean))].sort();
 
   const parseCSVLine = (text, delimiter) => {
-    let ret = []; let inQuote = false; let value = '';
+    let ret = [];
+    let inQuote = false;
+    let value = '';
     for (let i = 0; i < text.length; i++) {
         let ch = text[i];
         if (inQuote) {
-            if (ch === '"') { if (i + 1 < text.length && text[i+1] === '"') { value += '"'; i++; } else { inQuote = false; } } else { value += ch; }
+            if (ch === '"') {
+                if (i + 1 < text.length && text[i+1] === '"') { value += '"'; i++; } 
+                else { inQuote = false; }
+            } else { value += ch; }
         } else {
-            if (ch === '"') { inQuote = true; } else if (ch === delimiter) { ret.push(value.trim()); value = ''; } else { value += ch; }
+            if (ch === '"') { inQuote = true; } 
+            else if (ch === delimiter) { ret.push(value.trim()); value = ''; } 
+            else { value += ch; }
         }
     }
     ret.push(value.trim());
@@ -390,26 +406,42 @@ function App() {
       setUploadProgresso('Lendo arquivo CSV...');
       const lines = event.target.result.split('\n');
       const delimiter = lines[0].includes(';') ? ';' : ',';
-      const headers = parseCSVLine(lines[0], delimiter).map(h => h.replace(/"/g, ''));
+      const headers = parseCSVLine(lines[0], delimiter).map(h => h.replace(/"/g, '').trim());
       
-      const novosLeads = [];
+      const novos = [];
+      const paraAtualizar = [];
+      let ignorados = 0;
+
       for (let i = 1; i < lines.length; i++) {
         if (!lines[i].trim() || lines[i].replace(/;/g, '').trim() === '') continue;
-        const currentLine = parseCSVLine(lines[i], delimiter).map(val => val.replace(/"/g, ''));
+        const currentLine = parseCSVLine(lines[i], delimiter).map(val => val.replace(/"/g, '').trim());
         if (currentLine.length < 2) continue;
         
-        let obj = { etapa_funil: ETAPAS.LEAD, data_criacao: Date.now() };
+        let obj = {};
+        let csvId = null;
+
         headers.forEach((h, idx) => {
-          if (h.toLowerCase() !== 'id' && h.trim() !== '') {
-            let keyName = h; let hLower = h.toLowerCase(); let val = currentLine[idx] || '';
-            if (hLower === 'vendedor_responsavel' || hLower === 'vendedor responsável' || hLower === 'responsavel' || hLower === 'vendedor') keyName = 'responsavel';
-            if (hLower === 'distribuidora' || hLower === 'bandeira' || hLower === 'distribuidor' || hLower === 'marca') keyName = 'distribuidora';
-            if (hLower === 'telefone' || hLower === 'telefones' || hLower === 'celular' || hLower === 'contato') {
-                obj.telefones = val.split(/[;,\/]+/).map(t => t.trim()).filter(t => t !== '');
-                obj.telefone = obj.telefones[0] || ''; 
-            } else {
-                obj[keyName] = val;
-            }
+          let keyName = h;
+          let hLower = h.toLowerCase();
+          let val = currentLine[idx] || '';
+          
+          if (hLower === 'id') {
+              csvId = val;
+              return;
+          }
+          if (val === '') return;
+          
+          if (hLower === 'vendedor_responsavel' || hLower === 'vendedor responsável' || hLower === 'responsavel' || hLower === 'vendedor') {
+              keyName = 'responsavel';
+          }
+          if (hLower === 'distribuidora' || hLower === 'bandeira' || hLower === 'distribuidor' || hLower === 'marca') {
+              keyName = 'distribuidora';
+          }
+          if (hLower === 'telefone' || hLower === 'telefones' || hLower === 'celular' || hLower === 'contato') {
+              obj.telefones = val.split(/[;,\/]+/).map(t => t.trim()).filter(t => t !== '');
+              obj.telefone = obj.telefones[0] || ''; 
+          } else {
+              obj[keyName] = val;
           }
         });
         
@@ -418,24 +450,107 @@ function App() {
         if (!obj.uf && obj.UF) obj.uf = obj.UF;
         if (!obj.distribuidora && obj.Bandeira) obj.distribuidora = obj.Bandeira;
         
-        if (obj.nome && obj.nome !== 'Sem Nome' && obj.nome !== '') novosLeads.push(obj);
+        let cnpjLimpo = obj['CPF/CNPJ'] ? obj['CPF/CNPJ'].replace(/\D/g, '') : null;
+        if (cnpjLimpo === '') cnpjLimpo = null;
+        
+        let existingLead = null;
+        
+        if (csvId) {
+            existingLead = leads.find(l => l.id === csvId);
+        }
+        
+        if (!existingLead && cnpjLimpo) {
+            existingLead = leads.find(l => {
+                const lCnpj = l['CPF/CNPJ'] ? l['CPF/CNPJ'].replace(/\D/g, '') : null;
+                return lCnpj === cnpjLimpo;
+            });
+        }
+        
+        if (!existingLead && obj.nome && obj.cidade) {
+            existingLead = leads.find(l => 
+                l.nome && l.cidade && 
+                l.nome.toLowerCase().trim() === obj.nome.toLowerCase().trim() && 
+                l.cidade.toLowerCase().trim() === obj.cidade.toLowerCase().trim()
+            );
+        }
+
+        if (existingLead) {
+            let fieldsToUpdate = {};
+            let hasChanges = false;
+            
+            for (const key in obj) {
+                if (key === 'telefones' || key === 'telefone') continue;
+                if (!existingLead[key] || existingLead[key].toString().trim() === '') {
+                    fieldsToUpdate[key] = obj[key];
+                    hasChanges = true;
+                }
+            }
+
+            if (obj.telefone) {
+                const existingPhones = existingLead.telefones || [];
+                if (existingPhones.length === 0 && !existingLead.telefone) {
+                    fieldsToUpdate.telefone = obj.telefone;
+                    fieldsToUpdate.telefones = obj.telefones;
+                    hasChanges = true;
+                }
+            }
+
+            if (hasChanges) {
+                paraAtualizar.push({ id: existingLead.id, changes: fieldsToUpdate });
+            } else {
+                ignorados++;
+            }
+
+        } else {
+            if (obj.nome && obj.nome !== 'Sem Nome' && obj.nome !== '') {
+                obj.etapa_funil = ETAPAS.LEAD;
+                obj.data_criacao = Date.now();
+                novos.push(obj);
+            }
+        }
       }
 
-      if (novosLeads.length === 0) return mostrarMensagem('Nenhum lead válido encontrado.', true);
+      if (novos.length === 0 && paraAtualizar.length === 0) {
+          setUploadProgresso('');
+          return mostrarMensagem(`Lido: ${ignorados} duplicados ignorados. Nenhum dado novo.`, false);
+      }
 
-      const chunks = [];
-      for (let i = 0; i < novosLeads.length; i += 450) chunks.push(novosLeads.slice(i, i + 450));
+      setUploadProgresso(`Processando: ${novos.length} novos, ${paraAtualizar.length} atualizações...`);
 
+      const BATCH_SIZE = 450;
       let salvos = 0;
-      for (let chunk of chunks) {
-        const batch = writeBatch(db);
-        chunk.forEach(lead => { batch.set(doc(collection(db, "leads")), lead); });
-        await batch.commit();
-        salvos += chunk.length;
-        setUploadProgresso(`Salvando na Nuvem: ${salvos} de ${novosLeads.length}`);
+      let atualizados = 0;
+      
+      try {
+          for (let i = 0; i < novos.length; i += BATCH_SIZE) {
+            const chunk = novos.slice(i, i + BATCH_SIZE);
+            const batch = writeBatch(db);
+            chunk.forEach(lead => { 
+                const docRef = doc(collection(db, "leads"));
+                batch.set(docRef, lead); 
+            });
+            await batch.commit();
+            salvos += chunk.length;
+            setUploadProgresso(`Salvando Novos: ${salvos} de ${novos.length}`);
+          }
+
+          for (let i = 0; i < paraAtualizar.length; i += BATCH_SIZE) {
+            const chunk = paraAtualizar.slice(i, i + BATCH_SIZE);
+            const batch = writeBatch(db);
+            chunk.forEach(item => { 
+                batch.update(doc(db, "leads", item.id), item.changes); 
+            });
+            await batch.commit();
+            atualizados += chunk.length;
+            setUploadProgresso(`Atualizando Existentes: ${atualizados} de ${paraAtualizar.length}`);
+          }
+
+          setUploadProgresso('');
+          mostrarMensagem(`Feito! ${salvos} novos, ${atualizados} atualizados, ${ignorados} ignorados.`);
+      } catch (err) {
+          setUploadProgresso('');
+          mostrarMensagem('Erro durante o salvamento dos dados.', true);
       }
-      setUploadProgresso('');
-      mostrarMensagem(`Importação concluída! ${novosLeads.length} salvos no Firebase.`);
     };
     reader.readAsText(file, 'UTF-8');
   };
@@ -456,6 +571,7 @@ function App() {
     histFiltrado.forEach(h => {
       const lead = leads.find(l => l.id === h.id_lead) || {};
       const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
+      
       csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(lead.nome)},${limpaStr(lead['CPF/CNPJ'])},${limpaStr(lead.distribuidora || lead.bandeira)},${limpaStr(lead.cidade)},${limpaStr(lead.uf)},${limpaStr(lead.etapa_funil)},${limpaStr(lead.status_venda)},${limpaStr(lead.motivo_perda)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
     });
 
@@ -467,15 +583,51 @@ function App() {
     mostrarMensagem("Download iniciado!");
   };
 
-  const abrirWhatsApp = async (telefone, leadAlvo = leadAtual) => {
-    if (!leadAlvo) return;
+  const consultarCNPJ = async () => {
+    if (!leadAtual || !leadAtual['CPF/CNPJ']) return;
+    const cnpjL = leadAtual['CPF/CNPJ'].replace(/\D/g, '');
+    if (cnpjL.length !== 14) return mostrarMensagem('CNPJ inválido para consulta.', true);
 
+    setBuscandoCNPJ(true);
+    try {
+        const res = await fetch(`https://brasilapi.com.br/api/cnpj/v1/${cnpjL}`);
+        if (!res.ok) throw new Error('Não encontrado');
+        const data = await res.json();
+        
+        let updateData = {
+            razao_social: data.razao_social,
+            endereco: `${data.logradouro}${data.numero ? ', ' + data.numero : ''}`,
+            bairro: data.bairro,
+            cep: data.cep,
+            cidade: data.municipio,
+            uf: data.uf,
+        };
+
+        if (data.ddd_telefone_1) {
+            const telApi = data.ddd_telefone_1.replace(/\D/g, '');
+            const existingTels = leadAtual.telefones || [];
+            if (!existingTels.includes(telApi) && telApi.length >= 10) {
+                updateData.telefones = [...existingTels, telApi];
+                if (!leadAtual.telefone) updateData.telefone = telApi;
+            }
+        }
+
+        await updateDoc(doc(db, "leads", leadAtual.id), updateData);
+        mostrarMensagem('✅ Dados da Receita sincronizados!');
+    } catch (error) {
+        mostrarMensagem('Erro ao consultar CNPJ na Receita.', true);
+    } finally {
+        setBuscandoCNPJ(false);
+    }
+  };
+
+  const abrirWhatsApp = async (lead, telefone) => {
     const hora = new Date().getHours();
     let saudacao = 'Bom dia';
     if (hora >= 12 && hora < 18) saudacao = 'Boa tarde';
     else if (hora >= 18) saudacao = 'Boa noite';
 
-    const nomeRevenda = leadAlvo.nome || 'a revenda';
+    const nomeRevenda = lead.nome || 'a revenda';
     const nomeVendedor = vendedor || 'Consultor';
 
     const modelos = [
@@ -499,125 +651,98 @@ function App() {
     const url = `https://wa.me/55${numLimpo}?text=${msgEncoded}`;
 
     window.open(url, '_blank');
-
-    // Abre o Modal para confirmar se o envio deu certo e automatizar o Follow-up / Nova Etapa
-    setModalConfirmacaoWA({ telefone, leadAlvo, msgSorteada });
+    setModalContatoConfirma({ lead, telefone, msg: msgSorteada, canal: 'WhatsApp' });
   };
 
-  const confirmarWhatsApp = async (deuCerto) => {
-    if (!modalConfirmacaoWA) return;
-    const { telefone, leadAlvo, msgSorteada } = modalConfirmacaoWA;
-    setModalConfirmacaoWA(null);
+  const abrirLigacao = (lead, telefone) => {
+    window.location.href = `tel:${telefone.replace(/\D/g, '')}`;
+    setModalContatoConfirma({ lead, telefone, msg: '', canal: 'Ligação' });
+  };
 
+  const confirmarContato = async (deuCerto) => {
+    if (!modalContatoConfirma) return;
+    const { lead, telefone, msg, canal } = modalContatoConfirma;
     const timestamp = Date.now();
-
-    // MÁGICA DO FOLLOW-UP AUTOMÁTICO PARA O PRÓXIMO DIA ÚTIL
-    const nextDate = new Date();
-    nextDate.setDate(nextDate.getDate() + 1); // Pula 1 dia
-    while (nextDate.getDay() === 0 || nextDate.getDay() === 6) { // 0 = Domingo, 6 = Sábado
-        nextDate.setDate(nextDate.getDate() + 1);
-    }
-    nextDate.setHours(10, 0, 0, 0); // Define follow-up para as 10:00 da manhã
+    const proximoDiaUtil = getNextBusinessDay().getTime();
 
     try {
         if (deuCerto) {
+            let obsText = canal === 'WhatsApp' 
+                ? `✅ Contato ativo com SUCESSO via WhatsApp:\n\n"${msg}"\n\n(Follow-up agendado para o próximo dia útil)` 
+                : `✅ Contato ativo com SUCESSO via Ligação.\n\n(Follow-up agendado para o próximo dia útil)`;
+
             await addDoc(collection(db, "historico"), {
-                id_lead: leadAlvo.id, 
+                id_lead: lead.id, 
                 data_hora: new Date().toLocaleString('pt-BR'), 
                 timestamp: timestamp, 
                 vendedor: vendedor,
                 contato: telefone, 
-                canal: 'WhatsApp', 
-                observacao: `Contato ativo iniciado via WhatsApp:\n\n"${msgSorteada}"\n\n(Retorno agendado automaticamente para o próximo dia útil).`
+                canal: canal, 
+                sucesso: true,
+                observacao: obsText
             });
             
-            let novaEtapa = leadAlvo.etapa_funil;
-            // Se o lead for Novo, move magicamente para a etapa de Primeiro Contato
-            if (!novaEtapa || novaEtapa === ETAPAS.LEAD) {
+            let novaEtapa = lead.etapa_funil;
+            if (!lead.etapa_funil || lead.etapa_funil === ETAPAS.LEAD) {
                 novaEtapa = ETAPAS.PRIMEIRO_CONTATO;
             }
-
-            await updateDoc(doc(db, "leads", leadAlvo.id), { 
+            
+            await updateDoc(doc(db, "leads", lead.id), { 
                 ultima_interacao: timestamp,
-                proximo_contato: nextDate.getTime(),
+                proximo_contato: proximoDiaUtil,
                 etapa_funil: novaEtapa
             });
-            
-            mostrarMensagem('WhatsApp salvo, retorno agendado e cliente movimentado!');
+            mostrarMensagem('Sucesso! Lead avançado e retorno agendado.');
         } else {
-            const invalidos = leadAlvo.telefones_invalidos || [];
-            if(!invalidos.includes(telefone)) {
-                invalidos.push(telefone);
-            }
+            let obsText = canal === 'WhatsApp' 
+                ? `🚫 Número sem WhatsApp ou contato falhou.\n\n(Follow-up de ligação agendado para o próximo dia útil)` 
+                : `🚫 Ligação não atendida ou falhou.\n\n(Follow-up agendado para o próximo dia útil)`;
 
             await addDoc(collection(db, "historico"), {
-                id_lead: leadAlvo.id, 
+                id_lead: lead.id, 
                 data_hora: new Date().toLocaleString('pt-BR'), 
                 timestamp: timestamp, 
                 vendedor: vendedor,
                 contato: telefone, 
-                canal: 'WhatsApp', 
-                observacao: `Tentativa de contato via WhatsApp falhou (Número não possui WhatsApp ativo).\n\n(Retorno agendado automaticamente para o próximo dia útil via ligação).`
+                canal: canal, 
+                sucesso: false,
+                observacao: obsText
             });
 
-            await updateDoc(doc(db, "leads", leadAlvo.id), { 
+            let updateData = { 
                 ultima_interacao: timestamp,
-                proximo_contato: nextDate.getTime(),
-                telefones_invalidos: invalidos
-            });
+                proximo_contato: proximoDiaUtil
+            };
 
-            mostrarMensagem('Número marcado como sem WhatsApp e retorno agendado!');
+            if (canal === 'WhatsApp') {
+                const invalidos = lead.telefones_invalidos || [];
+                if (!invalidos.includes(telefone)) {
+                    invalidos.push(telefone);
+                }
+                updateData.telefones_invalidos = invalidos;
+            }
+            
+            await updateDoc(doc(db, "leads", lead.id), updateData);
+            mostrarMensagem(`Falha registrada. Follow-up agendado.`);
         }
     } catch (e) {
-        console.error("Erro ao registrar whatsapp", e);
-        mostrarMensagem('Erro ao salvar os dados.', true);
+        console.error("Erro ao gravar histórico", e);
     }
+    setModalContatoConfirma(null);
   };
 
-  const consultarCNPJ = async () => {
-      if (!leadAtual['CPF/CNPJ']) return mostrarMensagem('CNPJ não cadastrado.', true);
-      const cnpjLimpo = leadAtual['CPF/CNPJ'].replace(/\D/g, '');
-      if (cnpjLimpo.length !== 14) return mostrarMensagem('CNPJ inválido (14 dígitos).', true);
-
-      setBuscandoCNPJ(true);
-      mostrarMensagem('Consultando Receita Federal...');
-
-      try {
-          const res = await fetch(`https://brasilapi.com.br/api/cnpj/v1/${cnpjLimpo}`);
-          if (!res.ok) throw new Error('CNPJ não encontrado');
-          const dados = await res.json();
-
-          let novoEndereco = dados.logradouro || '';
-          if (dados.numero) novoEndereco += `, ${dados.numero}`;
-          if (dados.complemento) novoEndereco += ` - ${dados.complemento}`;
-
-          const atualizacoes = {
-              razao_social: dados.razao_social || leadAtual.razao_social || '',
-              endereco: novoEndereco,
-              bairro: dados.bairro || leadAtual.bairro || '',
-              cidade: dados.municipio || leadAtual.cidade || '',
-              uf: dados.uf || leadAtual.uf || '',
-              cep: dados.cep || leadAtual.cep || ''
-          };
-
-          if (dados.ddd_telefone_1) {
-              const telReceita = dados.ddd_telefone_1.replace(/\D/g, '');
-              if (telReceita) {
-                  const telsAtuais = leadAtual.telefones || (leadAtual.telefone ? [leadAtual.telefone] : []);
-                  if (!telsAtuais.some(t => t.replace(/\D/g, '') === telReceita)) {
-                      atualizacoes.telefones = [...telsAtuais, dados.ddd_telefone_1];
-                      atualizacoes.telefone = atualizacoes.telefones[0];
-                  }
-              }
-          }
-
-          await updateDoc(doc(db, "leads", leadAtual.id), atualizacoes);
-          mostrarMensagem('Dá um Appgas! Dados da Receita sincronizados!');
-      } catch (erro) {
-          mostrarMensagem('Erro ao buscar CNPJ.', true);
-      } finally {
-          setBuscandoCNPJ(false);
-      }
+  const marcarNumeroInvalido = async (telefone) => {
+    if (!leadAtual) return;
+    try {
+        const invalidos = leadAtual.telefones_invalidos || [];
+        if (!invalidos.includes(telefone)) {
+            invalidos.push(telefone);
+            await updateDoc(doc(db, "leads", leadAtual.id), { telefones_invalidos: invalidos });
+            mostrarMensagem('Número marcado como sem WhatsApp!');
+        }
+    } catch(e) {
+        mostrarMensagem('Erro ao marcar número.', true);
+    }
   };
 
   const salvarNovoLead = async () => {
@@ -649,7 +774,7 @@ function App() {
     try {
       await addDoc(collection(db, "historico"), {
         id_lead: leadAtual.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor,
-        contato: novoComentario.contato, canal: novoComentario.canal, observacao: novoComentario.observacao
+        contato: novoComentario.contato, canal: novoComentario.canal, observacao: novoComentario.observacao, sucesso: true
       });
       const attLead = { ultima_interacao: timestamp };
       if (novoComentario.proximo_contato) attLead.proximo_contato = new Date(novoComentario.proximo_contato).getTime();
@@ -702,16 +827,24 @@ function App() {
     loteSelecionados.forEach(id => {
       const docRef = doc(db, "leads", id);
       batch.update(docRef, { responsavel: loteNovoResponsavel === 'SEM_DONO' ? '' : loteNovoResponsavel });
+      
       const histRef = doc(collection(db, "historico"));
-      batch.set(histRef, { id_lead: id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: Date.now(), vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: `🔄 Transferido em Lote para: ${loteNovoResponsavel === 'SEM_DONO' ? 'Sem Dono' : loteNovoResponsavel}` });
+      batch.set(histRef, {
+        id_lead: id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: Date.now(),
+        vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático',
+        observacao: `🔄 Transferido em Lote para: ${loteNovoResponsavel === 'SEM_DONO' ? 'Sem Dono' : loteNovoResponsavel}`
+      });
     });
 
     try {
       await batch.commit();
-      setModalLote(false); setLoteSelecionados([]); setUploadProgresso('');
+      setModalLote(false);
+      setLoteSelecionados([]);
+      setUploadProgresso('');
       mostrarMensagem(`Transferência de ${loteSelecionados.length} concluída!`);
     } catch(e) {
-      setUploadProgresso(''); mostrarMensagem('Erro na transferência.', true);
+      setUploadProgresso('');
+      mostrarMensagem('Erro na transferência.', true);
     }
   };
 
@@ -754,26 +887,38 @@ function App() {
     });
 
     let sumCiclo = 0; let fechamentos = 0;
-    baseLeads.filter(l => l.status_venda && l.data_conclusao).forEach(l => { sumCiclo += (l.data_conclusao - l.data_criacao) / (1000 * 60 * 60 * 24); fechamentos++; });
+    baseLeads.filter(l => l.status_venda && l.data_conclusao).forEach(l => {
+       sumCiclo += (l.data_conclusao - l.data_criacao) / (1000 * 60 * 60 * 24); fechamentos++;
+    });
     const cicloMedio = fechamentos > 0 ? (sumCiclo/fechamentos).toFixed(1) : 0;
 
     const dataFunil = [
       { name: '1. Lead', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.LEAD || !l.etapa_funil).length },
-      { name: '1.5 P. Cont.', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.PRIMEIRO_CONTATO).length },
-      { name: '2. Apres.', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.APRESENTACAO).length },
-      { name: '3. Negoc.', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.NEGOCIACAO).length },
-      { name: '4. Cad.', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.CADASTRO).length },
-      { name: '5. Trein.', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.TREINAMENTO).length },
+      { name: 'P. Contato', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.PRIMEIRO_CONTATO).length },
+      { name: '2. Apresentação', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.APRESENTACAO).length },
+      { name: '3. Negociação', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.NEGOCIACAO).length },
+      { name: '4. Lançamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.CADASTRO).length },
+      { name: '5. Treinamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.TREINAMENTO).length },
     ];
 
-    let contagensCanais = {}; let timelineData = {};
+    let contagensCanais = {}; 
+    let timelineData = {};
+    let intencaoContato = { total: 0, sucesso: 0, falha: 0 };
+
     historicoGeral.forEach(h => {
        const leadMatch = baseLeads.find(l => l.id === h.id_lead);
        if (leadMatch && checkTime(h.timestamp) && h.canal !== 'Automático') {
-           contagensCanais[h.canal] = (contagensCanais[h.canal] || 0) + 1;
-           const dateKey = new Date(h.timestamp).toLocaleDateString('pt-BR', {day:'2-digit', month:'2-digit'});
-           if (!timelineData[dateKey]) timelineData[dateKey] = { date: dateKey };
-           timelineData[dateKey][h.canal] = (timelineData[dateKey][h.canal] || 0) + 1;
+           intencaoContato.total++;
+           
+           if (h.sucesso !== false) {
+               intencaoContato.sucesso++;
+               contagensCanais[h.canal] = (contagensCanais[h.canal] || 0) + 1;
+               const dateKey = new Date(h.timestamp).toLocaleDateString('pt-BR', {day:'2-digit', month:'2-digit'});
+               if (!timelineData[dateKey]) timelineData[dateKey] = { date: dateKey };
+               timelineData[dateKey][h.canal] = (timelineData[dateKey][h.canal] || 0) + 1;
+           } else {
+               intencaoContato.falha++;
+           }
        }
     });
 
@@ -787,12 +932,16 @@ function App() {
 
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
-         <button onClick={voltarVisao} className={`mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit`} style={{color: BRAND.gray}}>← Voltar</button>
+         <button onClick={voltarVisao} className={`mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit`} style={{color: BRAND.gray}}>
+            ← Voltar
+         </button>
          <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
              <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>Métricas e Inteligência</h2>
              <div className="flex flex-col sm:flex-row gap-2 w-full xl:w-auto">
                  <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}>
-                    <option value="mes">Este Mês</option><option value="semana">Esta Semana</option><option value="tudo">Todo Período</option>
+                    <option value="mes">Este Mês</option>
+                    <option value="semana">Esta Semana</option>
+                    <option value="tudo">Todo Período</option>
                  </select>
                  {isAdmin && (
                    <select className="text-sm font-bold text-white py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}} value={filtroVendedorDash} onChange={e=>setFiltroVendedorDash(e.target.value)}>
@@ -805,7 +954,10 @@ function App() {
 
          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
             <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
-                <div className="flex justify-between items-center mb-6"><h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Funil de Leads</h3><span className="text-slate-300">⚙️</span></div>
+                <div className="flex justify-between items-center mb-6">
+                   <h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Funil de Leads</h3>
+                   <span className="text-slate-300">⚙️</span>
+                </div>
                 <div className="h-56 md:h-64">
                     <ResponsiveContainer width="100%" height="100%">
                        <BarChart data={dataFunil} layout="vertical" margin={{ left: 40, right: 40, top: 10, bottom: 10 }}>
@@ -813,14 +965,19 @@ function App() {
                           <XAxis type="number" />
                           <YAxis dataKey="name" type="category" width={90} tick={{fontSize: 11, fill: BRAND.gray, fontWeight: 'bold'}} />
                           <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
-                          <Bar dataKey="qtde" fill={BRAND.blue} radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar>
+                          <Bar dataKey="qtde" fill={BRAND.blue} radius={[0, 4, 4, 0]}>
+                              <LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" />
+                          </Bar>
                        </BarChart>
                     </ResponsiveContainer>
                 </div>
             </div>
             
             <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
-                <div className="flex justify-between items-center mb-6"><h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Fontes de Contato</h3><span className="text-slate-300">⚙️</span></div>
+                <div className="flex justify-between items-center mb-6">
+                   <h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Fontes de Contato</h3>
+                   <span className="text-slate-300">⚙️</span>
+                </div>
                 <div className="h-56 md:h-64">
                     {dataCanais.length > 0 ? (
                       <ResponsiveContainer width="100%" height="100%">
@@ -832,7 +989,7 @@ function App() {
                             <Legend wrapperStyle={{fontSize: '11px', fontWeight: 'bold'}} />
                          </PieChart>
                       </ResponsiveContainer>
-                    ) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem interações no período</div>}
+                    ) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem interações efetivas no período</div>}
                 </div>
             </div>
          </div>
@@ -848,10 +1005,18 @@ function App() {
              </div>
          </div>
 
-         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6 mb-6">
+         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-6">
+             <div className="bg-white p-5 md:p-6 rounded-2xl shadow-sm border-l-4" style={{borderLeftColor: BRAND.blue}}>
+                 <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-1 text-slate-500">Intenção de Contato</h3>
+                 <div className="text-4xl md:text-5xl font-light mb-3 text-slate-800">{intencaoContato.total}</div>
+                 <div className="flex gap-4 text-[10px] md:text-xs font-bold">
+                     <span className="text-emerald-600 bg-emerald-50 px-2 py-1 rounded">✅ {intencaoContato.sucesso} Efetivos</span>
+                     <span className="text-red-500 bg-red-50 px-2 py-1 rounded">🚫 {intencaoContato.falha} Falhas</span>
+                 </div>
+             </div>
              <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white" style={{backgroundColor: BRAND.blueLight}}><h3 className="text-xs md:text-sm font-medium text-white/80 mb-4 md:mb-6">Número de Leads convertidos</h3><div className="text-4xl md:text-5xl font-light text-right">{leadsConvertidos.length}</div></div>
              <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white" style={{backgroundColor: BRAND.gray}}><h3 className="text-xs md:text-sm font-medium text-white/80 mb-4 md:mb-6 truncate">Leads descartados</h3><div className="text-4xl md:text-5xl font-light text-right">{leadsPerdidos.length}</div></div>
-             <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white sm:col-span-2 lg:col-span-1 bg-red-500"><div className="flex justify-between items-start mb-4 md:mb-6"><h3 className="text-xs md:text-sm font-medium text-white/80">Perdido (Taxa)</h3><span className="text-white/50">⚙️</span></div><div className="text-4xl md:text-5xl font-light text-right">{taxaDescarte}%</div></div>
+             <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white bg-red-500"><div className="flex justify-between items-start mb-4 md:mb-6"><h3 className="text-xs md:text-sm font-medium text-white/80">Perdido (Taxa)</h3><span className="text-white/50">⚙️</span></div><div className="text-4xl md:text-5xl font-light text-right">{taxaDescarte}%</div></div>
          </div>
 
          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 md:gap-6 mb-6">
@@ -873,7 +1038,7 @@ function App() {
          </div>
 
          <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6">
-            <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Evolução Diária de Contatos (Canal)</h3>
+            <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Evolução Diária de Contatos Efetivos</h3>
             <div className="h-56 md:h-64">
                {lineChartData.length > 0 ? (
                  <ResponsiveContainer width="100%" height="100%">
@@ -988,6 +1153,7 @@ function App() {
 
       {menuMobileAberto && <div className="fixed inset-0 bg-slate-900/60 z-30 md:hidden backdrop-blur-sm" onClick={fecharMenuMobile}></div>}
 
+      {/* Sidebar de Navegação */}
       <div className={`${menuMobileAberto ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 fixed md:relative z-40 md:z-20 w-[85%] sm:w-80 md:w-80 bg-white border-r border-slate-200 flex flex-col shadow-2xl md:shadow-lg h-full pt-16 md:pt-0`}>
         <div className="p-4 md:p-6 text-white shrink-0 rounded-br-[40px] hidden md:block" style={{backgroundColor: BRAND.blue}}>
           <div className="flex items-center justify-between mb-4">
@@ -1064,39 +1230,49 @@ function App() {
           )}
         </div>
 
+        {}
         {!leadAtual && visaoAtual === 'lista' && (
-          <div ref={listaRef} onScroll={(e) => scrollPosRef.current.lista = e.target.scrollTop} className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
-            {leadsFiltradosGeral.slice(0, 100).map(lead => {
+          <div ref={listaRef} onScroll={(e) => {
+               const { scrollTop, scrollHeight, clientHeight } = e.target;
+               if (scrollHeight - scrollTop <= clientHeight * 1.5) {
+                   setItensVisiveisLista(prev => prev + 50);
+               }
+           }} className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
+            {leadsFiltradosGeral.slice(0, itensVisiveisLista).map(lead => {
               const urg = getUrgency(lead);
               const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
-              const isInvalid = lead.telefones_invalidos?.includes(lead.telefone);
+              const telefones = lead.telefones?.length > 0 ? lead.telefones : (lead.telefone ? [lead.telefone] : []);
+              const telValido = telefones.find(t => !(lead.telefones_invalidos || []).includes(t));
 
               return (
-                <div key={lead.id} onClick={() => { setLeadSelecionadoId(lead.id); setVeioDoMapa(false); fecharMenuMobile(); }} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
+                <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
                   <h3 className="font-bold text-xs md:text-sm mb-1 truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
                   
                   <div className="flex flex-wrap gap-1.5 mb-2">
-                    <p className="text-[10px] md:text-xs truncate" style={{color: BRAND.gray}}>{lead.cidade ? `📍 ${lead.cidade} - ${lead.uf}` : '-'}</p>
+                    <p className="text-[10px] md:text-xs truncate flex items-center gap-1" style={{color: BRAND.gray}}>
+                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                       {lead.cidade ? `${lead.cidade} - ${lead.uf}` : '-'}
+                    </p>
                     {distNome && (
-                       <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate">
-                         🏢 {distNome}
+                       <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate flex items-center gap-1">
+                         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path></svg>
+                         {distNome}
                        </span>
                     )}
                   </div>
 
-                  <div className="flex justify-between items-center mb-2">
-                    {lead.telefone ? (
-                        isInvalid ? (
-                            <a href={`tel:${lead.telefone.replace(/\D/g, '')}`} onClick={e => e.stopPropagation()} className="px-3 md:px-4 py-1.5 md:py-2 text-[10px] md:text-[11px] font-black rounded-xl border uppercase shadow-sm transition-colors hover:-translate-y-0.5 flex items-center gap-1.5 bg-[#eff6ff] text-[#2563eb] border-[#bfdbfe] hover:bg-[#2563eb] hover:text-white">
-                                📞 Ligar
-                            </a>
-                        ) : (
-                            <button onClick={(e) => { e.stopPropagation(); abrirWhatsApp(lead.telefone, lead); }} className="px-3 md:px-4 py-1.5 md:py-2 text-[10px] md:text-[11px] font-black rounded-xl border uppercase shadow-sm transition-colors hover:-translate-y-0.5 flex items-center gap-1.5 bg-[#25D366] text-white border-[#1DA851] hover:bg-[#1DA851]">
-                                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg> Chamar
-                            </button>
-                        )
+                  <div className="flex justify-between items-center mb-2 gap-2">
+                    {telValido ? (
+                        <button onClick={(e) => { e.stopPropagation(); abrirWhatsApp(lead, telValido); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-[#f0fdf4] text-[#166534] border-[#bbf7d0] hover:bg-[#dcfce7] transition-colors flex items-center gap-1 shadow-sm">
+                            <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                            Chamar
+                        </button>
+                    ) : telefones.length > 0 ? (
+                        <button onClick={(e) => { e.stopPropagation(); abrirLigacao(lead, telefones[0]); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase text-white shadow-sm flex items-center gap-1 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}}>
+                            📞 Ligar
+                        </button>
                     ) : (
-                        <button disabled className="px-3 md:px-4 py-1.5 md:py-2 text-[10px] md:text-[11px] font-black rounded-xl border uppercase shadow-sm flex items-center gap-1.5 bg-slate-50 text-slate-400 border-slate-200 cursor-not-allowed">Sem Tel</button>
+                        <span className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-slate-50 text-slate-500 border-slate-200">Sem Tel</span>
                     )}
                     <span className="text-[9px] md:text-[10px] font-extrabold uppercase px-2 py-1 rounded-lg border" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue, borderColor: `${BRAND.blue}30`}}>{lead.responsavel || 'SEM DONO'}</span>
                   </div>
@@ -1106,34 +1282,40 @@ function App() {
                 </div>
               )
             })}
+            {itensVisiveisLista < leadsFiltradosGeral.length && (
+                <div className="py-4 text-center">
+                    <span className="text-xs font-bold text-slate-400 animate-pulse border border-slate-200 px-4 py-2 rounded-xl bg-white shadow-sm">Carregando mais...</span>
+                </div>
+            )}
           </div>
         )}
       </div>
 
       <div className="flex-1 bg-slate-50 relative h-full flex flex-col min-w-0 overflow-hidden pt-16 md:pt-0">
         
+        {}
         {leadAtual ? (
           <div className="flex-1 p-4 md:p-8 overflow-y-auto">
             <div className="max-w-4xl mx-auto pb-20">
-              <button onClick={() => setLeadSelecionadoId(null)} className="mb-4 md:mb-6 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>
+              <button onClick={voltarVisao} className="mb-4 md:mb-6 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>
                 ← Voltar
               </button>
 
-              <div className="bg-white rounded-2xl md:rounded-[32px] rounded-tl-[40px] shadow-sm border border-slate-200 overflow-hidden mb-6 md:mb-8">
+              <div className="bg-white rounded-2xl md:rounded-[32px] shadow-sm border border-slate-200 overflow-hidden mb-6 md:mb-8 rounded-tl-[40px] rounded-br-[40px] rounded-tr-xl rounded-bl-xl">
                 <div className="h-2 md:h-2.5" style={{backgroundColor: BRAND.blue}}></div>
                 <div className="p-5 md:p-10">
                   <div className="flex flex-col md:flex-row gap-3 mb-6 items-start md:items-center justify-between">
-                    <div className="flex flex-wrap gap-2 items-center">
+                    <div className="flex flex-wrap gap-2">
                        <span className="px-3 md:px-4 py-1.5 text-[10px] md:text-xs font-black rounded-xl border uppercase tracking-widest shadow-sm" style={{backgroundColor: `${BRAND.yellow}20`, color: BRAND.black, borderColor: BRAND.yellow}}>
-                         Classe {leadAtual['Classe Revenda'] || 'C'}
+                          Classe {leadAtual['Classe Revenda'] || 'C'}
                        </span>
                        <span className="px-3 md:px-4 py-1.5 bg-slate-50 text-[10px] md:text-xs font-bold rounded-xl border border-slate-200 shadow-sm flex items-center gap-2" style={{color: BRAND.gray}}>
-                         {leadAtual['CPF/CNPJ'] || 'Documento Não Informado'}
-                         {leadAtual['CPF/CNPJ'] && leadAtual['CPF/CNPJ'].replace(/\D/g, '').length === 14 && (
-                             <button onClick={consultarCNPJ} disabled={buscandoCNPJ} className="text-white px-2 py-0.5 rounded text-[9px] transition-colors font-bold flex items-center gap-1 hover:opacity-80" style={{backgroundColor: BRAND.blue}}>
-                                 {buscandoCNPJ ? '⏳ Buscando...' : '🔍 Buscar na Receita'}
-                             </button>
-                         )}
+                          {leadAtual['CPF/CNPJ'] || 'Documento Não Informado'}
+                          {leadAtual['CPF/CNPJ'] && leadAtual['CPF/CNPJ'].replace(/\D/g, '').length === 14 && (
+                              <button onClick={consultarCNPJ} disabled={buscandoCNPJ} className="ml-1 text-[10px] bg-slate-200 hover:bg-slate-300 text-slate-700 px-2 py-0.5 rounded-md font-bold transition-colors">
+                                  {buscandoCNPJ ? '⏳ Buscando...' : '🔍 Buscar na Receita'}
+                              </button>
+                          )}
                        </span>
                     </div>
                     
@@ -1163,31 +1345,44 @@ function App() {
                   </div>
                   
                   <h1 className="text-3xl md:text-5xl font-black mb-1 tracking-tight" style={{color: BRAND.black}}>{leadAtual.nome || 'Sem Nome'}</h1>
-                  {leadAtual.razao_social && <p className="text-sm font-semibold mb-6 uppercase tracking-wider" style={{color: BRAND.gray}}>{leadAtual.razao_social}</p>}
+                  {leadAtual.razao_social && (
+                      <p className="text-xs md:text-sm font-bold uppercase tracking-widest mb-6 md:mb-8" style={{color: BRAND.gray}}>{leadAtual.razao_social}</p>
+                  )}
                   {!leadAtual.razao_social && <div className="mb-6 md:mb-8"></div>}
                   
                   <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
                     <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
-                      <div className="text-slate-400">📍</div>
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.endereco ? leadAtual.endereco : `${leadAtual.cidade || '-'} - ${leadAtual.uf || '-'}`}</span>
-                        {leadAtual.bairro && <span className="text-xs mt-0.5" style={{color: BRAND.gray}}>{leadAtual.bairro} • CEP: {leadAtual.cep}</span>}
-                        {leadAtual.endereco && <span className="text-xs font-bold mt-1" style={{color: BRAND.gray}}>{leadAtual.cidade} - {leadAtual.uf}</span>}
+                      <div className="text-slate-400">
+                         <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                      </div>
+                      <div className="min-w-0">
+                         {leadAtual.endereco ? (
+                             <>
+                                <p className="font-semibold text-xs md:text-sm truncate" style={{color: BRAND.black}}>{leadAtual.endereco}</p>
+                                <p className="text-[10px] md:text-xs font-medium truncate" style={{color: BRAND.gray}}>{leadAtual.bairro} - {leadAtual.cidade} / {leadAtual.uf}</p>
+                                <p className="text-[9px] md:text-[10px] font-bold mt-0.5" style={{color: BRAND.gray}}>CEP: {leadAtual.cep}</p>
+                             </>
+                         ) : (
+                             <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.cidade || '-'} - {leadAtual.uf || '-'}</span>
+                         )}
                       </div>
                     </div>
 
                     <div className="flex items-center gap-3 md:gap-4 bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9]">
-                      <div className="text-blue-500">🏢</div>
-                      <div>
+                      <div className="text-blue-500">
+                         <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path></svg>
+                      </div>
+                      <div className="min-w-0">
                         <p className="text-[10px] uppercase font-bold" style={{color: BRAND.gray}}>Distribuidora</p>
-                        <span className="font-semibold text-sm md:text-base" style={{color: BRAND.black}}>{leadAtual.distribuidora || leadAtual.bandeira || 'Não informada'}</span>
+                        <span className="font-semibold text-sm md:text-base truncate block" style={{color: BRAND.black}}>{leadAtual.distribuidora || leadAtual.bandeira || 'Não informada'}</span>
                       </div>
                     </div>
                     
                     <div className="bg-slate-50 p-4 md:p-5 rounded-2xl border border-[#f1f5f9] sm:col-span-2 md:col-span-1">
                       <div className="flex justify-between items-center mb-3">
                          <div className="flex items-center gap-2" style={{color: BRAND.gray}}>
-                             📞 <span className="text-xs font-bold uppercase tracking-wider">Telefones</span>
+                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"></path></svg>
+                             <span className="text-xs font-bold uppercase tracking-wider">Telefones</span>
                          </div>
                          {!editandoTels ? (
                              <button onClick={() => { setTelsTemp(leadAtual.telefones?.length > 0 ? [...leadAtual.telefones] : (leadAtual.telefone ? [leadAtual.telefone] : [])); setEditandoTels(true); }} className="bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-slate-50 transition-colors" style={{color: BRAND.blue}}>Editar</button>
@@ -1213,26 +1408,26 @@ function App() {
                                  if (displayTels.length === 0) return <span className="font-semibold text-sm md:text-base" style={{color: BRAND.gray}}>Sem telefone cadastrado</span>;
                                  
                                  return displayTels.map((tel, idx) => {
-                                     const isInvalid = leadAtual.telefones_invalidos?.includes(tel);
-                                     if(isInvalid) {
-                                         return (
-                                             <div key={idx} className="flex gap-2 items-center w-full">
-                                                 <a href={`tel:${tel.replace(/\D/g, '')}`} className="font-semibold text-sm md:text-base flex-1 flex items-center justify-between gap-2 bg-[#eff6ff] p-3 rounded-xl border border-[#bfdbfe] shadow-sm transition-all text-[#2563eb] hover:bg-[#2563eb] hover:text-white">
-                                                     {tel}
-                                                     <span className="text-[10px] bg-white text-[#2563eb] px-2.5 py-1 rounded-full font-bold">📞 Ligar</span>
-                                                 </a>
-                                             </div>
-                                         );
-                                     }
+                                     const invalido = (leadAtual.telefones_invalidos || []).includes(tel);
                                      return (
                                          <div key={idx} className="flex gap-2 items-center w-full">
-                                             <button onClick={() => abrirWhatsApp(tel)} className="font-semibold text-sm md:text-base flex-1 flex items-center justify-between gap-2 bg-white p-3 rounded-xl border border-slate-200 shadow-sm transition-all text-left hover:border-[#2D6FEF]" style={{color: BRAND.black}}>
+                                             <div className="font-semibold text-sm md:text-base flex-1 bg-white p-3 rounded-xl border border-slate-200 shadow-sm transition-all text-left" style={{color: BRAND.black}}>
                                                  {tel}
-                                                 <span className="text-[10px] bg-[#25D366] text-white px-2.5 py-1 rounded-full font-bold flex items-center gap-1.5 shadow-sm">
-                                                    <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
-                                                    Iniciar
-                                                 </span>
-                                             </button>
+                                             </div>
+                                             {invalido ? (
+                                                 <button onClick={() => abrirLigacao(leadAtual, tel)} className="text-[10px] text-white px-4 py-3.5 rounded-xl font-bold flex items-center justify-center shadow-sm hover:opacity-90 transition-opacity gap-1.5" style={{backgroundColor: BRAND.blue}}>
+                                                     📞 Ligar
+                                                 </button>
+                                             ) : (
+                                                 <>
+                                                     <button onClick={() => marcarNumeroInvalido(tel)} className="text-[10px] bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700 px-3 py-3 rounded-xl font-bold transition-colors border border-slate-200" title="Marcar como Inválido / Sem WhatsApp">
+                                                         🚫
+                                                     </button>
+                                                     <button onClick={() => abrirWhatsApp(leadAtual, tel)} className="text-[10px] bg-[#25D366] hover:bg-[#20b858] text-white px-4 py-3 rounded-xl font-bold flex items-center justify-center gap-1.5 shadow-sm transition-colors">
+                                                         <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                                                     </button>
+                                                 </>
+                                             )}
                                          </div>
                                      );
                                  });
@@ -1266,7 +1461,7 @@ function App() {
                 </div>
               </div>
 
-              <div className="bg-white rounded-2xl md:rounded-[32px] shadow-sm border border-slate-200 p-5 md:p-10 mb-6 md:mb-8 rounded-br-[40px]">
+              <div className="bg-white rounded-2xl md:rounded-[32px] shadow-sm border border-slate-200 p-5 md:p-10 mb-6 md:mb-8 rounded-tl-[40px] rounded-br-[40px] rounded-tr-xl rounded-bl-xl">
                 <h2 className="text-xl md:text-2xl font-black mb-5 md:mb-6 flex items-center gap-3" style={{color: BRAND.black}}>
                    <div className="p-2 rounded-xl" style={{backgroundColor: `${BRAND.blue}20`, color: BRAND.blue}}><svg className="w-5 md:w-6 h-5 md:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></div>
                    Registrar Nova Interação
@@ -1322,11 +1517,7 @@ function App() {
             </div>
           </div>
         ) : visaoAtual === 'kanban' ? (
-          <div 
-             ref={kanbanRef}
-             onScroll={(e) => scrollPosRef.current.kanban = e.target.scrollLeft}
-             className="flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 flex gap-4 md:gap-6 h-full bg-slate-100 items-start"
-          >
+          <div ref={kanbanRef} className="flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 flex gap-4 md:gap-6 h-full bg-slate-100 items-start">
             {Object.values(ETAPAS).map(etapa => {
               const leadsEtapa = leadsFiltradosGeral.filter(l => {
                 if (etapa === ETAPAS.FINALIZADO) return l.etapa_funil === ETAPAS.FINALIZADO;
@@ -1340,33 +1531,28 @@ function App() {
                     <span className="bg-white text-[10px] md:text-xs font-black px-2 md:px-2.5 py-0.5 md:py-1 rounded-full shadow-sm" style={{color: BRAND.gray}}>{leadsEtapa.length}</span>
                   </div>
                   
-                  <div 
-                     ref={(el) => kanbanColsRefs.current[etapa] = el}
-                     onScroll={(e) => scrollPosRef.current.kanbanCols[etapa] = e.target.scrollTop}
-                     className="flex-1 overflow-y-auto p-2 md:p-3 space-y-3 md:space-y-4"
-                  >
+                  <div className="flex-1 overflow-y-auto p-2 md:p-3 space-y-3 md:space-y-4">
                     {leadsEtapa.map(lead => {
                       const urg = getUrgency(lead);
                       const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
                       
-                      let cardCss = '';
+                      let kanbanCardBg = 'bg-white';
+                      let kanbanCardBorder = 'border-[#e2e8f0]';
                       if (lead.etapa_funil === ETAPAS.FINALIZADO) {
-                          if (lead.status_venda === 'Ganho') cardCss = 'bg-emerald-50 border-emerald-400 hover:border-emerald-500';
-                          else if (lead.status_venda === 'Perdido') cardCss = 'bg-red-50 border-red-400 hover:border-red-500';
-                          else cardCss = 'bg-white border-slate-200 hover:border-[#2D6FEF]';
-                      } else {
-                          cardCss = `bg-white ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400' : 'border-[#e2e8f0]'} hover:border-[#2D6FEF]`;
+                          if (lead.status_venda === 'Ganho') {
+                              kanbanCardBg = 'bg-[#dcfce7]';
+                              kanbanCardBorder = 'border-[#86efac]';
+                          } else {
+                              kanbanCardBg = 'bg-[#fee2e2]';
+                              kanbanCardBorder = 'border-[#fca5a5]';
+                          }
+                      } else if (urg.status === 'atrasado' || urg.status === 'ocioso') {
+                          kanbanCardBorder = 'border-red-400';
                       }
 
                       return (
-                        <div 
-                           key={lead.id} 
-                           draggable 
-                           onDragStart={(e) => setDraggedLeadId(lead.id)} 
-                           onClick={() => { setLeadSelecionadoId(lead.id); setVeioDoMapa(false); }}
-                           className={`p-4 md:p-5 rounded-[24px] md:rounded-[32px] rounded-tl-sm border-2 shadow-sm cursor-grab transition-all hover:shadow-md ${cardCss}`}
-                        >
-                          <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-white/60 px-2 py-1 rounded-md mb-2">
+                        <div key={lead.id} onClick={() => abrirCardLead(lead.id)} draggable onDragStart={(e) => setDraggedLeadId(lead.id)} className={`${kanbanCardBg} p-4 md:p-5 rounded-xl md:rounded-2xl border-2 shadow-sm cursor-pointer hover:shadow-md transition-shadow ${kanbanCardBorder}`}>
+                          <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-slate-50/50 px-2 py-1 rounded-md mb-2">
                              <span className="truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</span>
                              {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
                           </div>
@@ -1374,10 +1560,10 @@ function App() {
                           <h4 className="font-black text-sm md:text-base mb-2 md:mb-3 leading-tight truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h4>
                           <div className={`text-[10px] md:text-[11px] font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg mb-3 md:mb-4 text-center border ${urg.css}`}>{urg.texto}</div>
                           
-                          <div className="grid grid-cols-3 gap-1.5 md:gap-2 relative z-10">
-                            {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'perda', lead}); }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">👎</button>}
-                            <button onClick={(e) => { e.stopPropagation(); setLeadSelecionadoId(lead.id); setVeioDoMapa(false); }} className={`py-1.5 md:py-2 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors hover:text-white ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`} style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue}} onMouseEnter={e => e.target.style.backgroundColor = BRAND.blue} onMouseLeave={e => e.target.style.backgroundColor = `${BRAND.blue}10`} >Abrir</button>
-                            {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'ganho', lead}); }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">🏆</button>}
+                          <div className="grid grid-cols-3 gap-1.5 md:gap-2">
+                            {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'perda', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">👎</button>}
+                            <button onClick={(e) => { e.stopPropagation(); abrirCardLead(lead.id); }} className={`py-1.5 md:py-2 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors hover:text-white ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`} style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue}} onMouseEnter={e => e.target.style.backgroundColor = BRAND.blue} onMouseLeave={e => e.target.style.backgroundColor = `${BRAND.blue}10`} >Abrir</button>
+                            {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'ganho', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">🏆</button>}
                           </div>
                         </div>
                       );
@@ -1429,13 +1615,11 @@ function App() {
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.gray}}></div> Lead Novo</span>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: '#ABC5F9'}}></div> Primeiro Contato</span>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.blueLight}}></div> Apresentação</span>
+                            <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.yellow}}></div> Negociação</span>
                         </div>
                         <div className="flex flex-col gap-2 font-medium" style={{color: BRAND.gray}}>
-                            <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.yellow}}></div> Negociação</span>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.blue}}></div> Cadastro</span>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.blueDark}}></div> Treinamento</span>
-                        </div>
-                        <div className="flex flex-col gap-2 font-medium" style={{color: BRAND.gray}}>
                             <span className="flex items-center gap-2 font-bold" style={{color: BRAND.black}}><span className="text-base leading-none">🏆</span> Negócio Ganho</span>
                         </div>
                     </div>
@@ -1525,7 +1709,7 @@ function App() {
                                     </div>
                                  ) : (
                                     <button onClick={() => { setVendedorEditandoId(v.id); setVendedorNovaSenha(v.senha || ''); }} className="px-3 md:px-4 py-1.5 md:py-2 rounded-lg text-[10px] md:text-xs font-bold bg-slate-100 border border-slate-200 hover:bg-slate-200 transition-colors" style={{color: BRAND.gray}}>
-                                       🔑 Editar Senha
+                                        🔑 Editar Senha
                                     </button>
                                  )}
 
@@ -1535,7 +1719,7 @@ function App() {
                                  
                                  {v.nome.toLowerCase() !== 'admin' && (
                                      <button onClick={() => setVendedorParaExcluir(v)} className="px-3 md:px-4 py-1.5 md:py-2 rounded-lg text-[10px] md:text-xs font-bold bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">
-                                       🗑️ Excluir
+                                        🗑️ Excluir
                                      </button>
                                  )}
                               </div>
@@ -1566,25 +1750,22 @@ function App() {
            </div>
         )}
 
-      {/* MODAL DE CONFIRMAÇÃO DE WHATSAPP (Follow-up Automático) */}
-      {modalConfirmacaoWA && (
-        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[80] p-4 backdrop-blur-sm">
-          <div className="bg-white p-6 md:p-8 rounded-3xl max-w-sm w-full shadow-2xl border-t-8" style={{borderTopColor: '#25D366'}}>
-            <div className="flex justify-center mb-4">
-              <div className="w-16 h-16 bg-[#25D366]/20 rounded-full flex items-center justify-center text-[#25D366]">
-                <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
-              </div>
-            </div>
-            <h3 className="text-xl font-black mb-2 text-center" style={{color: BRAND.black}}>Contato Enviado?</h3>
-            <p className="mb-6 font-medium text-sm text-center" style={{color: BRAND.gray}}>
-              Você conseguiu enviar a mensagem ou o número <strong>{modalConfirmacaoWA.telefone}</strong> possui WhatsApp?
+      {}
+      {modalContatoConfirma && (
+        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
+          <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl">
+            <h3 className="text-xl md:text-2xl font-black mb-4" style={{color: BRAND.black}}>
+              Status do Contato
+            </h3>
+            <p className="text-slate-600 mb-6 font-medium text-sm md:text-base">
+              A tentativa de {modalContatoConfirma.canal} deu certo e o cliente atendeu/recebeu?
             </p>
             <div className="flex gap-3">
-              <button onClick={() => confirmarWhatsApp(false)} className="flex-1 px-4 py-3 bg-red-50 text-red-600 font-bold rounded-xl hover:bg-red-100 text-sm border border-red-200">
-                Não (Inválido)
+              <button onClick={() => confirmarContato(false)} className="flex-1 px-4 py-3 md:py-3.5 bg-red-50 text-red-600 font-bold rounded-xl hover:bg-red-100 text-sm md:text-base border border-red-200">
+                👎 Não deu certo
               </button>
-              <button onClick={() => confirmarWhatsApp(true)} className="flex-1 px-4 py-3 text-white font-bold rounded-xl shadow-md bg-[#25D366] hover:bg-[#1DA851] text-sm">
-                Sim, deu certo!
+              <button onClick={() => confirmarContato(true)} className="flex-1 px-4 py-3 md:py-3.5 text-white font-bold rounded-xl shadow-md text-sm md:text-base bg-emerald-500 hover:bg-emerald-600">
+                👍 Sim, deu certo
               </button>
             </div>
           </div>
@@ -1680,9 +1861,32 @@ function App() {
             <h3 className="text-xl md:text-2xl font-black mb-6" style={{color: BRAND.black}}>Cadastrar Novo Lead</h3>
             
             <div className="space-y-4 mb-6">
+               <div className="flex gap-2">
+                 <input type="text" placeholder="CPF ou CNPJ" className="flex-1 border-2 border-slate-200 p-3.5 rounded-xl font-bold text-sm outline-none bg-slate-50 focus:bg-white" style={{color: BRAND.black}} value={formNovoLead.cnpj} onChange={e => setFormNovoLead({...formNovoLead, cnpj: e.target.value})} />
+                 <button onClick={async () => {
+                     const cnpjL = formNovoLead.cnpj.replace(/\D/g, '');
+                     if (cnpjL.length !== 14) return mostrarMensagem('CNPJ inválido.', true);
+                     try {
+                         const res = await fetch(`https://brasilapi.com.br/api/cnpj/v1/${cnpjL}`);
+                         if (!res.ok) throw new Error('Não encontrado');
+                         const data = await res.json();
+                         setFormNovoLead({
+                             ...formNovoLead,
+                             nome: data.razao_social,
+                             cidade: data.municipio,
+                             uf: data.uf,
+                             telefone: data.ddd_telefone_1 ? data.ddd_telefone_1.replace(/\D/g, '') : formNovoLead.telefone
+                         });
+                         mostrarMensagem('Dados da Receita preenchidos!');
+                     } catch (e) {
+                         mostrarMensagem('Erro ao consultar Receita.', true);
+                     }
+                 }} className="px-4 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold rounded-xl transition-colors text-xs">
+                     🔍 Buscar
+                 </button>
+               </div>
                <input type="text" placeholder="Nome do Cliente / Revenda *" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.nome} onChange={e => setFormNovoLead({...formNovoLead, nome: e.target.value})} />
                <input type="text" placeholder="WhatsApp / Telefone" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.telefone} onChange={e => setFormNovoLead({...formNovoLead, telefone: e.target.value})} />
-               <input type="text" placeholder="CPF ou CNPJ" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.cnpj} onChange={e => setFormNovoLead({...formNovoLead, cnpj: e.target.value})} />
                <input type="text" placeholder="Distribuidora / Bandeira (Ex: Ultragaz, Liquigás...)" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.distribuidora} onChange={e => setFormNovoLead({...formNovoLead, distribuidora: e.target.value})} />
                <div className="flex gap-3">
                  <input type="text" placeholder="Cidade" className="w-full border-2 border-slate-200 p-3.5 rounded-xl font-medium text-sm outline-none" style={{color: BRAND.black}} value={formNovoLead.cidade} onChange={e => setFormNovoLead({...formNovoLead, cidade: e.target.value})} />
