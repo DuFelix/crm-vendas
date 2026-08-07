@@ -202,7 +202,6 @@ function App() {
   const [modalFinalizar, setModalFinalizar] = useState(null); 
   const [motivoPerda, setMotivoPerda] = useState('');
   
-  // Estado para os campos de Onboarding no Fechamento
   const [onboardingForm, setOnboardingForm] = useState({
       dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não'
   });
@@ -235,7 +234,6 @@ function App() {
       setTelsTemp([]);
   }, [leadSelecionadoId]);
 
-  // Preenche telefone sugerido no onboarding ao abrir modal de ganho
   useEffect(() => {
       if (modalFinalizar && modalFinalizar.type === 'ganho') {
           setOnboardingForm(prev => ({
@@ -862,63 +860,95 @@ function App() {
     let obs = '';
 
     if (modalFinalizar.type === 'perda') {
-      if (!motivoPerda) return mostrarMensagem('Selecione o motivo.', true);
-      obs = `❌ Negócio Perdido: ${motivoPerda}`;
+        if (!motivoPerda) return mostrarMensagem('Selecione o motivo.', true);
+        obs = `❌ Negócio Perdido: ${motivoPerda}`;
     } else {
-      if (!onboardingForm.dataHora || !onboardingForm.gestor || !onboardingForm.telefone) {
-          return mostrarMensagem('Preencha os campos de Onboarding!', true);
-      }
-      obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`;
-      
-      // INÍCIO DA INTEGRAÇÃO COM BITRIX24
-      setUploadProgresso('Criando tarefa no Bitrix24...');
-      try {
-          const leadCNPJ = modalFinalizar.lead['CPF/CNPJ'] || 'Sem CNPJ';
-          const leadRazao = modalFinalizar.lead.razao_social || modalFinalizar.lead.nome;
-          const dataDataHoraStr = new Date(onboardingForm.dataHora).toLocaleString('pt-BR');
-          
-          const desc = `**AGENDAMENTO DE ONBOARDING**\n\n` +
-                       `Data e hora: ${dataDataHoraStr}\n` +
-                       `Proprietário ou Gestor: ${onboardingForm.gestor}\n` +
-                       `Contatos: ${onboardingForm.telefone}\n` +
-                       `Modelo/formato: ${onboardingForm.formato}\n` +
-                       `Possui cadastro de outra revenda no App? ${onboardingForm.outroCadastro}\n\n` +
-                       `Vendedor Responsável: ${vendedor}`;
+        if (!onboardingForm.dataHora || !onboardingForm.gestor || !onboardingForm.telefone) {
+            return mostrarMensagem('Preencha os campos de Onboarding!', true);
+        }
+        obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`;
+        
+        // INTEGRAÇÃO COM BITRIX24: Cria a Tarefa Principal
+        setUploadProgresso('Criando tarefa no Bitrix24...');
+        try {
+            const leadCNPJ = modalFinalizar.lead['CPF/CNPJ'] || 'Sem CNPJ';
+            const leadRazao = modalFinalizar.lead.razao_social || modalFinalizar.lead.nome;
+            const dataDataHoraStr = new Date(onboardingForm.dataHora).toLocaleString('pt-BR');
+            
+            const desc = `**AGENDAMENTO DE ONBOARDING**\n\n` +
+                         `Data e hora: ${dataDataHoraStr}\n` +
+                         `Proprietário ou Gestor: ${onboardingForm.gestor}\n` +
+                         `Contatos: ${onboardingForm.telefone}\n` +
+                         `Modelo/formato: ${onboardingForm.formato}\n` +
+                         `Possui cadastro de outra revenda no App? ${onboardingForm.outroCadastro}\n\n` +
+                         `Vendedor Responsável: ${vendedor}`;
 
-          const payload = {
-              fields: {
-                  TITLE: `[ONBOARDING] ${leadCNPJ} - ${leadRazao}`,
-                  DESCRIPTION: desc,
-                  RESPONSIBLE_ID: BITRIX_ID_PEDRO, 
-                  CREATED_BY: BITRIX_ID_PEDRO,     
-                  AUDITORS: [BITRIX_ID_EDUARDO, BITRIX_ID_CAMILA],     
-                  DEADLINE: getNextBusinessDay().toISOString()
-              }
-          };
+            const payload = {
+                fields: {
+                    TITLE: `[ONBOARDING] ${leadCNPJ} - ${leadRazao}`,
+                    DESCRIPTION: desc,
+                    RESPONSIBLE_ID: BITRIX_ID_PEDRO, 
+                    CREATED_BY: BITRIX_ID_PEDRO,     
+                    AUDITORS: [BITRIX_ID_EDUARDO, BITRIX_ID_CAMILA],     
+                    DEADLINE: getNextBusinessDay().toISOString()
+                }
+            };
 
-          await fetch(`${BITRIX_WEBHOOK_URL}tasks.task.add.json`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-          });
-          
-          // Grava os dados do onboarding no próprio Firebase no Lead
-          await updateDoc(doc(db, "leads", modalFinalizar.lead.id), {
-              onboarding_info: onboardingForm
-          });
-          setUploadProgresso('');
-      } catch (e) {
-          setUploadProgresso('');
-          console.error("Erro no Bitrix:", e);
-          mostrarMensagem('Aviso: Erro de rede ao conectar com Bitrix, mas o CRM será atualizado.', true);
-      }
+            const response = await fetch(`${BITRIX_WEBHOOK_URL}tasks.task.add.json`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            
+            const data = await response.json();
+            const taskId = data.result?.task?.id;
+
+            // INTEGRAÇÃO COM BITRIX24: Insere os 13 Itens da Checklist via Batch Request
+            if (taskId) {
+                const checklistItems = [
+                  "1 CRM - ANP/ SINTEGRA / RECEITA (Print - anexar docs.)",
+                  "2 Confirmação dos dados cadastrais",
+                  "3 [Fin] Conta Bancária jurídica vinculada ao CNPJ - Obrigatório",
+                  "4 [Fin] Reforço de taxa única de 8%",
+                  "5 [Fin] Reembolso ( cupom de desc. / gift card / taxa de serviço / pag online )",
+                  "6 [Fin] Boleto de MDR semanais",
+                  "7 Carência - verificar na Dash e no CRM",
+                  "8 Acesso a Dash (gestores)",
+                  "9 Área de Cobertura (mapas divididos / produtos / preços / horários)",
+                  "10 Pedido teste (aviso sonoro / mensagem no wpp)",
+                  "11 [Fin] Política de Multas por cancelamento",
+                  "12 [Print] Criação do grupo Wpp - com o time de sucesso do cliente - colocar todos como Admin",
+                  "13 CRM - Conclusão CRM em P4"
+                ];
+
+                const batchPayload = { halt: 0, cmd: {} };
+                checklistItems.forEach((item, idx) => {
+                    batchPayload.cmd[`check${idx}`] = `task.checklistitem.add?TASKID=${taskId}&FIELDS[TITLE]=${encodeURIComponent(item)}`;
+                });
+
+                await fetch(`${BITRIX_WEBHOOK_URL}batch.json`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(batchPayload)
+                });
+            }
+            
+            // Grava os dados do onboarding no próprio Firebase no Lead
+            await updateDoc(doc(db, "leads", modalFinalizar.lead.id), {
+                onboarding_info: onboardingForm
+            });
+            setUploadProgresso('');
+        } catch (e) {
+            setUploadProgresso('');
+            console.error("Erro no Bitrix:", e);
+            mostrarMensagem('Aviso: Erro de rede ao conectar com Bitrix, mas o CRM será atualizado.', true);
+        }
     }
 
     try {
       await addDoc(collection(db, "historico"), { id_lead: modalFinalizar.lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: obs });
       await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, data_conclusao: timestamp });
-      setModalFinalizar(null); 
-      setMotivoPerda('');
+      setModalFinalizar(null); setMotivoPerda('');
       mostrarMensagem(modalFinalizar.type === 'ganho' ? 'Dá um Appgas! Venda Fechada e Tarefa Criada!' : 'Perda registrada.');
     } catch(e) { mostrarMensagem('Erro ao gravar no CRM.', true); }
   };
@@ -1445,10 +1475,10 @@ function App() {
         </div>
 
         <div className="flex bg-slate-100 p-1.5 mx-4 mt-4 rounded-xl gap-1 shrink-0 overflow-x-auto relative">
-          <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' ? BRAND.blue : BRAND.gray}}>Lista</button>
-          <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' ? BRAND.blue : BRAND.gray}}>Kanban</button>
+          <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' && !leadAtual ? BRAND.blue : BRAND.gray}}>Lista</button>
+          <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' && !leadAtual ? BRAND.blue : BRAND.gray}}>Kanban</button>
           <button onClick={() => mudarVisao('dashboard')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'dashboard' ? BRAND.blue : BRAND.gray}}>Métricas</button>
-          <button onClick={() => mudarVisao('mapa')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'mapa' ? BRAND.blue : BRAND.gray}}>Mapa</button>
+          <button onClick={() => mudarVisao('mapa')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'mapa' && !leadAtual ? BRAND.blue : BRAND.gray}}>Mapa</button>
           <button onClick={() => mudarVisao('appgas')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'appgas' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'appgas' ? BRAND.blue : BRAND.gray}}>Appgas</button>
         </div>
 
@@ -1476,74 +1506,12 @@ function App() {
             </div>
           )}
         </div>
-
-        {}
-        <div className={`${visaoAtual === 'lista' ? 'block' : 'hidden'} flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50`} ref={listaRef} onScroll={(e) => {
-             const { scrollTop, scrollHeight, clientHeight } = e.target;
-             if (scrollHeight - scrollTop <= clientHeight * 1.5) {
-                 setItensVisiveisLista(prev => prev + 50);
-             }
-         }}>
-          {leadsFiltradosGeral.slice(0, itensVisiveisLista).map(lead => {
-            const urg = getUrgency(lead);
-            const distNome = getDistNome(lead);
-            const telefones = lead.telefones?.length > 0 ? lead.telefones : (lead.telefone ? [lead.telefone] : []);
-            const telValido = telefones.find(t => !(lead.telefones_invalidos || []).includes(t));
-
-            return (
-              <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
-                <h3 className="font-bold text-xs md:text-sm mb-1 truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
-                
-                <div className="flex flex-wrap gap-1.5 mb-2">
-                  <p className="text-[10px] md:text-xs truncate flex items-center gap-1" style={{color: BRAND.gray}}>
-                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                     {lead.cidade ? `${lead.cidade} - ${lead.uf}` : '-'}
-                  </p>
-                  <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-purple-50 text-purple-700 border border-purple-200 truncate flex items-center gap-1">
-                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
-                    {lead.etapa_funil || ETAPAS.LEAD}
-                  </span>
-                  {distNome && (
-                     <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate flex items-center gap-1">
-                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path></svg>
-                       {distNome}
-                     </span>
-                  )}
-                </div>
-
-                <div className="flex justify-between items-center mb-2 gap-2">
-                  {telValido ? (
-                      <button onClick={(e) => { e.stopPropagation(); abrirWhatsApp(lead, telValido); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-[#f0fdf4] text-[#166534] border-[#bbf7d0] hover:bg-[#dcfce7] transition-colors flex items-center gap-1 shadow-sm">
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
-                          Chamar
-                      </button>
-                  ) : telefones.length > 0 ? (
-                      <button onClick={(e) => { e.stopPropagation(); abrirLigacao(lead, telefones[0]); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase text-white shadow-sm flex items-center gap-1 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}}>
-                          📞 Ligar
-                      </button>
-                  ) : (
-                      <span className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-slate-50 text-slate-500 border-slate-200">Sem Tel</span>
-                  )}
-                  <span className="text-[9px] md:text-[10px] font-extrabold uppercase px-2 py-1 rounded-lg border" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue, borderColor: `${BRAND.blue}30`}}>{lead.responsavel || 'SEM DONO'}</span>
-                </div>
-                {urg.status !== 'novo' && urg.status !== 'em_dia' && urg.status !== 'finalizado' && (
-                   <div className={`text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-md text-center border ${urg.css}`}>{urg.texto}</div>
-                )}
-              </div>
-            )
-          })}
-          {itensVisiveisLista < leadsFiltradosGeral.length && (
-              <div className="py-4 text-center">
-                  <span className="text-xs font-bold text-slate-400 animate-pulse border border-slate-200 px-4 py-2 rounded-xl bg-white shadow-sm">Carregando mais...</span>
-              </div>
-          )}
-        </div>
       </div>
 
-      <div className={`${leadAtual || visaoAtual !== 'lista' ? 'flex' : 'hidden'} flex-1 bg-slate-50 relative h-full flex-col min-w-0 overflow-hidden pt-16 md:pt-0`}>
+      <div className="flex-1 bg-slate-50 relative h-full flex flex-col min-w-0 overflow-hidden pt-16 md:pt-0">
         
         {/* Detalhes do Lead */}
-        {leadAtual ? (
+        {leadAtual && (
           <div className="flex-1 p-4 md:p-8 overflow-y-auto">
             <div className="max-w-4xl mx-auto pb-20">
               <button onClick={voltarVisao} className="mb-4 md:mb-6 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>
@@ -1623,7 +1591,7 @@ function App() {
                       </div>
                       <div>
                         <p className="text-[10px] uppercase font-bold" style={{color: BRAND.gray}}>Distribuidora</p>
-                        <span className="font-semibold text-sm md:text-base truncate block" style={{color: BRAND.black}}>{getDistNome(leadAtual) || 'Não informada'}</span>
+                        <span className="font-semibold text-sm md:text-base truncate block" style={{color: BRAND.black}}>{leadAtual.distribuidora || leadAtual.bandeira || 'Não informada'}</span>
                       </div>
                     </div>
                     
@@ -1765,66 +1733,128 @@ function App() {
               </div>
             </div>
           </div>
-        ) : visaoAtual === 'kanban' ? (
-          <div ref={kanbanRef} className="flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 flex gap-4 md:gap-6 h-full bg-slate-100 items-start">
-            {Object.values(ETAPAS).map(etapa => {
-              const leadsEtapa = leadsFiltradosGeral.filter(l => {
-                if (etapa === ETAPAS.FINALIZADO) return l.etapa_funil === ETAPAS.FINALIZADO;
-                return (l.etapa_funil || ETAPAS.LEAD) === etapa && l.etapa_funil !== ETAPAS.FINALIZADO;
-              }).sort((a, b) => getUrgency(a).order - getUrgency(b).order);
+        )}
 
-              return (
-                <div key={etapa} className="w-[85vw] sm:w-[320px] md:w-[340px] shrink-0 flex flex-col bg-slate-200/50 rounded-[20px] md:rounded-[24px] border border-slate-200/60 max-h-full overflow-hidden" onDragOver={(e) => e.preventDefault()} onDrop={(e) => onDrop(e, etapa)}>
-                  <div className="p-3 md:p-4 flex justify-between items-center bg-slate-200/80">
-                    <span className="font-black text-xs md:text-sm uppercase tracking-wider" style={{color: BRAND.black}}>{etapa}</span>
-                    <span className="bg-white text-[10px] md:text-xs font-black px-2 md:px-2.5 py-0.5 md:py-1 rounded-full shadow-sm" style={{color: BRAND.gray}}>{leadsEtapa.length}</span>
-                  </div>
-                  
-                  <div id={`kanban-col-${etapa}`} className="flex-1 overflow-y-auto p-2 md:p-3 space-y-3 md:space-y-4">
-                    {leadsEtapa.map(lead => {
-                      const urg = getUrgency(lead);
-                      const distNome = getDistNome(lead);
-                      
-                      let kanbanCardBg = 'bg-white';
-                      let kanbanCardBorder = 'border-[#e2e8f0]';
-                      if (lead.etapa_funil === ETAPAS.FINALIZADO) {
-                          if (lead.status_venda === 'Ganho') {
-                              kanbanCardBg = 'bg-[#dcfce7]';
-                              kanbanCardBorder = 'border-[#86efac]';
-                          } else {
-                              kanbanCardBg = 'bg-[#fee2e2]';
-                              kanbanCardBorder = 'border-[#fca5a5]';
-                          }
-                      } else if (urg.status === 'atrasado' || urg.status === 'ocioso') {
-                          kanbanCardBorder = 'border-red-400';
-                      }
+        {/* Visualização em Lista com Scroll Infinito (Oculta se não for ativa) */}
+        <div onScroll={(e) => {
+             const { scrollTop, scrollHeight, clientHeight } = e.target;
+             if (scrollHeight - scrollTop <= clientHeight * 1.5) {
+                 setItensVisiveisLista(prev => prev + 50);
+             }
+         }} className={`${!leadAtual && visaoAtual === 'lista' ? 'block' : 'hidden'} flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50`}>
+          {leadsFiltradosGeral.slice(0, itensVisiveisLista).map(lead => {
+            const urg = getUrgency(lead);
+            const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
+            const telefones = lead.telefones?.length > 0 ? lead.telefones : (lead.telefone ? [lead.telefone] : []);
+            const telValido = telefones.find(t => !(lead.telefones_invalidos || []).includes(t));
 
-                      return (
-                        <div key={lead.id} onClick={() => abrirCardLead(lead.id)} draggable onDragStart={(e) => setDraggedLeadId(lead.id)} className={`${kanbanCardBg} p-4 md:p-5 rounded-xl md:rounded-2xl border-2 shadow-sm cursor-pointer hover:shadow-md transition-shadow ${kanbanCardBorder}`}>
-                          <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-slate-50/50 px-2 py-1 rounded-md mb-2">
-                             <span className="truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</span>
-                             {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
-                          </div>
-                          
-                          <h4 className="font-black text-sm md:text-base mb-2 md:mb-3 leading-tight truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h4>
-                          <div className={`text-[10px] md:text-[11px] font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg mb-3 md:mb-4 text-center border ${urg.css}`}>{urg.texto}</div>
-                          
-                          <div className="grid grid-cols-3 gap-1.5 md:gap-2">
-                            {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'perda', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">👎</button>}
-                            <button onClick={(e) => { e.stopPropagation(); abrirCardLead(lead.id); }} className={`py-1.5 md:py-2 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors hover:text-white ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`} style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue}} onMouseEnter={e => e.target.style.backgroundColor = BRAND.blue} onMouseLeave={e => e.target.style.backgroundColor = `${BRAND.blue}10`} >Abrir</button>
-                            {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'ganho', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">🏆</button>}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+            return (
+              <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
+                <h3 className="font-bold text-xs md:text-sm mb-1 truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
+                
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  <p className="text-[10px] md:text-xs truncate flex items-center gap-1" style={{color: BRAND.gray}}>
+                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                     {lead.cidade ? `${lead.cidade} - ${lead.uf}` : '-'}
+                  </p>
+                  {distNome && (
+                     <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate flex items-center gap-1">
+                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path></svg>
+                       {distNome}
+                     </span>
+                  )}
                 </div>
-              );
-            })}
-          </div>
-        ) : visaoAtual === 'dashboard' ? (
-          renderDashboard()
-        ) : visaoAtual === 'mapa' ? (
+
+                <div className="flex justify-between items-center mb-2 gap-2">
+                  {telValido ? (
+                      <button onClick={(e) => { e.stopPropagation(); abrirWhatsApp(lead, telValido); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-[#f0fdf4] text-[#166534] border-[#bbf7d0] hover:bg-[#dcfce7] transition-colors flex items-center gap-1 shadow-sm">
+                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                          Chamar
+                      </button>
+                  ) : telefones.length > 0 ? (
+                      <button onClick={(e) => { e.stopPropagation(); abrirLigacao(lead, telefones[0]); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase text-white shadow-sm flex items-center gap-1 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}}>
+                          📞 Ligar
+                      </button>
+                  ) : (
+                      <span className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-slate-50 text-slate-500 border-slate-200">Sem Tel</span>
+                  )}
+                  <span className="text-[9px] md:text-[10px] font-extrabold uppercase px-2 py-1 rounded-lg border" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue, borderColor: `${BRAND.blue}30`}}>{lead.responsavel || 'SEM DONO'}</span>
+                </div>
+                {urg.status !== 'novo' && urg.status !== 'em_dia' && urg.status !== 'finalizado' && (
+                   <div className={`text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-md text-center border ${urg.css}`}>{urg.texto}</div>
+                )}
+              </div>
+            )
+          })}
+          {itensVisiveisLista < leadsFiltradosGeral.length && (
+              <div className="py-4 text-center">
+                  <span className="text-xs font-bold text-slate-400 animate-pulse border border-slate-200 px-4 py-2 rounded-xl bg-white shadow-sm">Carregando mais...</span>
+              </div>
+          )}
+        </div>
+
+        {/* Visualização do Kanban (Oculta se não for ativa) */}
+        <div className={`${!leadAtual && visaoAtual === 'kanban' ? 'flex' : 'hidden'} flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 gap-4 md:gap-6 h-full bg-slate-100 items-start`} ref={kanbanRef}>
+          {Object.values(ETAPAS).map(etapa => {
+            const leadsEtapa = leadsFiltradosGeral.filter(l => {
+              if (etapa === ETAPAS.FINALIZADO) return l.etapa_funil === ETAPAS.FINALIZADO;
+              return (l.etapa_funil || ETAPAS.LEAD) === etapa && l.etapa_funil !== ETAPAS.FINALIZADO;
+            }).sort((a, b) => getUrgency(a).order - getUrgency(b).order);
+
+            return (
+              <div key={etapa} className="w-[85vw] sm:w-[320px] md:w-[340px] shrink-0 flex flex-col bg-slate-200/50 rounded-[20px] md:rounded-[24px] border border-slate-200/60 max-h-full overflow-hidden" onDragOver={(e) => e.preventDefault()} onDrop={(e) => onDrop(e, etapa)}>
+                <div className="p-3 md:p-4 flex justify-between items-center bg-slate-200/80">
+                  <span className="font-black text-xs md:text-sm uppercase tracking-wider" style={{color: BRAND.black}}>{etapa}</span>
+                  <span className="bg-white text-[10px] md:text-xs font-black px-2 md:px-2.5 py-0.5 md:py-1 rounded-full shadow-sm" style={{color: BRAND.gray}}>{leadsEtapa.length}</span>
+                </div>
+                
+                <div id={`kanban-col-${etapa}`} className="flex-1 overflow-y-auto p-2 md:p-3 space-y-3 md:space-y-4">
+                  {leadsEtapa.map(lead => {
+                    const urg = getUrgency(lead);
+                    const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
+                    
+                    let kanbanCardBg = 'bg-white';
+                    let kanbanCardBorder = 'border-[#e2e8f0]';
+                    if (lead.etapa_funil === ETAPAS.FINALIZADO) {
+                        if (lead.status_venda === 'Ganho') {
+                            kanbanCardBg = 'bg-[#dcfce7]';
+                            kanbanCardBorder = 'border-[#86efac]';
+                        } else {
+                            kanbanCardBg = 'bg-[#fee2e2]';
+                            kanbanCardBorder = 'border-[#fca5a5]';
+                        }
+                    } else if (urg.status === 'atrasado' || urg.status === 'ocioso') {
+                        kanbanCardBorder = 'border-red-400';
+                    }
+
+                    return (
+                      <div key={lead.id} onClick={() => abrirCardLead(lead.id)} draggable onDragStart={(e) => setDraggedLeadId(lead.id)} className={`${kanbanCardBg} p-4 md:p-5 rounded-xl md:rounded-2xl border-2 shadow-sm cursor-pointer hover:shadow-md transition-shadow ${kanbanCardBorder}`}>
+                        <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-slate-50/50 px-2 py-1 rounded-md mb-2">
+                           <span className="truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</span>
+                           {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
+                        </div>
+                        
+                        <h4 className="font-black text-sm md:text-base mb-2 md:mb-3 leading-tight truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h4>
+                        <div className={`text-[10px] md:text-[11px] font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg mb-3 md:mb-4 text-center border ${urg.css}`}>{urg.texto}</div>
+                        
+                        <div className="grid grid-cols-3 gap-1.5 md:gap-2">
+                          {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'perda', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">👎</button>}
+                          <button onClick={(e) => { e.stopPropagation(); abrirCardLead(lead.id); }} className={`py-1.5 md:py-2 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors hover:text-white ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`} style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue}} onMouseEnter={e => e.target.style.backgroundColor = BRAND.blue} onMouseLeave={e => e.target.style.backgroundColor = `${BRAND.blue}10`} >Abrir</button>
+                          {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'ganho', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">🏆</button>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Demais Views (Renderizadas sob demanda) */}
+        {!leadAtual && visaoAtual === 'dashboard' && renderDashboard()}
+        
+        {!leadAtual && visaoAtual === 'mapa' && (
           <div className="flex-1 p-4 md:p-6 h-full flex flex-col relative bg-slate-50">
              <button onClick={voltarVisao} className="mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>
                 ← Voltar
@@ -1875,7 +1905,9 @@ function App() {
                 </div>
              </div>
           </div>
-        ) : visaoAtual === 'appgas' ? (
+        )}
+
+        {!leadAtual && visaoAtual === 'appgas' && (
           <div className="flex-1 p-4 md:p-10 h-full bg-slate-50 flex flex-col">
              <button onClick={voltarVisao} className="mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>
                 ← Voltar
@@ -1895,7 +1927,9 @@ function App() {
                  </div>
              </div>
           </div>
-        ) : visaoAtual === 'gerenciar' && isAdmin ? (
+        )}
+
+        {!leadAtual && visaoAtual === 'gerenciar' && isAdmin && (
           <div className="flex-1 p-4 md:p-8 bg-slate-50 overflow-y-auto">
              <button onClick={voltarVisao} className="mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>
                 ← Voltar
@@ -1993,13 +2027,9 @@ function App() {
                  </div>
              </div>
           </div>
-        ) : (
-           <div className="flex flex-col h-full items-center justify-center bg-slate-50 p-6 text-center">
-             <p className="text-lg md:text-xl font-bold" style={{color: BRAND.gray}}>Selecione uma visão no menu.</p>
-           </div>
         )}
 
-      {}
+      {/* Modais Globais (Confirmação, Exclusão, Novo) */}
       {modalContatoConfirma && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
           <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl">
