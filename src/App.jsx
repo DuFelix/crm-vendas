@@ -31,7 +31,7 @@ const BITRIX_ID_CAMILA = 9;
 const ETAPAS = {
   LEAD: '1. Lead',
   PRIMEIRO_CONTATO: 'Primeiro contato',
-  APRESENTACAO: '2. Apresentação',
+  AGUARDANDO_RESPOSTA: '2. Aguardando resposta', // Etapa Inteligente 
   NEGOCIACAO: '3. Negociação',
   CADASTRO: '4. Cadastro / Lançamento',
   TREINAMENTO: '5. Treinamento Appgas',
@@ -67,6 +67,18 @@ const getNextBusinessDay = (date = new Date()) => {
   }
   nextDay.setHours(10, 0, 0, 0); 
   return nextDay;
+};
+
+const getBusinessDaysDiff = (startDate, endDate) => {
+    let count = 0;
+    let curDate = new Date(startDate);
+    const end = new Date(endDate);
+    while (curDate < end) {
+      const dayOfWeek = curDate.getDay();
+      if (dayOfWeek !== 0 && dayOfWeek !== 6) count++;
+      curDate.setDate(curDate.getDate() + 1);
+    }
+    return count;
 };
 
 const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
@@ -133,7 +145,7 @@ const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
         } else {
            let color = BRAND.gray;
            if (lead.etapa_funil === ETAPAS.PRIMEIRO_CONTATO) color = '#ABC5F9';
-           else if (lead.etapa_funil === ETAPAS.APRESENTACAO) color = BRAND.blueLight; 
+           else if (lead.etapa_funil === ETAPAS.AGUARDANDO_RESPOSTA) color = BRAND.blueLight; 
            else if (lead.etapa_funil === ETAPAS.NEGOCIACAO) color = BRAND.yellow;
            else if (lead.etapa_funil === ETAPAS.CADASTRO) color = BRAND.blue;
            else if (lead.etapa_funil === ETAPAS.TREINAMENTO) color = BRAND.blueDark; 
@@ -281,6 +293,31 @@ function App() {
     return () => { unsubLeads(); unsubHist(); unsubVend(); unsubMotivos(); };
   }, []);
 
+  // AUTOMAÇÃO: Verifica leads no Vácuo e move para "Aguardando Resposta"
+  useEffect(() => {
+      if (leads.length === 0) return;
+      const checkGhostingAndMove = async () => {
+          const batch = writeBatch(db);
+          let hasChanges = false;
+          leads.forEach(lead => {
+              if (lead.etapa_funil === ETAPAS.LEAD || lead.etapa_funil === ETAPAS.PRIMEIRO_CONTATO) {
+                  if (lead.ultimo_remetente === 'vendedor' && lead.ultima_interacao) {
+                      const bDays = getBusinessDaysDiff(lead.ultima_interacao, Date.now());
+                      if (bDays >= 1) {
+                          const docRef = doc(db, "leads", lead.id);
+                          batch.update(docRef, { etapa_funil: ETAPAS.AGUARDANDO_RESPOSTA });
+                          hasChanges = true;
+                      }
+                  }
+              }
+          });
+          if (hasChanges) {
+              try { await batch.commit(); } catch (e) { console.error("Erro no auto-move:", e); }
+          }
+      };
+      checkGhostingAndMove();
+  }, [leads]);
+
   const leadAtual = leadSelecionadoId ? leads.find(l => l.id === leadSelecionadoId) : null;
   const historicoLead = leadAtual ? historicoGeral.filter(h => h.id_lead === leadAtual.id) : [];
 
@@ -363,40 +400,40 @@ function App() {
     return d ? String(d).trim() : '';
   };
 
-  const getBusinessDaysDiff = (startDate, endDate) => {
-    let count = 0;
-    let curDate = new Date(startDate);
-    const end = new Date(endDate);
-    while (curDate < end) {
-      const dayOfWeek = curDate.getDay();
-      if (dayOfWeek !== 0 && dayOfWeek !== 6) count++;
-      curDate.setDate(curDate.getDate() + 1);
-    }
-    return count;
-  };
-
   const getUrgency = (lead) => {
+    if (lead.status_venda === 'Ganho' || lead.status_venda === 'Perdido') return { status: 'finalizado', texto: 'Encerrado', css: 'bg-slate-100 text-[#767676] border-slate-200', order: 6 };
+
     const now = Date.now();
-    if (lead.status_venda === 'Ganho' || lead.status_venda === 'Perdido') return { status: 'finalizado', texto: 'Encerrado', css: 'bg-slate-100 text-[#767676] border-slate-200', order: 5 };
+    const horasSemResposta = lead.ultima_interacao ? Math.floor((now - lead.ultima_interacao) / (1000 * 60 * 60)) : 0;
+    const diasSemResposta = Math.floor(horasSemResposta / 24);
+    const estaNoVacuo = lead.ultimo_remetente === 'vendedor' && horasSemResposta >= 24;
+    const esperandoResposta = lead.ultimo_remetente === 'vendedor' && horasSemResposta < 24;
+
+    if (estaNoVacuo) {
+        return { status: 'vacuo', texto: `⚠️ Vácuo (${diasSemResposta > 0 ? diasSemResposta + 'd' : horasSemResposta + 'h'})`, css: 'bg-orange-100 text-orange-700 border-orange-500 font-bold animate-pulse', order: 0 };
+    }
 
     if (lead.proximo_contato) {
       const diff = lead.proximo_contato - now;
-      if (diff < 0) return { status: 'atrasado', texto: '🚨 Retorno Atrasado', css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse', order: 0 };
+      if (diff < 0) return { status: 'atrasado', texto: '🚨 Retorno Atrasado', css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse', order: 1 };
       const isToday = new Date(lead.proximo_contato).toDateString() === new Date().toDateString();
-      if (isToday) return { status: 'hoje', texto: '📅 Retorno Hoje', css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold', order: 1 };
-      return { status: 'agendado', texto: `📅 Agendado: ${new Date(lead.proximo_contato).toLocaleDateString('pt-BR')}`, css: 'bg-[#2D6FEF]/10 text-[#2D6FEF] border-[#2D6FEF]/30', order: 3 };
+      if (isToday) return { status: 'hoje', texto: '📅 Retorno Hoje', css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold', order: 2 };
+      return { status: 'agendado', texto: `📅 Agendado: ${new Date(lead.proximo_contato).toLocaleDateString('pt-BR')}`, css: 'bg-[#2D6FEF]/10 text-[#2D6FEF] border-[#2D6FEF]/30', order: 4 };
     }
 
     const lastInt = lead.ultima_interacao || lead.data_criacao;
     if (lastInt) {
       const bDays = getBusinessDaysDiff(lastInt, now);
-      if (lead.etapa_funil !== ETAPAS.LEAD && lead.etapa_funil !== ETAPAS.FINALIZADO && bDays >= 1) {
-        return { status: 'ocioso', texto: `🚨 Sem retorno (${bDays}d úteis)`, css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse', order: 0 };
+      if (lead.etapa_funil !== ETAPAS.LEAD && lead.etapa_funil !== ETAPAS.FINALIZADO && bDays >= 1 && !esperandoResposta) {
+        return { status: 'ocioso', texto: `🚨 Sem retorno (${bDays}d úteis)`, css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse', order: 1 };
       }
-      if (bDays > 2) return { status: 'ocioso', texto: `⚠️ Ocioso (${bDays}d úteis)`, css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold', order: 2 };
-      return { status: 'em_dia', texto: '✅ Em dia', css: 'bg-emerald-50 text-emerald-700 border-emerald-200', order: 4 };
+      if (bDays > 2 && !esperandoResposta) return { status: 'ocioso', texto: `⚠️ Ocioso (${bDays}d úteis)`, css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold', order: 3 };
+      
+      if (esperandoResposta) return { status: 'esperando', texto: `⏱️ Aguardando (${horasSemResposta}h)`, css: 'bg-blue-50 text-blue-600 border-blue-200 font-bold', order: 5 };
+
+      return { status: 'em_dia', texto: '✅ Em dia', css: 'bg-emerald-50 text-emerald-700 border-emerald-200', order: 5 };
     }
-    return { status: 'novo', texto: '⭐ Novo Lead', css: 'bg-[#1B438F]/10 text-[#1B438F] border-[#1B438F]/30 font-bold', order: 2 };
+    return { status: 'novo', texto: '⭐ Novo Lead', css: 'bg-[#1B438F]/10 text-[#1B438F] border-[#1B438F]/30 font-bold', order: 3 };
   };
 
   const isAdmin = vendedor.toLowerCase() === 'admin';
@@ -503,23 +540,15 @@ function App() {
         
         let existingLead = null;
         
-        if (csvId) {
-            existingLead = leads.find(l => l.id === csvId);
-        }
-        
+        if (csvId) existingLead = leads.find(l => l.id === csvId);
         if (!existingLead && cnpjLimpo) {
             existingLead = leads.find(l => {
                 const lCnpj = l['CPF/CNPJ'] ? l['CPF/CNPJ'].replace(/\D/g, '') : null;
                 return lCnpj === cnpjLimpo;
             });
         }
-        
         if (!existingLead && obj.nome && obj.cidade) {
-            existingLead = leads.find(l => 
-                l.nome && l.cidade && 
-                l.nome.toLowerCase().trim() === obj.nome.toLowerCase().trim() && 
-                l.cidade.toLowerCase().trim() === obj.cidade.toLowerCase().trim()
-            );
+            existingLead = leads.find(l => l.nome && l.cidade && l.nome.toLowerCase().trim() === obj.nome.toLowerCase().trim() && l.cidade.toLowerCase().trim() === obj.cidade.toLowerCase().trim());
         }
 
         if (existingLead) {
@@ -675,21 +704,12 @@ function App() {
     if (hora >= 12 && hora < 18) saudacao = 'Boa tarde';
     else if (hora >= 18) saudacao = 'Boa noite';
 
-    const nomeRevenda = lead.nome || 'a revenda';
     const nomeVendedor = vendedor || 'Consultor';
 
     const modelos = [
-        `${saudacao}! Falo com o ${nomeRevenda} pois, ele entrou em contato conosco do Appgas para aumentar o faturamento da revenda e estamos retornando.`,
         `${saudacao}! Meu nome é ${nomeVendedor} e falo pela Appgas. Tenho uma proposta para a revenda, sem custo inicial. É com o responsável que estou falando?`,
-        `${saudacao}! ${nomeVendedor} da Appgas falando. Gostaria de apresentar uma proposta sem custo inicial para a revenda. É esse o contato correto?`,
         `${saudacao}! Aqui é o ${nomeVendedor}, da Appgas. Tenho uma proposta para a revenda e não há custo inicial. Posso falar com o responsável?`,
-        `${saudacao}! Meu nome é ${nomeVendedor} e represento a Appgas. Gostaria de apresentar uma proposta sem investimento inicial. É com o responsável?`,
-        `${saudacao}! ${nomeVendedor} da Appgas aqui. Tenho uma oportunidade para a revenda, sem custo inicial. Estou falando com o responsável?`,
-        `${saudacao}! Meu nome é ${nomeVendedor}, da Appgas. Gostaria de conversar sobre uma proposta sem custo inicial para a revenda. Posso falar com o responsável?`,
-        `${saudacao}! ${nomeVendedor} falando pela Appgas. Tenho uma proposta que não exige nenhum custo inicial. É esse o contato da revenda?`,
-        `${saudacao}! Aqui é o ${nomeVendedor}, da Appgas. Posso apresentar uma proposta sem custo inicial para a revenda?`,
-        `${saudacao}! Meu nome é ${nomeVendedor} e falo pela Appgas. Tenho uma proposta comercial sem custo inicial. É com o responsável que consigo falar?`,
-        `${saudacao}! ${nomeVendedor} da Appgas falando. Estou entrando em contato para apresentar uma proposta sem custo inicial para a revenda. Posso falar com o responsável?`
+        `${saudacao}! ${nomeVendedor} da Appgas aqui. Tenho uma oportunidade para a revenda, sem custo inicial. Estou falando com o responsável?`
     ];
 
     const msgSorteada = modelos[Math.floor(Math.random() * modelos.length)];
@@ -737,6 +757,7 @@ function App() {
             
             await updateDoc(doc(db, "leads", lead.id), { 
                 ultima_interacao: timestamp,
+                ultimo_remetente: 'vendedor',
                 proximo_contato: proximoDiaUtil,
                 etapa_funil: novaEtapa
             });
@@ -766,6 +787,7 @@ function App() {
 
             let updateData = { 
                 ultima_interacao: timestamp,
+                ultimo_remetente: 'vendedor',
                 proximo_contato: proximoDiaUtil
             };
 
@@ -831,7 +853,7 @@ function App() {
         id_lead: leadAtual.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor,
         contato: novoComentario.contato, canal: novoComentario.canal, observacao: novoComentario.observacao, sucesso: true
       });
-      const attLead = { ultima_interacao: timestamp };
+      const attLead = { ultima_interacao: timestamp, ultimo_remetente: 'vendedor' };
       if (novoComentario.proximo_contato) attLead.proximo_contato = new Date(novoComentario.proximo_contato).getTime();
       else attLead.proximo_contato = null; 
       
@@ -1015,7 +1037,7 @@ function App() {
     let totalAtrasados = 0; let totalOciosos = 0; let maisAtrasado = null; let maxDaysOcioso = -1;
     leadsAtivos.forEach(l => {
        const urg = getUrgency(l);
-       if (urg.status === 'atrasado') totalAtrasados++;
+       if (urg.status === 'atrasado' || urg.status === 'vacuo') totalAtrasados++;
        if (urg.status === 'ocioso') totalOciosos++;
        const lastInt = l.ultima_interacao || l.data_criacao;
        if (lastInt) {
@@ -1033,7 +1055,7 @@ function App() {
     const dataFunil = [
       { name: '1. Lead', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.LEAD || !l.etapa_funil).length },
       { name: 'P. Contato', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.PRIMEIRO_CONTATO).length },
-      { name: '2. Apresentação', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.APRESENTACAO).length },
+      { name: '2. Aguardando', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.AGUARDANDO_RESPOSTA).length },
       { name: '3. Negociação', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.NEGOCIACAO).length },
       { name: '4. Lançamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.CADASTRO).length },
       { name: '5. Treinamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.TREINAMENTO).length },
@@ -1052,7 +1074,7 @@ function App() {
     };
 
     let leadsSucessoSet = new Set();
-    let leadsApresentacaoSet = new Set();
+    let leadsAguardandoSet = new Set();
     
     Object.values(ETAPAS).forEach(e => temposPorEtapa[e] = { totalMs: 0, count: 0 });
 
@@ -1066,7 +1088,8 @@ function App() {
     historicoGeral.forEach(h => {
        const leadMatch = baseLeads.find(l => l.id === h.id_lead);
        if (leadMatch && checkTime(h.timestamp)) {
-           if (h.canal !== 'Automático') {
+           // OMITIR AS AÇÕES AUTOMÁTICAS DO WHATSAPP DO VENDEDOR DAS MÉTRICAS MANUAIS
+           if (h.canal !== 'Automático' && h.canal !== 'WhatsApp (Auto)') {
                intencaoContato.total++;
                
                let isSuccess = h.sucesso;
@@ -1098,8 +1121,8 @@ function App() {
                    intencaoContato.falha[canalKey] = (intencaoContato.falha[canalKey] || 0) + 1;
                }
            } else {
-               if (h.observacao && h.observacao.includes('Avançou para 2. Apresentação')) {
-                   leadsApresentacaoSet.add(h.id_lead);
+               if (h.observacao && h.observacao.includes('Avançou para 2. Aguardando resposta')) {
+                   leadsAguardandoSet.add(h.id_lead);
                }
            }
        }
@@ -1145,9 +1168,9 @@ function App() {
     });
 
     const totalLeadsSucesso = leadsSucessoSet.size;
-    const totalLeadsApresentacao = leadsApresentacaoSet.size;
-    const taxaConversaoApresentacao = totalLeadsSucesso > 0 ? ((totalLeadsApresentacao / totalLeadsSucesso) * 100).toFixed(0) : 0;
-    const taxaDrop = totalLeadsSucesso > 0 ? (100 - taxaConversaoApresentacao).toFixed(0) : 0;
+    const totalLeadsAguardando = leadsAguardandoSet.size;
+    const taxaConversaoAguardando = totalLeadsSucesso > 0 ? ((totalLeadsAguardando / totalLeadsSucesso) * 100).toFixed(0) : 0;
+    const taxaDrop = totalLeadsSucesso > 0 ? (100 - taxaConversaoAguardando).toFixed(0) : 0;
 
     const dataTempos = Object.values(ETAPAS)
        .filter(e => e !== ETAPAS.FINALIZADO)
@@ -1276,7 +1299,7 @@ function App() {
 
          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6 mb-6">
             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4 flex flex-col" style={{borderLeftColor: BRAND.blueLight}}>
-               <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Conversão p/ Apresentação</h3>
+               <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Conversão p/ 2. Aguardando</h3>
                <div className="flex justify-between items-center mb-4 px-2">
                   <div className="text-center">
                      <p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>Sucesso (Wpp/Lig)</p>
@@ -1286,8 +1309,8 @@ function App() {
                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
                   </div>
                   <div className="text-center">
-                     <p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.blue}}>Apresentações</p>
-                     <p className="text-2xl md:text-3xl font-black" style={{color: BRAND.blue}}>{totalLeadsApresentacao}</p>
+                     <p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.blue}}>Aguardando</p>
+                     <p className="text-2xl md:text-3xl font-black" style={{color: BRAND.blue}}>{totalLeadsAguardando}</p>
                   </div>
                </div>
                <div className="mt-auto pt-3 border-t border-slate-100 flex justify-between items-center">
@@ -1300,7 +1323,7 @@ function App() {
                <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Termômetro de Follow-up</h3>
                <div className="grid grid-cols-2 gap-3 md:gap-4 mb-4">
                   <div className="bg-slate-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>Ociosos</p><p className="text-xl md:text-2xl font-black" style={{color: BRAND.black}}>{totalOciosos}</p></div>
-                  <div className="bg-red-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold text-red-400 mb-1">Atrasados</p><p className="text-xl md:text-2xl font-black text-red-700">{totalAtrasados}</p></div>
+                  <div className="bg-red-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold text-red-400 mb-1">Atrasados/Vácuo</p><p className="text-xl md:text-2xl font-black text-red-700">{totalAtrasados}</p></div>
                </div>
                {maisAtrasado && maxDaysOcioso > 2 && (
                   <div className="p-3 rounded-lg flex items-center gap-3 border" style={{backgroundColor: `${BRAND.yellow}20`, borderColor: BRAND.yellow}}>
@@ -1472,6 +1495,7 @@ function App() {
 
       {menuMobileAberto && <div className="fixed inset-0 bg-slate-900/60 z-30 md:hidden backdrop-blur-sm" onClick={fecharMenuMobile}></div>}
 
+      {/* Sidebar Lateral Esquerda */}
       <div className={`${menuMobileAberto ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 fixed md:relative z-40 md:z-20 w-[85%] sm:w-80 md:w-80 bg-white border-r border-slate-200 flex flex-col shadow-2xl md:shadow-lg h-full pt-16 md:pt-0`}>
         <div className="p-4 md:p-6 text-white shrink-0 rounded-br-[40px] hidden md:block" style={{backgroundColor: BRAND.blue}}>
           <div className="flex items-center justify-between mb-4">
@@ -1549,9 +1573,10 @@ function App() {
         </div>
       </div>
 
+      {/* ÁREA PRINCIPAL DIREITA */}
       <div className="flex-1 bg-slate-50 relative h-full flex flex-col min-w-0 overflow-hidden pt-16 md:pt-0">
         
-        {/* Detalhes do Lead (Card Interno) */}
+        {/* VIEW: Detalhes do Lead (Card Interno) */}
         {leadAtual && (
           <div className="flex-1 p-4 md:p-8 overflow-y-auto">
             <div className="max-w-4xl mx-auto pb-20">
@@ -1757,6 +1782,29 @@ function App() {
                    <div className="bg-slate-200 p-2 rounded-lg" style={{color: BRAND.gray}}><svg className="w-5 md:w-6 h-5 md:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
                    Linha do Tempo
                 </h3>
+
+                {/* ALERTA VISUAL DE VÁCUO / GHOSTING NA LINHA DO TEMPO */}
+                {(() => {
+                    const horasSemResposta = leadAtual.ultima_interacao ? Math.floor((Date.now() - leadAtual.ultima_interacao) / (1000 * 60 * 60)) : 0;
+                    const diasSemResposta = Math.floor(horasSemResposta / 24);
+                    
+                    if (leadAtual.ultimo_remetente === 'vendedor') {
+                        return (
+                            <div className={`p-4 md:p-5 rounded-2xl flex items-center justify-between mb-6 text-sm font-bold border shadow-sm ${horasSemResposta >= 24 ? 'bg-orange-50 text-orange-700 border-orange-200' : 'bg-blue-50 text-blue-600 border-blue-100'}`}>
+                                <div className="flex items-center gap-3">
+                                    <span className="text-2xl">{horasSemResposta >= 24 ? '⚠️' : '⏱️'}</span>
+                                    <span>
+                                        {horasSemResposta >= 24 
+                                            ? `Alerta de Vácuo: O cliente não responde há ${diasSemResposta > 0 ? `${diasSemResposta} dia(s)` : `${horasSemResposta} horas`}. Faça um follow-up!` 
+                                            : `Aguardando resposta do cliente há ${horasSemResposta} hora(s)...`}
+                                    </span>
+                                </div>
+                            </div>
+                        );
+                    }
+                    return null;
+                })()}
+
                 {historicoLead.map(h => (
                   <div key={h.id} className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
                     <div className={`absolute left-0 top-0 bottom-0 w-1 md:w-1.5`} style={{backgroundColor: h.canal === 'Automático' ? BRAND.yellow : BRAND.blue}}></div>
@@ -1776,7 +1824,7 @@ function App() {
           </div>
         )}
 
-        {/* Visualização em Lista (Oculta se não for ativa) */}
+        {/* VIEW: Lista (Oculta se não for ativa) */}
         <div onScroll={(e) => {
              const { scrollTop, scrollHeight, clientHeight } = e.target;
              if (scrollHeight - scrollTop <= clientHeight * 1.5) {
@@ -1790,7 +1838,7 @@ function App() {
             const telValido = telefones.find(t => !(lead.telefones_invalidos || []).includes(t));
 
             return (
-              <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
+              <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' || urg.status === 'vacuo' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
                 <div className="flex justify-between items-start mb-1">
                    <h3 className="font-bold text-xs md:text-sm truncate mr-2" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
                    <span className="shrink-0 bg-purple-100 text-purple-700 text-[9px] md:text-[10px] font-black px-2 py-0.5 rounded border border-purple-200 uppercase whitespace-nowrap">
@@ -1839,7 +1887,7 @@ function App() {
           )}
         </div>
 
-        {/* Visualização do Kanban (Oculta se não for ativa) */}
+        {/* VIEW: Kanban (Oculta se não for ativa) */}
         <div className={`${!leadAtual && visaoAtual === 'kanban' ? 'flex' : 'hidden'} flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 gap-4 md:gap-6 h-full bg-slate-100 items-start`} ref={kanbanRef}>
           {Object.values(ETAPAS).map(etapa => {
             const leadsEtapa = leadsFiltradosGeral.filter(l => {
@@ -1869,7 +1917,7 @@ function App() {
                             kanbanCardBg = 'bg-[#fee2e2]';
                             kanbanCardBorder = 'border-[#fca5a5]';
                         }
-                    } else if (urg.status === 'atrasado' || urg.status === 'ocioso') {
+                    } else if (urg.status === 'atrasado' || urg.status === 'ocioso' || urg.status === 'vacuo') {
                         kanbanCardBorder = 'border-red-400';
                     }
 
@@ -1897,7 +1945,7 @@ function App() {
           })}
         </div>
 
-        {/* Demais Views (Renderizadas sob demanda) */}
+        {/* OUTRAS VIEWS (Dash, Mapa, Appgas, Gerenciar) */}
         {!leadAtual && visaoAtual === 'dashboard' && renderDashboard()}
         
         {!leadAtual && visaoAtual === 'mapa' && (
@@ -1939,7 +1987,7 @@ function App() {
                         <div className="flex flex-col gap-2 font-medium" style={{color: BRAND.gray}}>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.gray}}></div> Lead Novo</span>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: '#ABC5F9'}}></div> Primeiro Contato</span>
-                            <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.blueLight}}></div> Apresentação</span>
+                            <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.blueLight}}></div> Aguardando Resposta</span>
                             <span className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor: BRAND.yellow}}></div> Negociação</span>
                         </div>
                         <div className="flex flex-col gap-2 font-medium" style={{color: BRAND.gray}}>
@@ -2082,7 +2130,7 @@ function App() {
           </div>
         )}
 
-      {/* Modais Globais (Confirmação, Exclusão, Novo) */}
+      {/* MODAIS (Contato Confirma, Finalizar, Exclusões, Novo) */}
       {modalContatoConfirma && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
           <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl">
