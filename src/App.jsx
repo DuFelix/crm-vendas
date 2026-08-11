@@ -4,6 +4,9 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pi
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc } from "firebase/firestore";
 
+// ==========================================
+// CONFIGURAÇÕES DO FIREBASE
+// ==========================================
 const firebaseConfig = {
   apiKey: "AIzaSyDJs8Gzdb2eaop_7NLFb7qSuIduyhE5DDs",
   authDomain: "crm-vendas-4f4d2.firebaseapp.com",
@@ -187,11 +190,13 @@ function App() {
 
   const [novoVendedorNome, setNovoVendedorNome] = useState('');
   const [novoVendedorSenha, setNovoVendedorSenha] = useState(''); 
+  const [novoVendedorTelefone, setNovoVendedorTelefone] = useState('');
   const [novoMotivo, setNovoMotivo] = useState('');
   const [erroPermissaoFirebase, setErroPermissaoFirebase] = useState(false); 
 
   const [vendedorEditandoId, setVendedorEditandoId] = useState(null);
   const [vendedorNovaSenha, setVendedorNovaSenha] = useState('');
+  const [vendedorNovoTelefone, setVendedorNovoTelefone] = useState('');
   const [vendedorParaExcluir, setVendedorParaExcluir] = useState(null);
 
   const [editandoTels, setEditandoTels] = useState(false);
@@ -868,7 +873,6 @@ function App() {
         }
         obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`;
         
-        // INTEGRAÇÃO COM BITRIX24: Cria a Tarefa Principal
         setUploadProgresso('Criando tarefa no Bitrix24...');
         try {
             const leadCNPJ = modalFinalizar.lead['CPF/CNPJ'] || 'Sem CNPJ';
@@ -903,7 +907,6 @@ function App() {
             const data = await response.json();
             const taskId = data.result?.task?.id;
 
-            // INTEGRAÇÃO COM BITRIX24: Insere os 13 Itens da Checklist via Batch Request
             if (taskId) {
                 const checklistItems = [
                   "1 CRM - ANP/ SINTEGRA / RECEITA (Print - anexar docs.)",
@@ -933,7 +936,6 @@ function App() {
                 });
             }
             
-            // Grava os dados do onboarding no próprio Firebase no Lead
             await updateDoc(doc(db, "leads", modalFinalizar.lead.id), {
                 onboarding_info: onboardingForm
             });
@@ -1048,6 +1050,9 @@ function App() {
         sucesso: { WhatsApp: 0, Ligação: 0, Outros: 0 },
         falha: { WhatsApp: 0, Ligação: 0, Outros: 0 }
     };
+
+    let leadsSucessoSet = new Set();
+    let leadsApresentacaoSet = new Set();
     
     Object.values(ETAPAS).forEach(e => temposPorEtapa[e] = { totalMs: 0, count: 0 });
 
@@ -1060,32 +1065,42 @@ function App() {
 
     historicoGeral.forEach(h => {
        const leadMatch = baseLeads.find(l => l.id === h.id_lead);
-       if (leadMatch && checkTime(h.timestamp) && h.canal !== 'Automático') {
-           intencaoContato.total++;
-           
-           let isSuccess = h.sucesso;
-           if (isSuccess === undefined) {
-               const obs = (h.observacao || '').toLowerCase();
-               if (obs.includes('🚫') || obs.includes('falhou') || obs.includes('não atendida') || obs.includes('inválido')) {
-                   isSuccess = false;
-               } else {
-                   isSuccess = true;
-               }
-           }
-           
-           let canalKey = h.canal === 'WhatsApp' ? 'WhatsApp' : (h.canal === 'Ligação' ? 'Ligação' : 'Outros');
-
-           if (isSuccess) {
-               intencaoContato.sucessoTotal++;
-               intencaoContato.sucesso[canalKey] = (intencaoContato.sucesso[canalKey] || 0) + 1;
+       if (leadMatch && checkTime(h.timestamp)) {
+           if (h.canal !== 'Automático') {
+               intencaoContato.total++;
                
-               contagensCanais[h.canal] = (contagensCanais[h.canal] || 0) + 1;
-               const dateKey = new Date(h.timestamp).toLocaleDateString('pt-BR', {day:'2-digit', month:'2-digit'});
-               if (!timelineData[dateKey]) timelineData[dateKey] = { date: dateKey };
-               timelineData[dateKey][h.canal] = (timelineData[dateKey][h.canal] || 0) + 1;
+               let isSuccess = h.sucesso;
+               if (isSuccess === undefined) {
+                   const obs = (h.observacao || '').toLowerCase();
+                   if (obs.includes('🚫') || obs.includes('falhou') || obs.includes('não atendida') || obs.includes('inválido')) {
+                       isSuccess = false;
+                   } else {
+                       isSuccess = true;
+                   }
+               }
+               
+               let canalKey = h.canal === 'WhatsApp' ? 'WhatsApp' : (h.canal === 'Ligação' ? 'Ligação' : 'Outros');
+
+               if (isSuccess) {
+                   intencaoContato.sucessoTotal++;
+                   intencaoContato.sucesso[canalKey] = (intencaoContato.sucesso[canalKey] || 0) + 1;
+                   
+                   contagensCanais[h.canal] = (contagensCanais[h.canal] || 0) + 1;
+                   const dateKey = new Date(h.timestamp).toLocaleDateString('pt-BR', {day:'2-digit', month:'2-digit'});
+                   if (!timelineData[dateKey]) timelineData[dateKey] = { date: dateKey };
+                   timelineData[dateKey][h.canal] = (timelineData[dateKey][h.canal] || 0) + 1;
+
+                   if (canalKey === 'WhatsApp' || canalKey === 'Ligação') {
+                       leadsSucessoSet.add(h.id_lead);
+                   }
+               } else {
+                   intencaoContato.falhaTotal++;
+                   intencaoContato.falha[canalKey] = (intencaoContato.falha[canalKey] || 0) + 1;
+               }
            } else {
-               intencaoContato.falhaTotal++;
-               intencaoContato.falha[canalKey] = (intencaoContato.falha[canalKey] || 0) + 1;
+               if (h.observacao && h.observacao.includes('Avançou para 2. Apresentação')) {
+                   leadsApresentacaoSet.add(h.id_lead);
+               }
            }
        }
     });
@@ -1128,6 +1143,11 @@ function App() {
            }
        }
     });
+
+    const totalLeadsSucesso = leadsSucessoSet.size;
+    const totalLeadsApresentacao = leadsApresentacaoSet.size;
+    const taxaConversaoApresentacao = totalLeadsSucesso > 0 ? ((totalLeadsApresentacao / totalLeadsSucesso) * 100).toFixed(0) : 0;
+    const taxaDrop = totalLeadsSucesso > 0 ? (100 - taxaConversaoApresentacao).toFixed(0) : 0;
 
     const dataTempos = Object.values(ETAPAS)
        .filter(e => e !== ETAPAS.FINALIZADO)
@@ -1254,7 +1274,28 @@ function App() {
              <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white bg-red-500"><div className="flex justify-between items-start mb-4 md:mb-6"><h3 className="text-xs md:text-sm font-medium text-white/80">Perdido (Taxa)</h3><span className="text-white/50">⚙️</span></div><div className="text-4xl md:text-5xl font-light text-right">{taxaDescarte}%</div></div>
          </div>
 
-         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 md:gap-6 mb-6">
+         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6 mb-6">
+            <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4 flex flex-col" style={{borderLeftColor: BRAND.blueLight}}>
+               <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Conversão p/ Apresentação</h3>
+               <div className="flex justify-between items-center mb-4 px-2">
+                  <div className="text-center">
+                     <p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>Sucesso (Wpp/Lig)</p>
+                     <p className="text-2xl md:text-3xl font-black" style={{color: BRAND.black}}>{totalLeadsSucesso}</p>
+                  </div>
+                  <div className="text-slate-300">
+                     <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                  </div>
+                  <div className="text-center">
+                     <p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.blue}}>Apresentações</p>
+                     <p className="text-2xl md:text-3xl font-black" style={{color: BRAND.blue}}>{totalLeadsApresentacao}</p>
+                  </div>
+               </div>
+               <div className="mt-auto pt-3 border-t border-slate-100 flex justify-between items-center">
+                  <span className="text-[10px] md:text-xs font-bold" style={{color: BRAND.gray}}>Drop (Perda de Interesse):</span>
+                  <span className="text-sm font-black text-red-500">{taxaDrop}%</span>
+               </div>
+            </div>
+            
             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4" style={{borderLeftColor: BRAND.yellow}}>
                <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Termômetro de Follow-up</h3>
                <div className="grid grid-cols-2 gap-3 md:gap-4 mb-4">
@@ -1475,10 +1516,10 @@ function App() {
         </div>
 
         <div className="flex bg-slate-100 p-1.5 mx-4 mt-4 rounded-xl gap-1 shrink-0 overflow-x-auto relative">
-          <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' && !leadAtual ? BRAND.blue : BRAND.gray}}>Lista</button>
-          <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' && !leadAtual ? BRAND.blue : BRAND.gray}}>Kanban</button>
+          <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' ? BRAND.blue : BRAND.gray}}>Lista</button>
+          <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' ? BRAND.blue : BRAND.gray}}>Kanban</button>
           <button onClick={() => mudarVisao('dashboard')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'dashboard' ? BRAND.blue : BRAND.gray}}>Métricas</button>
-          <button onClick={() => mudarVisao('mapa')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' && !leadAtual ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'mapa' && !leadAtual ? BRAND.blue : BRAND.gray}}>Mapa</button>
+          <button onClick={() => mudarVisao('mapa')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'mapa' ? BRAND.blue : BRAND.gray}}>Mapa</button>
           <button onClick={() => mudarVisao('appgas')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'appgas' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'appgas' ? BRAND.blue : BRAND.gray}}>Appgas</button>
         </div>
 
@@ -1510,7 +1551,7 @@ function App() {
 
       <div className="flex-1 bg-slate-50 relative h-full flex flex-col min-w-0 overflow-hidden pt-16 md:pt-0">
         
-        {/* Detalhes do Lead */}
+        {/* Detalhes do Lead (Card Interno) */}
         {leadAtual && (
           <div className="flex-1 p-4 md:p-8 overflow-y-auto">
             <div className="max-w-4xl mx-auto pb-20">
@@ -1735,7 +1776,7 @@ function App() {
           </div>
         )}
 
-        {/* Visualização em Lista com Scroll Infinito (Oculta se não for ativa) */}
+        {/* Visualização em Lista (Oculta se não for ativa) */}
         <div onScroll={(e) => {
              const { scrollTop, scrollHeight, clientHeight } = e.target;
              if (scrollHeight - scrollTop <= clientHeight * 1.5) {
@@ -1744,13 +1785,18 @@ function App() {
          }} className={`${!leadAtual && visaoAtual === 'lista' ? 'block' : 'hidden'} flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50`}>
           {leadsFiltradosGeral.slice(0, itensVisiveisLista).map(lead => {
             const urg = getUrgency(lead);
-            const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
+            const distNome = getDistNome(lead);
             const telefones = lead.telefones?.length > 0 ? lead.telefones : (lead.telefone ? [lead.telefone] : []);
             const telValido = telefones.find(t => !(lead.telefones_invalidos || []).includes(t));
 
             return (
               <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
-                <h3 className="font-bold text-xs md:text-sm mb-1 truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
+                <div className="flex justify-between items-start mb-1">
+                   <h3 className="font-bold text-xs md:text-sm truncate mr-2" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
+                   <span className="shrink-0 bg-purple-100 text-purple-700 text-[9px] md:text-[10px] font-black px-2 py-0.5 rounded border border-purple-200 uppercase whitespace-nowrap">
+                      {lead.etapa_funil || ETAPAS.LEAD}
+                   </span>
+                </div>
                 
                 <div className="flex flex-wrap gap-1.5 mb-2">
                   <p className="text-[10px] md:text-xs truncate flex items-center gap-1" style={{color: BRAND.gray}}>
@@ -1811,7 +1857,7 @@ function App() {
                 <div id={`kanban-col-${etapa}`} className="flex-1 overflow-y-auto p-2 md:p-3 space-y-3 md:space-y-4">
                   {leadsEtapa.map(lead => {
                     const urg = getUrgency(lead);
-                    const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
+                    const distNome = getDistNome(lead);
                     
                     let kanbanCardBg = 'bg-white';
                     let kanbanCardBorder = 'border-[#e2e8f0]';
@@ -1954,16 +2000,18 @@ function App() {
                  <div>
                      <h3 className="text-lg md:text-xl font-bold mb-4" style={{color: BRAND.black}}>👥 Vendedores Autorizados</h3>
                      <div className="flex flex-col sm:flex-row gap-2 mb-4">
-                        <input type="text" className="flex-1 p-3 rounded-xl border outline-none font-bold text-sm" style={{color: BRAND.black}} placeholder="Novo Vendedor" value={novoVendedorNome} onChange={e=>setNovoVendedorNome(e.target.value)} />
+                        <input type="text" className="flex-1 p-3 rounded-xl border outline-none font-bold text-sm" style={{color: BRAND.black}} placeholder="Nome" value={novoVendedorNome} onChange={e=>setNovoVendedorNome(e.target.value)} />
                         <input type="password" className="flex-1 p-3 rounded-xl border outline-none font-bold text-sm" style={{color: BRAND.black}} placeholder="Senha" value={novoVendedorSenha} onChange={e=>setNovoVendedorSenha(e.target.value)} />
+                        <input type="text" className="flex-1 p-3 rounded-xl border outline-none font-bold text-sm" style={{color: BRAND.black}} placeholder="Tel: 5511999999999" value={novoVendedorTelefone} onChange={e=>setNovoVendedorTelefone(e.target.value.replace(/\D/g, ''))} />
                         <button onClick={async () => { 
-                            if(novoVendedorNome && novoVendedorSenha) { 
-                                await addDoc(collection(db, "vendedores"), { nome: novoVendedorNome, senha: novoVendedorSenha, ativo: true }); 
+                            if(novoVendedorNome && novoVendedorSenha && novoVendedorTelefone) { 
+                                await addDoc(collection(db, "vendedores"), { nome: novoVendedorNome, senha: novoVendedorSenha, telefone: novoVendedorTelefone, ativo: true }); 
                                 setNovoVendedorNome(''); 
                                 setNovoVendedorSenha('');
+                                setNovoVendedorTelefone('');
                                 mostrarMensagem('Vendedor salvo!'); 
                             } else {
-                                mostrarMensagem('Preencha o nome e a senha!', true);
+                                mostrarMensagem('Preencha nome, senha e telefone!', true);
                             }
                         }} className="text-white px-5 py-3 rounded-xl font-bold text-sm" style={{backgroundColor: BRAND.black}}>Add</button>
                      </div>
@@ -1972,27 +2020,32 @@ function App() {
                            <div key={v.id} className="p-4 border-b last:border-0 flex flex-col sm:flex-row sm:justify-between sm:items-center bg-white hover:bg-slate-50 gap-3">
                               <div className="flex flex-col">
                                  <span className="font-bold text-sm md:text-base" style={{color: BRAND.black}}>{v.nome}</span>
-                                 <span className="text-xs font-medium" style={{color: BRAND.gray}}>Status: {v.ativo ? 'Ativo' : 'Bloqueado'}</span>
+                                 <span className="text-xs font-medium mt-0.5" style={{color: BRAND.gray}}>📱 {v.telefone || 'Sem telefone'}</span>
+                                 <span className="text-xs font-medium mt-0.5" style={{color: BRAND.gray}}>Status: {v.ativo ? 'Ativo' : 'Bloqueado'}</span>
                               </div>
                               
                               <div className="flex flex-wrap items-center gap-2">
                                  {vendedorEditandoId === v.id ? (
                                     <div className="flex items-center gap-2 bg-slate-100 p-1.5 rounded-lg border border-slate-200">
-                                       <input type="text" placeholder="Nova Senha" value={vendedorNovaSenha} onChange={(e) => setVendedorNovaSenha(e.target.value)} className="w-28 text-xs p-1.5 border rounded outline-none font-bold" style={{color: BRAND.black}} />
+                                       <input type="text" placeholder="Nova Senha" value={vendedorNovaSenha} onChange={(e) => setVendedorNovaSenha(e.target.value)} className="w-24 text-xs p-1.5 border rounded outline-none font-bold" style={{color: BRAND.black}} />
+                                       <input type="text" placeholder="Novo Tel" value={vendedorNovoTelefone} onChange={(e) => setVendedorNovoTelefone(e.target.value.replace(/\D/g, ''))} className="w-28 text-xs p-1.5 border rounded outline-none font-bold" style={{color: BRAND.black}} />
                                        <button onClick={async () => {
-                                           if (vendedorNovaSenha.trim()) {
-                                               await updateDoc(doc(db, "vendedores", v.id), { senha: vendedorNovaSenha.trim() });
+                                           if (vendedorNovaSenha.trim() || vendedorNovoTelefone.trim()) {
+                                               let updates = {};
+                                               if (vendedorNovaSenha.trim()) updates.senha = vendedorNovaSenha.trim();
+                                               if (vendedorNovoTelefone.trim()) updates.telefone = vendedorNovoTelefone.trim();
+                                               await updateDoc(doc(db, "vendedores", v.id), updates);
                                                setVendedorEditandoId(null);
-                                               mostrarMensagem('Senha atualizada!');
+                                               mostrarMensagem('Dados atualizados!');
                                            } else {
-                                               mostrarMensagem('Digite uma senha válida', true);
+                                               mostrarMensagem('Preencha os campos', true);
                                            }
                                        }} className="text-white px-3 py-1.5 rounded text-xs font-bold transition-colors" style={{backgroundColor: BRAND.blue}}>Salvar</button>
                                        <button onClick={() => setVendedorEditandoId(null)} className="bg-slate-300 hover:bg-slate-400 text-slate-700 px-3 py-1.5 rounded text-xs font-bold transition-colors">✕</button>
                                     </div>
                                  ) : (
-                                    <button onClick={() => { setVendedorEditandoId(v.id); setVendedorNovaSenha(v.senha || ''); }} className="px-3 md:px-4 py-1.5 md:py-2 rounded-lg text-[10px] md:text-xs font-bold bg-slate-100 border border-slate-200 hover:bg-slate-200 transition-colors" style={{color: BRAND.gray}}>
-                                        🔑 Editar Senha
+                                    <button onClick={() => { setVendedorEditandoId(v.id); setVendedorNovaSenha(v.senha || ''); setVendedorNovoTelefone(v.telefone || ''); }} className="px-3 md:px-4 py-1.5 md:py-2 rounded-lg text-[10px] md:text-xs font-bold bg-slate-100 border border-slate-200 hover:bg-slate-200 transition-colors" style={{color: BRAND.gray}}>
+                                        ✏️ Editar
                                     </button>
                                  )}
 
@@ -2255,7 +2308,7 @@ function App() {
                       if (loteFiltros.cidade && l.cidade !== loteFiltros.cidade) return false;
                       if (loteFiltros.etapa && (l.etapa_funil || ETAPAS.LEAD) !== loteFiltros.etapa) return false;
                       
-                      const dist = getDistNome(l);
+                      const dist = l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira || '';
                       if (loteFiltros.distribuidora && dist.toLowerCase() !== loteFiltros.distribuidora.toLowerCase()) return false;
 
                       if (loteFiltros.responsavel) {
@@ -2279,7 +2332,7 @@ function App() {
                        
                        <div className="space-y-2">
                           {filtrados.map(lead => {
-                             const distNome = getDistNome(lead);
+                             const distNome = lead.distribuidora || lead.bandeira || lead.Distribuidora || lead.Bandeira;
                              return (
                                <div key={lead.id} onClick={() => {
                                    setLoteSelecionados(prev => prev.includes(lead.id) ? prev.filter(id => id !== lead.id) : [...prev, lead.id])
