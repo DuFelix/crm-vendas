@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, CartesianGrid, Legend, LabelList } from 'recharts';
 
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc } from "firebase/firestore";
+import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc, getDocs, query, where } from "firebase/firestore";
 
 // ==========================================
 // CONFIGURAÇÕES DO FIREBASE
@@ -181,7 +181,11 @@ function App() {
   const [menuMobileAberto, setMenuMobileAberto] = useState(false);
 
   const [leads, setLeads] = useState([]);
-  const [historicoGeral, setHistoricoGeral] = useState([]);
+  
+  // OTIMIZAÇÃO: Arrays separados para carregar sob demanda e evitar Leituras massivas
+  const [historicoLead, setHistoricoLead] = useState([]);
+  const [historicoDash, setHistoricoDash] = useState([]);
+  
   const [vendedores, setVendedores] = useState([]);
   const [motivosPerda, setMotivosPerda] = useState(DEFAULT_MOTIVOS_PERDA);
   
@@ -245,6 +249,9 @@ function App() {
   const scrollPosLista = useRef(0);
   const scrollPosKanban = useRef(0);
   const kanbanColRefs = useRef({}); 
+  
+  // TRAVA DE SEGURANÇA: Evita que o robô do Vácuo rode infinitamente
+  const autoMoveExecutadoRef = useRef(false);
 
   useEffect(() => {
       setEditandoTels(false);
@@ -274,28 +281,58 @@ function App() {
       setErroPermissaoFirebase(false);
     }, lidarComErroFirebase);
 
-    const unsubHist = onSnapshot(collection(db, "historico"), (snap) => {
-      const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      data.sort((a, b) => b.timestamp - a.timestamp);
-      setHistoricoGeral(data);
-    }, lidarComErroFirebase);
-
     const unsubVend = onSnapshot(collection(db, "vendedores"), (snap) => {
       const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setVendedores(data);
     }, lidarComErroFirebase);
 
-    const unsubMotivos = onSnapshot(doc(db, "config", "motivos"), (docSnap) => {
-      if (docSnap.exists() && docSnap.data().lista) setMotivosPerda(docSnap.data().lista);
-      setCarregandoDados(false);
-    }, lidarComErroFirebase);
+    const carregarConfig = async () => {
+        try {
+            const qs = await getDocs(collection(db, "config"));
+            qs.forEach(d => { if (d.id === "motivos" && d.data().lista) setMotivosPerda(d.data().lista); });
+        } catch(e) {}
+        setCarregandoDados(false);
+    };
+    carregarConfig();
 
-    return () => { unsubLeads(); unsubHist(); unsubVend(); unsubMotivos(); };
+    return () => { unsubLeads(); unsubVend(); };
   }, []);
 
-  // AUTOMAÇÃO: Verifica leads no Vácuo e move para "Aguardando Resposta"
+  // OTIMIZAÇÃO DE LEITURAS (Dashboard só carrega histórico sob demanda via getDocs)
+  const carregarHistoricoDash = async () => {
+      setUploadProgresso('Calculando métricas atualizadas...');
+      try {
+          const now = new Date();
+          let timeLimit = 0;
+          if (filtroTempoDash === 'mes') {
+              timeLimit = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+          } else if (filtroTempoDash === 'semana') {
+              timeLimit = now.getTime() - (7 * 24 * 60 * 60 * 1000);
+          }
+          
+          let q = collection(db, "historico");
+          if (timeLimit > 0) {
+              q = query(collection(db, "historico"), where("timestamp", ">=", timeLimit));
+          }
+          
+          const qs = await getDocs(q);
+          const data = qs.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          setHistoricoDash(data);
+      } catch (error) { console.error("Erro ao gerar Dash:", error); }
+      setUploadProgresso('');
+  };
+
   useEffect(() => {
-      if (leads.length === 0) return;
+      if (visaoAtual === 'dashboard') {
+          carregarHistoricoDash();
+      }
+  }, [visaoAtual, filtroTempoDash]);
+
+  // AUTOMAÇÃO: Verifica leads no Vácuo e move para "Aguardando Resposta" 1 vez por sessão
+  useEffect(() => {
+      if (leads.length === 0 || autoMoveExecutadoRef.current) return;
+      autoMoveExecutadoRef.current = true;
+
       const checkGhostingAndMove = async () => {
           const batch = writeBatch(db);
           let hasChanges = false;
@@ -319,7 +356,17 @@ function App() {
   }, [leads]);
 
   const leadAtual = leadSelecionadoId ? leads.find(l => l.id === leadSelecionadoId) : null;
-  const historicoLead = leadAtual ? historicoGeral.filter(h => h.id_lead === leadAtual.id) : [];
+
+  // OTIMIZAÇÃO: Lazy Loading para carregar o histórico de um lead apenas ao abrir o card
+  const buscarHistoricoCard = async (idLead) => {
+      try {
+          const q = query(collection(db, "historico"), where("id_lead", "==", idLead));
+          const qs = await getDocs(q);
+          const data = qs.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          data.sort((a, b) => b.timestamp - a.timestamp);
+          setHistoricoLead(data);
+      } catch (e) { console.error("Erro no fetch do lead", e); }
+  }
 
   const mostrarMensagem = (texto, erro = false) => {
     setToastMsg(texto);
@@ -348,7 +395,9 @@ function App() {
         });
     }
     
+    setHistoricoLead([]); // Limpa enquanto carrega
     setLeadSelecionadoId(id);
+    buscarHistoricoCard(id); // Otimização disparada aqui!
     setVeioDoMapa(visaoAtual === 'mapa');
     fecharMenuMobile();
   };
@@ -632,32 +681,38 @@ function App() {
     reader.readAsText(file, 'UTF-8');
   };
 
-  const exportarCSV = () => {
-    let histFiltrado = historicoGeral;
-    const now = new Date();
-    
-    if (filtroExportacao === 'mes') {
-      histFiltrado = historicoGeral.filter(h => new Date(h.timestamp).getMonth() === now.getMonth() && new Date(h.timestamp).getFullYear() === now.getFullYear());
-    } else if (filtroExportacao === 'semana') {
-      const umaSemanaAtras = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
-      histFiltrado = historicoGeral.filter(h => h.timestamp >= umaSemanaAtras.getTime());
+  const exportarCSV = async () => {
+    mostrarMensagem("Acessando banco de dados, aguarde...");
+    try {
+        const qs = await getDocs(collection(db, "historico"));
+        let histExport = qs.docs.map(d => ({ id: d.id, ...d.data() }));
+
+        const now = new Date();
+        if (filtroExportacao === 'mes') {
+          histExport = histExport.filter(h => new Date(h.timestamp).getMonth() === now.getMonth() && new Date(h.timestamp).getFullYear() === now.getFullYear());
+        } else if (filtroExportacao === 'semana') {
+          const umaSemanaAtras = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+          histExport = histExport.filter(h => h.timestamp >= umaSemanaAtras.getTime());
+        }
+
+        let csvContent = "Data,Vendedor,Revenda,CNPJ,Distribuidora,Cidade,UF,Etapa Funil,Status Venda,Motivo Perda,Canal,Pessoa Contatada,Observacao\n";
+        
+        histExport.forEach(h => {
+          const lead = leads.find(l => l.id === h.id_lead) || {};
+          const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
+          
+          csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(lead.nome)},${limpaStr(lead['CPF/CNPJ'])},${limpaStr(getDistNome(lead))},${limpaStr(lead.cidade)},${limpaStr(lead.uf)},${limpaStr(lead.etapa_funil)},${limpaStr(lead.status_venda)},${limpaStr(lead.motivo_perda)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
+        });
+
+        const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: "text/csv;charset=utf-8;" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `Exportacao_CRM_IA_${filtroExportacao}.csv`;
+        link.click();
+        mostrarMensagem("Download iniciado!");
+    } catch(e) {
+        mostrarMensagem("Erro na exportação", true);
     }
-
-    let csvContent = "Data,Vendedor,Revenda,CNPJ,Distribuidora,Cidade,UF,Etapa Funil,Status Venda,Motivo Perda,Canal,Pessoa Contatada,Observacao\n";
-    
-    histFiltrado.forEach(h => {
-      const lead = leads.find(l => l.id === h.id_lead) || {};
-      const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
-      
-      csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(lead.nome)},${limpaStr(lead['CPF/CNPJ'])},${limpaStr(getDistNome(lead))},${limpaStr(lead.cidade)},${limpaStr(lead.uf)},${limpaStr(lead.etapa_funil)},${limpaStr(lead.status_venda)},${limpaStr(lead.motivo_perda)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
-    });
-
-    const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: "text/csv;charset=utf-8;" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `Exportacao_CRM_IA_${filtroExportacao}.csv`;
-    link.click();
-    mostrarMensagem("Download iniciado!");
   };
 
   const consultarCNPJ = async () => {
@@ -802,6 +857,7 @@ function App() {
             await updateDoc(doc(db, "leads", lead.id), updateData);
             mostrarMensagem(`Falha registrada. Follow-up agendado.`);
         }
+        buscarHistoricoCard(lead.id); // Otimização
     } catch (e) {
         console.error("Erro ao gravar histórico", e);
     }
@@ -859,6 +915,7 @@ function App() {
       
       await updateDoc(doc(db, "leads", leadAtual.id), attLead);
       setNovoComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
+      buscarHistoricoCard(leadAtual.id);
       mostrarMensagem('Histórico salvo na Nuvem!');
     } catch (e) { mostrarMensagem('Erro ao salvar.', true); }
   };
@@ -877,7 +934,10 @@ function App() {
     if (novaEtapa !== ETAPAS.FINALIZADO && stVenda) { stVenda = null; stMotivo = null; msgHistorico = `♻️ Venda Restaurada para ${novaEtapa}`; }
     try {
       await updateDoc(doc(db, "leads", leadAlvo.id), { etapa_funil: novaEtapa, status_venda: stVenda || null, motivo_perda: stMotivo || null });
-      if (novaEtapa !== leadAlvo.etapa_funil) await addDoc(collection(db, "historico"), { id_lead: leadAlvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: Date.now(), vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: msgHistorico });
+      if (novaEtapa !== leadAlvo.etapa_funil) {
+          await addDoc(collection(db, "historico"), { id_lead: leadAlvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: Date.now(), vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: msgHistorico });
+          if(leadAtual?.id === leadAlvo.id) buscarHistoricoCard(leadAlvo.id);
+      }
       mostrarMensagem(`Movido para ${novaEtapa}`);
     } catch (err) { mostrarMensagem('Erro ao mover lead.', true); }
   };
@@ -972,6 +1032,7 @@ function App() {
     try {
       await addDoc(collection(db, "historico"), { id_lead: modalFinalizar.lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: obs });
       await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, data_conclusao: timestamp });
+      if(leadAtual?.id === modalFinalizar.lead.id) buscarHistoricoCard(modalFinalizar.lead.id);
       setModalFinalizar(null); setMotivoPerda('');
       mostrarMensagem(modalFinalizar.type === 'ganho' ? 'Dá um Appgas! Venda Fechada e Tarefa Criada!' : 'Perda registrada.');
     } catch(e) { mostrarMensagem('Erro ao gravar no CRM.', true); }
@@ -1085,10 +1146,9 @@ function App() {
     });
     const dataMotivos = Object.keys(motivosCount).map(k => ({ name: k, qtde: motivosCount[k] })).sort((a,b) => b.qtde - a.qtde).slice(0, 5);
 
-    historicoGeral.forEach(h => {
+    historicoDash.forEach(h => {
        const leadMatch = baseLeads.find(l => l.id === h.id_lead);
        if (leadMatch && checkTime(h.timestamp)) {
-           // OMITIR AS AÇÕES AUTOMÁTICAS DO WHATSAPP DO VENDEDOR DAS MÉTRICAS MANUAIS
            if (h.canal !== 'Automático' && h.canal !== 'WhatsApp (Auto)') {
                intencaoContato.total++;
                
@@ -1133,7 +1193,7 @@ function App() {
        if(!checkTime(creationTime) && !checkTime(lead.data_conclusao) && !checkTime(lead.ultima_interacao)) return;
 
        let timeline = [{ etapa: ETAPAS.LEAD, time: creationTime }];
-       const hLead = historicoGeral.filter(h => h.id_lead === lead.id).sort((a, b) => a.timestamp - b.timestamp);
+       const hLead = historicoDash.filter(h => h.id_lead === lead.id).sort((a, b) => a.timestamp - b.timestamp);
 
        hLead.forEach(h => {
            if (h.observacao && h.observacao.startsWith('Avançou para ')) {
