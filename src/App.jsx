@@ -249,7 +249,7 @@ function App() {
   const scrollPosLista = useRef(0);
   const scrollPosKanban = useRef(0);
   const kanbanColRefs = useRef({}); 
-  
+
   // TRAVA DE SEGURANÇA: Evita que o robô do Vácuo rode infinitamente
   const autoMoveExecutadoRef = useRef(false);
 
@@ -281,26 +281,24 @@ function App() {
       setErroPermissaoFirebase(false);
     }, lidarComErroFirebase);
 
+    // OTIMIZAÇÃO: onSnapshot do Histórico inteiro removido para economizar leituras!
+
     const unsubVend = onSnapshot(collection(db, "vendedores"), (snap) => {
       const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setVendedores(data);
     }, lidarComErroFirebase);
 
-    const carregarConfig = async () => {
-        try {
-            const qs = await getDocs(collection(db, "config"));
-            qs.forEach(d => { if (d.id === "motivos" && d.data().lista) setMotivosPerda(d.data().lista); });
-        } catch(e) {}
-        setCarregandoDados(false);
-    };
-    carregarConfig();
+    const unsubMotivos = onSnapshot(doc(db, "config", "motivos"), (docSnap) => {
+      if (docSnap.exists() && docSnap.data().lista) setMotivosPerda(docSnap.data().lista);
+      setCarregandoDados(false);
+    }, lidarComErroFirebase);
 
-    return () => { unsubLeads(); unsubVend(); };
+    return () => { unsubLeads(); unsubVend(); unsubMotivos(); };
   }, []);
 
-  // OTIMIZAÇÃO DE LEITURAS (Dashboard só carrega histórico sob demanda via getDocs)
+  // OTIMIZAÇÃO: Dashboard com carregamento "Preguiçoso" (Somente métricas da semana ou mês selecionado)
   const carregarHistoricoDash = async () => {
-      setUploadProgresso('Calculando métricas atualizadas...');
+      setUploadProgresso('Calculando métricas da Nuvem...');
       try {
           const now = new Date();
           let timeLimit = 0;
@@ -318,7 +316,7 @@ function App() {
           const qs = await getDocs(q);
           const data = qs.docs.map(doc => ({ id: doc.id, ...doc.data() }));
           setHistoricoDash(data);
-      } catch (error) { console.error("Erro ao gerar Dash:", error); }
+      } catch (error) { console.error("Erro Dash", error); }
       setUploadProgresso('');
   };
 
@@ -328,7 +326,7 @@ function App() {
       }
   }, [visaoAtual, filtroTempoDash]);
 
-  // AUTOMAÇÃO: Verifica leads no Vácuo e move para "Aguardando Resposta" 1 vez por sessão
+  // AUTOMAÇÃO COM TRAVA: Verifica leads no Vácuo (Ghosting) com useRef para economizar leituras
   useEffect(() => {
       if (leads.length === 0 || autoMoveExecutadoRef.current) return;
       autoMoveExecutadoRef.current = true;
@@ -357,7 +355,7 @@ function App() {
 
   const leadAtual = leadSelecionadoId ? leads.find(l => l.id === leadSelecionadoId) : null;
 
-  // OTIMIZAÇÃO: Lazy Loading para carregar o histórico de um lead apenas ao abrir o card
+  // OTIMIZAÇÃO: Lazy Loading para baixar o histórico do cliente apenas quando ele for clicado!
   const buscarHistoricoCard = async (idLead) => {
       try {
           const q = query(collection(db, "historico"), where("id_lead", "==", idLead));
@@ -395,9 +393,9 @@ function App() {
         });
     }
     
-    setHistoricoLead([]); // Limpa enquanto carrega
+    setHistoricoLead([]); // Limpa o carregamento anterior
     setLeadSelecionadoId(id);
-    buscarHistoricoCard(id); // Otimização disparada aqui!
+    buscarHistoricoCard(id); // Otimização Disparada Aqui
     setVeioDoMapa(visaoAtual === 'mapa');
     fecharMenuMobile();
   };
@@ -688,6 +686,7 @@ function App() {
         let histExport = qs.docs.map(d => ({ id: d.id, ...d.data() }));
 
         const now = new Date();
+        
         if (filtroExportacao === 'mes') {
           histExport = histExport.filter(h => new Date(h.timestamp).getMonth() === now.getMonth() && new Date(h.timestamp).getFullYear() === now.getFullYear());
         } else if (filtroExportacao === 'semana') {
@@ -857,7 +856,7 @@ function App() {
             await updateDoc(doc(db, "leads", lead.id), updateData);
             mostrarMensagem(`Falha registrada. Follow-up agendado.`);
         }
-        buscarHistoricoCard(lead.id); // Otimização
+        buscarHistoricoCard(lead.id); // Re-busca interações com Lazy Load
     } catch (e) {
         console.error("Erro ao gravar histórico", e);
     }
@@ -915,7 +914,7 @@ function App() {
       
       await updateDoc(doc(db, "leads", leadAtual.id), attLead);
       setNovoComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
-      buscarHistoricoCard(leadAtual.id);
+      buscarHistoricoCard(leadAtual.id); // OTIMIZAÇÃO APLICADA
       mostrarMensagem('Histórico salvo na Nuvem!');
     } catch (e) { mostrarMensagem('Erro ao salvar.', true); }
   };
@@ -1032,7 +1031,7 @@ function App() {
     try {
       await addDoc(collection(db, "historico"), { id_lead: modalFinalizar.lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: obs });
       await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, data_conclusao: timestamp });
-      if(leadAtual?.id === modalFinalizar.lead.id) buscarHistoricoCard(modalFinalizar.lead.id);
+      if(leadAtual?.id === modalFinalizar.lead.id) buscarHistoricoCard(modalFinalizar.lead.id); // OTIMIZADO
       setModalFinalizar(null); setMotivoPerda('');
       mostrarMensagem(modalFinalizar.type === 'ganho' ? 'Dá um Appgas! Venda Fechada e Tarefa Criada!' : 'Perda registrada.');
     } catch(e) { mostrarMensagem('Erro ao gravar no CRM.', true); }
@@ -1149,6 +1148,7 @@ function App() {
     historicoDash.forEach(h => {
        const leadMatch = baseLeads.find(l => l.id === h.id_lead);
        if (leadMatch && checkTime(h.timestamp)) {
+           // OMITIR AS AÇÕES AUTOMÁTICAS DO WHATSAPP DO VENDEDOR DAS MÉTRICAS MANUAIS
            if (h.canal !== 'Automático' && h.canal !== 'WhatsApp (Auto)') {
                intencaoContato.total++;
                
