@@ -217,6 +217,10 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
                const attLead = { ultima_interacao: timestamp, ultimo_remetente: 'vendedor' };
                if (comentario.proximo_contato) attLead.proximo_contato = new Date(comentario.proximo_contato).getTime(); else attLead.proximo_contato = null; 
                await updateDoc(doc(db, "leads", alvo.id), attLead);
+            } else {
+               // NOVO: marca a revenda como contactada, para o painel de métricas Farmers conseguir
+               // calcular "contactadas x sem contato" direto do campo, sem escanear o histórico inteiro.
+               await updateDoc(doc(db, "carteira_ativa", alvo.id), { ultima_interacao: timestamp });
             }
             
             setComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' }); 
@@ -299,6 +303,8 @@ function App() {
   const [filtroVendedorDash, setFiltroVendedorDash] = useState('todos');
   const [filtroTempoDash, setFiltroTempoDash] = useState('mes');
   const [filtroExportacao, setFiltroExportacao] = useState('mes');
+  const [filtroExportacaoFarmer, setFiltroExportacaoFarmer] = useState('mes');
+  const [dashboardAba, setDashboardAba] = useState('hunters');
 
   const [novoVendedorNome, setNovoVendedorNome] = useState('');
   const [novoVendedorSenha, setNovoVendedorSenha] = useState(''); 
@@ -466,7 +472,7 @@ function App() {
   };
 
   useEffect(() => {
-      if (visaoAtual === 'performance' && carteiraFarmers.length === 0) {
+      if ((visaoAtual === 'performance' || visaoAtual === 'dashboard') && carteiraFarmers.length === 0) {
           carregarCarteiraFarmers();
       }
   }, [visaoAtual]);
@@ -1075,7 +1081,7 @@ function App() {
     } catch(e) { setUploadProgresso(''); mostrarMensagem(`Erro ao limpar ${colecao}.`, true); }
   };
 
-  const exportarCSV = async () => {
+  const exportarCSVHunters = async () => {
     mostrarMensagem("Acessando banco de dados, aguarde...");
     try {
         const now = new Date();
@@ -1095,18 +1101,118 @@ function App() {
           histExport = histExport.filter(h => new Date(h.timestamp).getMonth() === now.getMonth() && new Date(h.timestamp).getFullYear() === now.getFullYear());
         }
 
+        // CORREÇÃO: busca os leads atuais direto do banco (independente do que já está em memória)
+        // e mantém SOMENTE entradas que pertencem a um lead de verdade — antes, comentários de
+        // Farmers (cujo id_lead aponta pra um documento em carteira_ativa, não em leads) também
+        // entravam nesse relatório com todos os campos de lead em branco, misturando os dois relatórios.
+        const leadsSnap = await getDocs(collection(db, "leads"));
+        const leadsMap = {};
+        leadsSnap.docs.forEach(d => { leadsMap[d.id] = d.data(); });
+        histExport = histExport.filter(h => leadsMap[h.id_lead]);
+
         let csvContent = "Data,Vendedor,Revenda,CNPJ,Distribuidora,Cidade,UF,Etapa Funil,Status Venda,Motivo Perda,Canal,Pessoa Contatada,Observacao\n";
         histExport.forEach(h => {
-          const lead = leads.find(l => l.id === h.id_lead) || {};
+          const lead = leadsMap[h.id_lead] || {};
           const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
           csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(lead.nome)},${limpaStr(lead['CPF/CNPJ'])},${limpaStr(getDistNome(lead))},${limpaStr(lead.cidade)},${limpaStr(lead.uf)},${limpaStr(lead.etapa_funil)},${limpaStr(lead.status_venda)},${limpaStr(lead.motivo_perda)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
         });
 
         const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: "text/csv;charset=utf-8;" });
         const link = document.createElement("a"); link.href = URL.createObjectURL(blob);
-        link.download = `Exportacao_CRM_IA_${filtroExportacao}.csv`; link.click();
+        link.download = `Exportacao_CRM_Hunters_${filtroExportacao}.csv`; link.click();
         mostrarMensagem("Download iniciado!");
     } catch(e) { mostrarMensagem("Erro na exportação", true); }
+  };
+
+  // NOVO: relatório equivalente, porém para os comentários registrados nos cards de Farmers.
+  // Mesma estrutura geral (Data, Vendedor, Canal, Pessoa Contatada, Observação), mas troca os
+  // campos que só existem pro funil de Hunters (Distribuidora/Etapa Funil/Status Venda/Motivo
+  // Perda, que não existem numa revenda de carteira_ativa) por Code, Revenda e Pontuação Atual.
+  const exportarCSVFarmers = async () => {
+    mostrarMensagem("Acessando banco de dados, aguarde...");
+    try {
+        const now = new Date();
+        let historicoQuery = collection(db, "historico");
+        if (filtroExportacaoFarmer === 'mes') {
+            const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+            historicoQuery = query(collection(db, "historico"), where("timestamp", ">=", inicioMes));
+        } else if (filtroExportacaoFarmer === 'semana') {
+            const umaSemanaAtras = now.getTime() - (7 * 24 * 60 * 60 * 1000);
+            historicoQuery = query(collection(db, "historico"), where("timestamp", ">=", umaSemanaAtras));
+        }
+
+        const qs = await getDocs(historicoQuery);
+        let histExport = qs.docs.map(d => ({ id: d.id, ...d.data() }));
+
+        if (filtroExportacaoFarmer === 'mes') {
+          histExport = histExport.filter(h => new Date(h.timestamp).getMonth() === now.getMonth() && new Date(h.timestamp).getFullYear() === now.getFullYear());
+        }
+
+        const carteiraSnap = await getDocs(collection(db, "carteira_ativa"));
+        const carteiraMap = {};
+        carteiraSnap.docs.forEach(d => { carteiraMap[d.id] = d.data(); });
+        histExport = histExport.filter(h => carteiraMap[h.id_lead]);
+
+        let csvContent = "Data,Vendedor,Code,Revenda,CNPJ,Cidade,UF,Pontuacao Atual,Canal,Pessoa Contatada,Observacao\n";
+        histExport.forEach(h => {
+          const revenda = carteiraMap[h.id_lead] || {};
+          const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
+          const ufRevenda = obterSiglaUF(revenda.uf || revenda.estado || revenda.state || '');
+          csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(revenda.code || revenda.CODE)},${limpaStr(revenda.nome || revenda.razao_social)},${limpaStr(revenda.cnpj || revenda['CPF/CNPJ'] || revenda.CNPJ)},${limpaStr(revenda.cidade || revenda.city)},${limpaStr(ufRevenda)},${limpaStr(revenda.total_score ?? 0)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
+        });
+
+        const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: "text/csv;charset=utf-8;" });
+        const link = document.createElement("a"); link.href = URL.createObjectURL(blob);
+        link.download = `Exportacao_CRM_Farmers_${filtroExportacaoFarmer}.csv`; link.click();
+        mostrarMensagem("Download iniciado!");
+    } catch(e) { mostrarMensagem("Erro na exportação", true); }
+  };
+
+  // NOVO: sincronização única (sob demanda) do campo ultima_interacao para revendas que já tinham
+  // comentários registrados ANTES dessa marcação existir. Sem isso, "Contactadas x Sem Contato"
+  // no painel Farmers ficaria incorreto para todo o histórico anterior a essa atualização.
+  const backfillContatosFarmers = async () => {
+      setUploadProgresso('Sincronizando contatos existentes...');
+      try {
+          const [historicoSnap, carteiraSnap] = await Promise.all([
+              getDocs(collection(db, "historico")),
+              getDocs(collection(db, "carteira_ativa"))
+          ]);
+          const carteiraIds = new Set(carteiraSnap.docs.map(d => d.id));
+          const ultimaInteracaoPorRevenda = {};
+          historicoSnap.docs.forEach(d => {
+              const h = d.data();
+              if (carteiraIds.has(h.id_lead)) {
+                  if (!ultimaInteracaoPorRevenda[h.id_lead] || h.timestamp > ultimaInteracaoPorRevenda[h.id_lead]) {
+                      ultimaInteracaoPorRevenda[h.id_lead] = h.timestamp;
+                  }
+              }
+          });
+
+          const idsParaAtualizar = Object.keys(ultimaInteracaoPorRevenda);
+          if (idsParaAtualizar.length === 0) {
+              setUploadProgresso('');
+              return mostrarMensagem('Nenhum comentário de Farmer encontrado no histórico.', false);
+          }
+
+          const BATCH_SIZE = 400;
+          let atualizados = 0;
+          for (let i = 0; i < idsParaAtualizar.length; i += BATCH_SIZE) {
+              const chunk = idsParaAtualizar.slice(i, i + BATCH_SIZE);
+              const batch = writeBatch(db);
+              chunk.forEach(id => { batch.update(doc(db, "carteira_ativa", id), { ultima_interacao: ultimaInteracaoPorRevenda[id] }); });
+              setUploadProgresso(`Sincronizando (${Math.min(i + chunk.length, idsParaAtualizar.length)}/${idsParaAtualizar.length})...`);
+              await batch.commit();
+              await delay(600);
+              atualizados += chunk.length;
+          }
+          setUploadProgresso('');
+          mostrarMensagem(`Contatos sincronizados! ${atualizados} revenda(s) marcadas com base no histórico já existente.`);
+          carregarCarteiraFarmers();
+      } catch (e) {
+          setUploadProgresso('');
+          mostrarMensagem('Erro ao sincronizar contatos.', true);
+      }
   };
 
   const abrirPerformanceFarmer = async (revenda) => {
@@ -1337,6 +1443,12 @@ function App() {
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
          <button onClick={voltarVisao} className={`mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit`} style={{color: BRAND.gray}}>← Voltar</button>
+         {isAdmin && (
+            <div className="inline-flex bg-slate-100 p-1 rounded-xl mb-6 gap-1">
+               <button onClick={() => setDashboardAba('hunters')} className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${dashboardAba === 'hunters' ? 'bg-white shadow-sm' : ''}`} style={{color: dashboardAba === 'hunters' ? BRAND.blue : BRAND.gray}}>🎯 Hunters</button>
+               <button onClick={() => setDashboardAba('farmers')} className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${dashboardAba === 'farmers' ? 'bg-white shadow-sm' : ''}`} style={{color: dashboardAba === 'farmers' ? BRAND.blue : BRAND.gray}}>🌾 Farmers</button>
+            </div>
+         )}
          <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
              <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>Métricas e Inteligência</h2>
              <div className="flex flex-col sm:flex-row gap-2 w-full xl:w-auto">
@@ -1378,6 +1490,78 @@ function App() {
          <div className="p-6 md:p-8 rounded-2xl text-white shadow-xl flex flex-col md:flex-row justify-between items-start md:items-center gap-6" style={{backgroundColor: BRAND.black}}>
              <div className="w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Meta de Vendas ({filtroTempoDash})</p><div className="flex items-end gap-2 mb-3"><span className="text-3xl md:text-4xl font-black" style={{color: BRAND.yellow}}>{leadsConvertidos.length}</span><span className="text-lg md:text-xl text-white/50 mb-0.5">/ {metaAtual} fechamentos</span></div><div className="w-full md:w-64 h-3 rounded-full overflow-hidden" style={{backgroundColor: 'rgba(255,255,255,0.1)'}}><div className="h-full rounded-full transition-all duration-1000" style={{backgroundColor: BRAND.yellow, width: `${Math.min((leadsConvertidos.length/metaAtual)*100, 100)}%`}}></div></div></div>
              <div className="text-left md:text-right border-t md:border-t-0 md:border-l border-white/20 pt-6 md:pt-0 md:pl-8 w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Projeção de Ganhos</p><p className="text-3xl md:text-4xl font-black text-white">R$ {valorComissao.toLocaleString('pt-BR')}</p><p className="text-xs md:text-sm font-medium mt-1" style={{color: BRAND.yellow}}>+ R$ {COMISSAO_REVENDA} por venda</p></div>
+         </div>
+      </div>
+    );
+  };
+
+  // NOVO: dashboard de métricas específico para Farmers — separado do dashboard de Hunters acima,
+  // já que "revenda de carteira" e "lead em funil" são conceitos diferentes (uma revenda não avança
+  // por etapas, então reaproveitar os gráficos de funil/conversão não fazia sentido aqui).
+  const renderDashboardFarmers = () => {
+    const baseFarmers = carteiraFarmersFiltrada; // já respeita a carteira do vendedor logado (ou tudo, se admin)
+
+    const contactadas = baseFarmers.filter(f => f.ultima_interacao).length;
+    const semContato = baseFarmers.length - contactadas;
+
+    const dataRanking = ['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume'].map(nivel => ({
+        name: nivel,
+        qtde: baseFarmers.filter(f => (f.ranking_level || 'Sem volume') === nivel).length
+    }));
+
+    const statusCount = {};
+    baseFarmers.forEach(f => { const st = getFarmerStatus(f); statusCount[st.text] = (statusCount[st.text] || 0) + 1; });
+    const dataStatus = Object.keys(statusCount).map(k => ({ name: k, value: statusCount[k] }));
+
+    const totalScore = baseFarmers.reduce((acc, f) => acc + (Number(f.total_score) || 0), 0);
+    const mediaScore = baseFarmers.length > 0 ? (totalScore / baseFarmers.length).toFixed(1) : 0;
+    const totalPedidos = baseFarmers.reduce((acc, f) => acc + (Number(f.total_orders) || 0), 0);
+    const taxaContato = baseFarmers.length > 0 ? ((contactadas / baseFarmers.length) * 100).toFixed(0) : 0;
+
+    return (
+      <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
+         <button onClick={voltarVisao} className="mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>← Voltar</button>
+         {isAdmin && (
+            <div className="inline-flex bg-slate-100 p-1 rounded-xl mb-6 gap-1">
+               <button onClick={() => setDashboardAba('hunters')} className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${dashboardAba === 'hunters' ? 'bg-white shadow-sm' : ''}`} style={{color: dashboardAba === 'hunters' ? BRAND.blue : BRAND.gray}}>🎯 Hunters</button>
+               <button onClick={() => setDashboardAba('farmers')} className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${dashboardAba === 'farmers' ? 'bg-white shadow-sm' : ''}`} style={{color: dashboardAba === 'farmers' ? BRAND.blue : BRAND.gray}}>🌾 Farmers</button>
+            </div>
+         )}
+         <h2 className="text-2xl md:text-3xl font-black tracking-tight mb-8" style={{color: BRAND.black}}>Métricas Farmers</h2>
+
+         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-6">
+             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm"><p className="text-xs font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>Total de Revendas</p><p className="text-4xl md:text-5xl font-black" style={{color: BRAND.black}}>{baseFarmers.length}</p></div>
+             <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white bg-emerald-500"><p className="text-xs font-medium uppercase tracking-widest mb-2 text-white/80">✅ Contactadas</p><p className="text-4xl md:text-5xl font-black">{contactadas}</p><p className="text-xs font-bold mt-1 text-white/80">{taxaContato}% da carteira</p></div>
+             <div className="p-5 md:p-6 rounded-2xl shadow-sm text-white bg-red-500"><p className="text-xs font-medium uppercase tracking-widest mb-2 text-white/80">🚫 Sem Contato</p><p className="text-4xl md:text-5xl font-black">{semContato}</p></div>
+             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm"><p className="text-xs font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>Score Médio</p><p className="text-4xl md:text-5xl font-black" style={{color: BRAND.black}}>{mediaScore}</p></div>
+         </div>
+
+         <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6">
+             <h3 className="text-sm font-bold uppercase tracking-widest mb-1" style={{color: BRAND.gray}}>Cobertura de Contato</h3>
+             <p className="text-xs mb-4" style={{color: BRAND.gray}}>Revendas com pelo menos um comentário registrado x sem nenhum contato ainda.</p>
+             <div className="w-full h-4 rounded-full overflow-hidden bg-red-100 flex">
+                 <div className="h-full bg-emerald-500 transition-all duration-700" style={{width: `${taxaContato}%`}}></div>
+             </div>
+             <div className="flex justify-between mt-2 text-[10px] font-bold" style={{color: BRAND.gray}}>
+                 <span>🟢 {contactadas} contactadas</span>
+                 <span>🔴 {semContato} sem contato</span>
+             </div>
+         </div>
+
+         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Distribuição por Ranking</h3>
+               <div className="h-56 md:h-64"><ResponsiveContainer width="100%" height="100%"><BarChart data={dataRanking} layout="vertical" margin={{ left: 40, right: 40, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" /><YAxis dataKey="name" type="category" width={90} tick={{fontSize: 11, fill: BRAND.gray, fontWeight: 'bold'}} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill={BRAND.blue} radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer></div>
+            </div>
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Distribuição por Status</h3>
+               <div className="h-56 md:h-64">{dataStatus.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={dataStatus} cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={5} dataKey="value">{dataStatus.map((entry, index) => <Cell key={`cell-${index}`} fill={CORES_GRAFICO[index % CORES_GRAFICO.length]} />)}</Pie><Tooltip contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Legend wrapperStyle={{fontSize: '11px', fontWeight: 'bold'}} /></PieChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem revendas na carteira</div>}</div>
+            </div>
+         </div>
+
+         <div className="p-6 md:p-8 rounded-2xl text-white shadow-xl flex flex-col md:flex-row justify-between items-start md:items-center gap-6" style={{backgroundColor: BRAND.black}}>
+             <div className="w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Total de Pedidos (última apuração)</p><p className="text-3xl md:text-4xl font-black" style={{color: BRAND.yellow}}>{totalPedidos.toLocaleString('pt-BR')}</p></div>
+             <div className="text-left md:text-right border-t md:border-t-0 md:border-l border-white/20 pt-6 md:pt-0 md:pl-8 w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Revendas na Carteira</p><p className="text-3xl md:text-4xl font-black text-white">{baseFarmers.length}</p></div>
          </div>
       </div>
     );
@@ -1520,7 +1704,7 @@ function App() {
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' ? BRAND.blue : BRAND.gray}}>Lista</button>}
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' ? BRAND.blue : BRAND.gray}}>Kanban</button>}
           {(isAdmin || isFarmerProfile) && <button onClick={() => mudarVisao('performance')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'performance' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'performance' ? BRAND.blue : BRAND.gray}}>Farmers</button>}
-          {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('dashboard')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'dashboard' ? BRAND.blue : BRAND.gray}}>Dash</button>}
+          {(isAdmin || isHunterProfile || isFarmerProfile) && <button onClick={() => mudarVisao('dashboard')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'dashboard' ? BRAND.blue : BRAND.gray}}>Dash</button>}
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('mapa')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'mapa' ? BRAND.blue : BRAND.gray}}>Mapa</button>}
         </div>
 
@@ -2137,7 +2321,7 @@ function App() {
         </div>
 
         {/* OUTRAS VIEWS (Dash, Mapa, Appgas, Gerenciar) */}
-        {!leadAtual && visaoAtual === 'dashboard' && renderDashboard()}
+        {!leadAtual && visaoAtual === 'dashboard' && (isFarmerProfile ? renderDashboardFarmers() : (dashboardAba === 'farmers' ? renderDashboardFarmers() : renderDashboard()))}
         
         {!leadAtual && visaoAtual === 'mapa' && (
           <div className="flex-1 p-4 md:p-6 h-full flex flex-col relative bg-slate-50">
@@ -2252,9 +2436,14 @@ function App() {
                         🗑️ Limpar Métricas
                     </button>
                 </div>
-                <button onClick={recalcularCarteiraRevendas} className="w-full mt-4 text-emerald-700 bg-emerald-50 text-xs font-bold py-3.5 rounded-xl border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">
-                    🔄 Recalcular Carteira das Revendas (usa o Guia de Municípios atual)
-                </button>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                    <button onClick={recalcularCarteiraRevendas} className="text-emerald-700 bg-emerald-50 text-xs font-bold py-3.5 rounded-xl border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">
+                        🔄 Recalcular Carteira das Revendas
+                    </button>
+                    <button onClick={backfillContatosFarmers} className="text-blue-700 bg-blue-50 text-xs font-bold py-3.5 rounded-xl border border-blue-200 hover:bg-blue-600 hover:text-white transition-colors">
+                        📇 Sincronizar Contatos Já Registrados
+                    </button>
+                </div>
              </div>
 
              <div className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-sm mb-6 md:mb-8">
@@ -2265,8 +2454,22 @@ function App() {
                       <option value="mes">Extrair Apenas Este Mês</option>
                       <option value="semana">Extrair Esta Semana</option>
                    </select>
-                   <button onClick={exportarCSV} className="text-white text-xs md:text-sm font-bold px-6 py-3 rounded-xl shadow-sm flex justify-center items-center gap-2 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blueDark}}>
-                      ⬇️ Baixar CSV para a IA
+                   <button onClick={exportarCSVHunters} className="text-white text-xs md:text-sm font-bold px-6 py-3 rounded-xl shadow-sm flex justify-center items-center gap-2 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blueDark}}>
+                      ⬇️ Baixar CSV Hunters para a IA
+                   </button>
+                </div>
+             </div>
+
+             <div className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-sm mb-6 md:mb-8">
+                <h3 className="text-sm font-bold uppercase tracking-widest mb-4 flex items-center gap-2" style={{color: BRAND.gray}}>🌾 Inteligência Artificial (Farmers)</h3>
+                <div className="flex flex-col sm:flex-row gap-3">
+                   <select className="flex-1 border p-3 rounded-xl text-xs md:text-sm font-bold outline-none bg-slate-50" style={{color: BRAND.black}} value={filtroExportacaoFarmer} onChange={e=>setFiltroExportacaoFarmer(e.target.value)}>
+                      <option value="tudo">Extrair Todo o Histórico</option>
+                      <option value="mes">Extrair Apenas Este Mês</option>
+                      <option value="semana">Extrair Esta Semana</option>
+                   </select>
+                   <button onClick={exportarCSVFarmers} className="text-white text-xs md:text-sm font-bold px-6 py-3 rounded-xl shadow-sm flex justify-center items-center gap-2 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blue}}>
+                      ⬇️ Baixar CSV Farmers para a IA
                    </button>
                 </div>
              </div>
