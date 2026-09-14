@@ -316,6 +316,7 @@ function App() {
 
   // NOVO: filtros e ordenação da visão Farmers
   const [filtroFarmerCidade, setFiltroFarmerCidade] = useState('');
+  const [filtroFarmerBusca, setFiltroFarmerBusca] = useState('');
   const [filtroFarmerUf, setFiltroFarmerUf] = useState('todas');
   const [filtroFarmerStatus, setFiltroFarmerStatus] = useState('todos');
   const [ordenacaoFarmer, setOrdenacaoFarmer] = useState('padrao');
@@ -678,9 +679,19 @@ function App() {
           if (filtroFarmerStatus !== 'todos') {
               if (getFarmerStatus(f).key !== filtroFarmerStatus) return false;
           }
+          // NOVO: busca por CNPJ (compara só dígitos, ignorando pontuação) ou por code (texto exato/parcial).
+          if (filtroFarmerBusca.trim()) {
+              const termo = filtroFarmerBusca.trim().toLowerCase();
+              const termoDigits = termo.replace(/\D/g, '');
+              const cnpjRevenda = String(f.cnpj || f['CPF/CNPJ'] || f.CNPJ || '').replace(/\D/g, '');
+              const codeRevenda = String(f.code || f.CODE || '').toLowerCase();
+              const bateCnpj = termoDigits.length > 0 && cnpjRevenda.includes(termoDigits);
+              const bateCode = codeRevenda.includes(termo);
+              if (!bateCnpj && !bateCode) return false;
+          }
           return true;
       });
-  }, [carteiraFarmersFiltrada, filtroFarmerUf, filtroFarmerCidade, filtroFarmerStatus]);
+  }, [carteiraFarmersFiltrada, filtroFarmerUf, filtroFarmerCidade, filtroFarmerStatus, filtroFarmerBusca]);
 
   // NOVO: comparador usado para ordenar os cards dentro de cada coluna do Kanban de Farmers
   const compararFarmers = (a, b) => {
@@ -872,9 +883,22 @@ function App() {
 
             setUploadProgresso('Verificando carteira já existente na nuvem...');
             const qsExisting = await getDocs(collection(db, "carteira_ativa"));
-            const existingErpIds = new Set(qsExisting.docs.map(doc => String(doc.data().id_erp || doc.id)));
+            // CORREÇÃO: antes só guardávamos os IDs já existentes (um Set) só pra pular e ignorar
+            // — por isso reimportar o CSV nunca atualizava o status (enabled/disabled_by) de uma
+            // revenda que já estava no banco, mesmo que ela tivesse sido desabilitada/reabilitada
+            // desde o último import. Agora guardamos também os dados atuais e o ID real do
+            // documento no Firestore (que pode ser diferente de id_erp em registros mais antigos,
+            // importados antes de o doc ID passar a ser o próprio id_erp), pra poder comparar e
+            // atualizar quando necessário.
+            const existingMap = {};
+            qsExisting.docs.forEach(d => {
+                const data = d.data();
+                const chave = String(data.id_erp || d.id);
+                existingMap[chave] = { docId: d.id, data };
+            });
 
             const novos = [];
+            const atualizacoesStatus = [];
             let ignorados = 0;
 
             setUploadProgresso('Processando dados do arquivo...');
@@ -892,8 +916,31 @@ function App() {
                 if (!idErp) continue;
                 idErp = String(idErp);
 
-                if (existingErpIds.has(idErp)) {
-                    ignorados++;
+                const existente = existingMap[idErp];
+
+                if (existente) {
+                    // CORREÇÃO: revenda já existe — compara status (enabled/disabled_by, e os campos
+                    // relacionados que vêm junto: disable_reason_id, close_reason_id, closed_at) contra
+                    // o que já está gravado; se mudou, assume o status novo do CSV. Se não mudou, ignora.
+                    const enabledNovo = String(objOriginal.enabled ?? '');
+                    const disabledByNovo = String(objOriginal.disabled_by ?? '');
+                    const enabledAntigo = String(existente.data.enabled ?? '');
+                    const disabledByAntigo = String(existente.data.disabled_by ?? '');
+
+                    if (enabledNovo !== enabledAntigo || disabledByNovo !== disabledByAntigo) {
+                        atualizacoesStatus.push({
+                            docId: existente.docId,
+                            changes: {
+                                enabled: objOriginal.enabled ?? '',
+                                disabled_by: objOriginal.disabled_by ?? '',
+                                disable_reason_id: objOriginal.disable_reason_id ?? '',
+                                close_reason_id: objOriginal.close_reason_id ?? '',
+                                closed_at: objOriginal.closed_at ?? ''
+                            }
+                        });
+                    } else {
+                        ignorados++;
+                    }
                     continue;
                 }
 
@@ -910,16 +957,12 @@ function App() {
                     uf_padronizada: state,
                     ...objOriginal 
                 });
-                existingErpIds.add(idErp); 
-            }
-
-            if (novos.length === 0) {
-                setUploadProgresso('');
-                return mostrarMensagem(`Concluído! ${ignorados} revendas já existiam. Nenhuma nova para importar.`, false);
+                existingMap[idErp] = { docId: idErp, data: novos[novos.length - 1] }; // evita duplicar se o mesmo id_erp aparecer 2x no mesmo arquivo
             }
 
             const BATCH_SIZE = 150;
             let qtdImportados = 0;
+            let qtdAtualizados = 0;
 
             for (let i = 0; i < novos.length; i += BATCH_SIZE) {
                 const chunk = novos.slice(i, i + BATCH_SIZE);
@@ -933,9 +976,26 @@ function App() {
                 await delay(1000); 
                 qtdImportados += chunk.length;
             }
+
+            for (let i = 0; i < atualizacoesStatus.length; i += BATCH_SIZE) {
+                const chunk = atualizacoesStatus.slice(i, i + BATCH_SIZE);
+                const batch = writeBatch(db);
+                chunk.forEach(item => {
+                    batch.update(doc(db, "carteira_ativa", item.docId), item.changes);
+                });
+                setUploadProgresso(`Atualizando status (${Math.min(i + chunk.length, atualizacoesStatus.length)}/${atualizacoesStatus.length})...`);
+                await batch.commit();
+                await delay(1000);
+                qtdAtualizados += chunk.length;
+            }
+
+            if (novos.length === 0 && atualizacoesStatus.length === 0) {
+                setUploadProgresso('');
+                return mostrarMensagem(`Concluído! ${ignorados} revendas já existiam sem mudança de status. Nenhuma novidade para importar.`, false);
+            }
             
             setUploadProgresso('');
-            mostrarMensagem(`Sucesso! ${qtdImportados} novas importadas, ${ignorados} ignoradas.`);
+            mostrarMensagem(`Sucesso! ${qtdImportados} novas importadas, ${qtdAtualizados} com status atualizado, ${ignorados} sem mudança.`);
             carregarCarteiraFarmers();
         } catch (err) {
             setUploadProgresso('');
@@ -2289,6 +2349,9 @@ function App() {
                      <div className="relative flex-1 min-w-[160px]">
                         <input type="text" placeholder="🔍 Buscar por cidade..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerCidade} onChange={e => setFiltroFarmerCidade(e.target.value)} />
                      </div>
+                     <div className="relative flex-1 min-w-[160px]">
+                        <input type="text" placeholder="🔍 Buscar por CNPJ ou código..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerBusca} onChange={e => setFiltroFarmerBusca(e.target.value)} />
+                     </div>
                      <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerUf} onChange={e => setFiltroFarmerUf(e.target.value)}>
                         <option value="todas">Estado: Todos</option>
                         {listaUfsFarmers.map(uf => <option key={uf} value={uf}>{uf}</option>)}
@@ -2309,8 +2372,8 @@ function App() {
                         <option value="score_asc">⚠️ Pior nota primeiro</option>
                         <option value="score_desc">⭐ Melhor nota primeiro</option>
                      </select>
-                     {(filtroFarmerCidade || filtroFarmerUf !== 'todas' || filtroFarmerStatus !== 'todos' || ordenacaoFarmer !== 'padrao') && (
-                        <button onClick={() => { setFiltroFarmerCidade(''); setFiltroFarmerUf('todas'); setFiltroFarmerStatus('todos'); setOrdenacaoFarmer('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
+                     {(filtroFarmerCidade || filtroFarmerBusca || filtroFarmerUf !== 'todas' || filtroFarmerStatus !== 'todos' || ordenacaoFarmer !== 'padrao') && (
+                        <button onClick={() => { setFiltroFarmerCidade(''); setFiltroFarmerBusca(''); setFiltroFarmerUf('todas'); setFiltroFarmerStatus('todos'); setOrdenacaoFarmer('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
                            ✕ Limpar
                         </button>
                      )}
