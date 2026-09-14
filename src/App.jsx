@@ -1343,7 +1343,7 @@ function App() {
     if (!metricas || metricas.length === 0) {
         return mostrarMensagem('Sem histórico suficiente para analisar.', true);
     }
-    setGerandoIA(true); //teste
+    setGerandoIA(true); //teste2
     setAnaliseIA('');
 
     try {
