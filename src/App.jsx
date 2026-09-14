@@ -76,6 +76,16 @@ const getFarmerStatus = (revenda) => {
     return { key: 'desabilitada', text: '⚪ Desabilitada', bg: 'bg-slate-100', textCol: 'text-slate-600', border: 'border-slate-200' };
 };
 
+// NOVO: sinalização de follow-up agendado para uma revenda de Farmer — equivalente simplificado do
+// getUrgency dos Hunters, mas só olhando o proximo_contato (não existe "ghosting"/funil para revenda).
+const getFarmerUrgency = (revenda) => {
+    if (!revenda.proximo_contato) return null;
+    const now = Date.now();
+    if (revenda.proximo_contato - now < 0) return { texto: '🚨 Retorno Atrasado', css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse' };
+    if (new Date(revenda.proximo_contato).toDateString() === new Date().toDateString()) return { texto: '📅 Retorno Hoje', css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold' };
+    return { texto: `📅 Agendado: ${new Date(revenda.proximo_contato).toLocaleDateString('pt-BR')}`, css: 'bg-[#2D6FEF]/10 text-[#2D6FEF] border-[#2D6FEF]/30' };
+};
+
 const getNextBusinessDay = (date = new Date()) => {
   let nextDay = new Date(date);
   nextDay.setDate(nextDay.getDate() + 1);
@@ -204,26 +214,35 @@ const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
   );
 };
 
-const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, isFarmer = false }) => {
-    const [comentario, setComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' });
+const MOTIVOS_COMENTARIO_FARMER = ['Engajamento', 'Boleto a Vencer', 'Cobrança Ativa', 'Cancelados', 'Problemas Operacionais'];
+
+const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, isFarmer = false, onFarmerFieldsSaved }) => {
+    const [comentario, setComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' });
 
     const salvarComentario = async () => {
         if (!comentario.contato.trim() || !comentario.observacao.trim()) return mostrarMensagem('Preencha com quem falou e a observação!', true);
+        if (isFarmer && !comentario.motivo) return mostrarMensagem('Selecione o motivo do comentário!', true);
         const timestamp = Date.now();
         try {
-            await addDoc(collection(db, "historico"), { id_lead: alvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: comentario.contato, canal: comentario.canal, observacao: comentario.observacao, sucesso: true });
+            const historicoData = { id_lead: alvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: comentario.contato, canal: comentario.canal, observacao: comentario.observacao, sucesso: true };
+            if (isFarmer) historicoData.motivo = comentario.motivo;
+            await addDoc(collection(db, "historico"), historicoData);
             
             if (!isFarmer) {
                const attLead = { ultima_interacao: timestamp, ultimo_remetente: 'vendedor' };
                if (comentario.proximo_contato) attLead.proximo_contato = new Date(comentario.proximo_contato).getTime(); else attLead.proximo_contato = null; 
                await updateDoc(doc(db, "leads", alvo.id), attLead);
             } else {
-               // NOVO: marca a revenda como contactada, para o painel de métricas Farmers conseguir
-               // calcular "contactadas x sem contato" direto do campo, sem escanear o histórico inteiro.
-               await updateDoc(doc(db, "carteira_ativa", alvo.id), { ultima_interacao: timestamp });
+               // NOVO: além de marcar como contactada, agora também persiste o follow-up agendado
+               // (antes esse campo era digitado mas nunca salvo para revendas de Farmer).
+               const attRevenda = { ultima_interacao: timestamp };
+               attRevenda.proximo_contato = comentario.proximo_contato ? new Date(comentario.proximo_contato).getTime() : null;
+               await updateDoc(doc(db, "carteira_ativa", alvo.id), attRevenda);
+               // Atualiza o estado local (card já aberto e a lista do Kanban) na hora, sem precisar recarregar.
+               onFarmerFieldsSaved?.(attRevenda);
             }
             
-            setComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '' }); 
+            setComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' }); 
             onHistoricoSalvo(alvo.id); 
             mostrarMensagem('Histórico salvo na Nuvem!');
         } catch (e) { mostrarMensagem('Erro ao salvar.', true); }
@@ -235,7 +254,7 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
                <div className="p-2 rounded-xl" style={{backgroundColor: `${BRAND.blue}20`, color: BRAND.blue}}><svg className="w-5 md:w-6 h-5 md:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></div>
                Registrar Nova Interação
             </h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6 mb-4 md:mb-6">
+            <div className={`grid grid-cols-1 ${isFarmer ? 'md:grid-cols-3' : 'md:grid-cols-2'} gap-4 md:gap-6 mb-4 md:mb-6`}>
               <div>
                 <input type="text" placeholder="Nome do Contato (Ex: Sr. Marcos - Gerente)" className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none font-medium text-sm md:text-base placeholder-slate-400 text-slate-800" value={comentario.contato} onChange={e => setComentario({...comentario, contato: e.target.value})} />
               </div>
@@ -247,6 +266,14 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
                   <option value="Visita Presencial">🤝 Visita Presencial</option>
                 </select>
               </div>
+              {isFarmer && (
+                <div>
+                  <select className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none font-medium text-sm md:text-base text-slate-600" value={comentario.motivo} onChange={e => setComentario({...comentario, motivo: e.target.value})}>
+                    <option value="">Motivo do comentário...</option>
+                    {MOTIVOS_COMENTARIO_FARMER.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+              )}
             </div>
             <div className="mb-4 md:mb-6">
               <textarea placeholder="Detalhe a conversa, ofertas feitas, condições..." className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none h-28 md:h-32 resize-none font-medium text-sm md:text-base placeholder-slate-400 text-slate-800" value={comentario.observacao} onChange={e => setComentario({...comentario, observacao: e.target.value})}></textarea>
@@ -1153,12 +1180,12 @@ function App() {
         carteiraSnap.docs.forEach(d => { carteiraMap[d.id] = d.data(); });
         histExport = histExport.filter(h => carteiraMap[h.id_lead]);
 
-        let csvContent = "Data,Vendedor,Code,Revenda,CNPJ,Cidade,UF,Pontuacao Atual,Canal,Pessoa Contatada,Observacao\n";
+        let csvContent = "Data,Vendedor,Code,Revenda,CNPJ,Cidade,UF,Pontuacao Atual,Motivo,Canal,Pessoa Contatada,Observacao\n";
         histExport.forEach(h => {
           const revenda = carteiraMap[h.id_lead] || {};
           const limpaStr = (str) => str ? `"${str.toString().replace(/"/g, '""').replace(/\n/g, ' ')}"` : '""';
           const ufRevenda = obterSiglaUF(revenda.uf || revenda.estado || revenda.state || '');
-          csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(revenda.code || revenda.CODE)},${limpaStr(revenda.nome || revenda.razao_social)},${limpaStr(revenda.cnpj || revenda['CPF/CNPJ'] || revenda.CNPJ)},${limpaStr(revenda.cidade || revenda.city)},${limpaStr(ufRevenda)},${limpaStr(revenda.total_score ?? 0)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
+          csvContent += `${limpaStr(h.data_hora)},${limpaStr(h.vendedor)},${limpaStr(revenda.code || revenda.CODE)},${limpaStr(revenda.nome || revenda.razao_social)},${limpaStr(revenda.cnpj || revenda['CPF/CNPJ'] || revenda.CNPJ)},${limpaStr(revenda.cidade || revenda.city)},${limpaStr(ufRevenda)},${limpaStr(revenda.total_score ?? 0)},${limpaStr(h.motivo)},${limpaStr(h.canal)},${limpaStr(h.contato)},${limpaStr(h.observacao)}\n`;
         });
 
         const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: "text/csv;charset=utf-8;" });
@@ -1558,6 +1585,28 @@ function App() {
     const totalPedidos = baseFarmers.reduce((acc, f) => acc + (Number(f.total_orders) || 0), 0);
     const taxaContato = baseFarmers.length > 0 ? ((contactadas / baseFarmers.length) * 100).toFixed(0) : 0;
 
+    // NOVO: comentários/contatos registrados para Farmers, no período selecionado (reaproveita o
+    // mesmo historicoDash já carregado/cacheado para o dashboard de Hunters — só filtra pra manter
+    // apenas as entradas cujo id_lead pertence a uma revenda desta carteira).
+    const idsFarmersSet = new Set(baseFarmers.map(f => f.id));
+    const farmersPorId = new Map(baseFarmers.map(f => [f.id, f]));
+    const historicoFarmers = historicoDash.filter(h => idsFarmersSet.has(h.id_lead));
+    const totalComentarios = historicoFarmers.length;
+
+    const canalCount = {};
+    const rankingContatoCount = {};
+    historicoFarmers.forEach(h => {
+        canalCount[h.canal] = (canalCount[h.canal] || 0) + 1;
+        const revenda = farmersPorId.get(h.id_lead);
+        const nivel = revenda ? (revenda.ranking_level || 'Sem volume') : 'Desconhecido';
+        rankingContatoCount[nivel] = (rankingContatoCount[nivel] || 0) + 1;
+    });
+    const dataCanalFarmers = Object.keys(canalCount).map(c => ({ name: c, value: canalCount[c] }));
+    const dataContatosPorRanking = ['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume'].map(nivel => ({
+        name: nivel,
+        qtde: rankingContatoCount[nivel] || 0
+    }));
+
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
          <button onClick={voltarVisao} className="mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>← Voltar</button>
@@ -1567,7 +1616,10 @@ function App() {
                <button onClick={() => setDashboardAba('farmers')} className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${dashboardAba === 'farmers' ? 'bg-white shadow-sm' : ''}`} style={{color: dashboardAba === 'farmers' ? BRAND.blue : BRAND.gray}}>🌾 Farmers</button>
             </div>
          )}
-         <h2 className="text-2xl md:text-3xl font-black tracking-tight mb-8" style={{color: BRAND.black}}>Métricas Farmers</h2>
+         <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
+             <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>Métricas Farmers</h2>
+             <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}><option value="mes">Este Mês</option><option value="semana">Esta Semana</option><option value="tudo">Todo Período</option></select>
+         </div>
 
          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-6">
              <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm"><p className="text-xs font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>Total de Revendas</p><p className="text-4xl md:text-5xl font-black" style={{color: BRAND.black}}>{baseFarmers.length}</p></div>
@@ -1586,6 +1638,22 @@ function App() {
                  <span>🟢 {contactadas} contactadas</span>
                  <span>🔴 {semContato} sem contato</span>
              </div>
+         </div>
+
+         <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6 border-l-4" style={{borderLeftColor: BRAND.blue}}>
+             <h3 className="text-xs font-bold uppercase tracking-widest mb-1" style={{color: BRAND.gray}}>💬 Comentários Inseridos ({filtroTempoDash === 'mes' ? 'este mês' : filtroTempoDash === 'semana' ? 'esta semana' : 'todo período'})</h3>
+             <p className="text-4xl md:text-5xl font-black" style={{color: BRAND.black}}>{totalComentarios}</p>
+         </div>
+
+         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Comentários por Canal</h3>
+               <div className="h-56 md:h-64">{dataCanalFarmers.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={dataCanalFarmers} cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={5} dataKey="value">{dataCanalFarmers.map((entry, index) => <Cell key={`cell-${index}`} fill={CORES_GRAFICO[index % CORES_GRAFICO.length]} />)}</Pie><Tooltip contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Legend wrapperStyle={{fontSize: '11px', fontWeight: 'bold'}} /></PieChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem comentários no período</div>}</div>
+            </div>
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Contatos Efetuados por Ranking</h3>
+               <div className="h-56 md:h-64"><ResponsiveContainer width="100%" height="100%"><BarChart data={dataContatosPorRanking} layout="vertical" margin={{ left: 40, right: 40, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" /><YAxis dataKey="name" type="category" width={90} tick={{fontSize: 11, fill: BRAND.gray, fontWeight: 'bold'}} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill={BRAND.yellow} radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer></div>
+            </div>
          </div>
 
          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
@@ -2028,11 +2096,17 @@ function App() {
                                  <p className="text-xl font-black" style={{color: BRAND.blue}}>{revendaPerformanceSelecionada.ultimo_mes_apurado || 'N/A'}</p>
                              </div>
                              {(() => {
-                                 // NOVO: diferença de pontuação entre o mês anterior e o último mês de apuração,
-                                 // com sinalização de alta/queda — usa o score_anterior gravado no import de métricas.
-                                 const scoreAtual = Number(revendaPerformanceSelecionada.total_score) || 0;
-                                 const temScoreAnterior = revendaPerformanceSelecionada.score_anterior !== undefined && revendaPerformanceSelecionada.score_anterior !== null;
-                                 const diffScore = temScoreAnterior ? scoreAtual - Number(revendaPerformanceSelecionada.score_anterior) : null;
+                                 // CORREÇÃO: a diferença não aparecia porque dependia só do campo score_anterior,
+                                 // que só passa a existir a partir do PRÓXIMO import de métricas (não retroage).
+                                 // Agora usa como fonte principal o metricasFarmerHistorico — já carregado ao abrir
+                                 // este card, com os últimos meses de apuração vindos de ranking_metricas — e só
+                                 // cai para o campo score_anterior se o histórico tiver menos de 2 meses registrados.
+                                 const scoreAtual = metricasFarmerHistorico[0]?.total_score ?? (Number(revendaPerformanceSelecionada.total_score) || 0);
+                                 const scoreAnteriorHistorico = metricasFarmerHistorico[1]?.total_score;
+                                 const scoreAnterior = (scoreAnteriorHistorico !== undefined && scoreAnteriorHistorico !== null)
+                                     ? scoreAnteriorHistorico
+                                     : (revendaPerformanceSelecionada.score_anterior !== undefined ? revendaPerformanceSelecionada.score_anterior : null);
+                                 const diffScore = (scoreAnterior !== null && scoreAnterior !== undefined) ? scoreAtual - Number(scoreAnterior) : null;
                                  return (
                                      <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
                                          <p className="text-[10px] font-bold text-slate-500 uppercase">Score Atual</p>
@@ -2176,7 +2250,10 @@ function App() {
 
                      {/* Formulário Interação Anti-Lag Farmers */}
                      <div className="mt-10 border-t border-slate-200 pt-8">
-                        <PainelInteracao alvo={revendaPerformanceSelecionada} vendedor={vendedor} onHistoricoSalvo={buscarHistoricoCard} mostrarMensagem={mostrarMensagem} isFarmer={true} />
+                        <PainelInteracao alvo={revendaPerformanceSelecionada} vendedor={vendedor} onHistoricoSalvo={buscarHistoricoCard} mostrarMensagem={mostrarMensagem} isFarmer={true} onFarmerFieldsSaved={(fields) => {
+                            setRevendaPerformanceSelecionada(prev => (prev ? { ...prev, ...fields } : prev));
+                            setCarteiraFarmers(prev => prev.map(f => f.id === revendaPerformanceSelecionada.id ? { ...f, ...fields } : f));
+                        }} />
 
                         <div className="space-y-4 mt-8">
                             <h3 className="font-bold text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-slate-800">
@@ -2306,6 +2383,12 @@ function App() {
                                           <p className={`text-sm font-black ${rev.total_orders<=20?'text-orange-500':'text-blue-600'}`}>{rev.total_orders||0}</p>
                                       </div>
                                    </div>
+                                   {(() => {
+                                       // NOVO: sinaliza no card quando há um retorno agendado para essa revenda.
+                                       const urgFarmer = getFarmerUrgency(rev);
+                                       if (!urgFarmer) return null;
+                                       return <div className={`mt-2 text-[10px] font-bold px-2 py-1 rounded-md text-center border ${urgFarmer.css}`}>{urgFarmer.texto}</div>;
+                                   })()}
                                 </div>
                               );
                           })}
