@@ -319,6 +319,9 @@ function App() {
   // NOVO: filtros e ordenação da visão Farmers
   const [filtroFarmerCidade, setFiltroFarmerCidade] = useState('');
   const [filtroFarmerBusca, setFiltroFarmerBusca] = useState('');
+  // NOVO: filtros exclusivos do admin no Dash de Farmers, pra comparar o trabalho por carteira e por farmer
+  const [filtroFarmerCarteiraDash, setFiltroFarmerCarteiraDash] = useState('todas');
+  const [filtroFarmerVendedorDash, setFiltroFarmerVendedorDash] = useState('todos');
   const [filtroFarmerUf, setFiltroFarmerUf] = useState('todas');
   const [filtroFarmerStatus, setFiltroFarmerStatus] = useState('todos');
   const [ordenacaoFarmer, setOrdenacaoFarmer] = useState('padrao');
@@ -681,15 +684,18 @@ function App() {
           if (filtroFarmerStatus !== 'todos') {
               if (getFarmerStatus(f).key !== filtroFarmerStatus) return false;
           }
-          // NOVO: busca por CNPJ (compara só dígitos, ignorando pontuação) ou por code (texto exato/parcial).
+          // NOVO: busca por CNPJ, code ou qualquer um dos 3 telefones da revenda (mobile, phone,
+          // financial_phone) — compara só dígitos, ignorando parênteses/traço/pontuação do CNPJ.
           if (filtroFarmerBusca.trim()) {
               const termo = filtroFarmerBusca.trim().toLowerCase();
               const termoDigits = termo.replace(/\D/g, '');
               const cnpjRevenda = String(f.cnpj || f['CPF/CNPJ'] || f.CNPJ || '').replace(/\D/g, '');
               const codeRevenda = String(f.code || f.CODE || '').toLowerCase();
+              const telefonesRevenda = [f.mobile, f.phone, f.financial_phone].filter(Boolean).map(t => String(t).replace(/\D/g, ''));
               const bateCnpj = termoDigits.length > 0 && cnpjRevenda.includes(termoDigits);
               const bateCode = codeRevenda.includes(termo);
-              if (!bateCnpj && !bateCode) return false;
+              const bateTelefone = termoDigits.length > 0 && telefonesRevenda.some(t => t.includes(termoDigits));
+              if (!bateCnpj && !bateCode && !bateTelefone) return false;
           }
           return true;
       });
@@ -1700,7 +1706,22 @@ function App() {
   const renderDashboardFarmers = () => {
     // CORREÇÃO: todos os cálculos desta aba devem considerar somente revendas com status
     // diferente de "Descredenciada" — filtra logo no início, antes de qualquer contagem/soma.
-    const baseFarmers = carteiraFarmersFiltrada.filter(f => getFarmerStatus(f).key !== 'descredenciada');
+    let baseFarmers = carteiraFarmersFiltrada.filter(f => getFarmerStatus(f).key !== 'descredenciada');
+
+    // NOVO: filtros exclusivos do admin, pra comparar o trabalho por carteira e por farmer específico
+    // (o vendedor Farmer logado já só vê a própria carteira via carteiraFarmersFiltrada, então esses
+    // dois filtros só fazem sentido — e só aparecem — pro admin).
+    if (isAdmin) {
+        if (filtroFarmerCarteiraDash !== 'todas') {
+            baseFarmers = baseFarmers.filter(f => f.carteira === filtroFarmerCarteiraDash);
+        }
+        if (filtroFarmerVendedorDash !== 'todos') {
+            const farmerSelecionado = vendedores.find(v => v.nome === filtroFarmerVendedorDash);
+            if (farmerSelecionado && farmerSelecionado.carteira && farmerSelecionado.carteira !== 'Todas') {
+                baseFarmers = baseFarmers.filter(f => f.carteira === farmerSelecionado.carteira);
+            }
+        }
+    }
 
     const contactadas = baseFarmers.filter(f => f.ultima_interacao).length;
     const semContato = baseFarmers.length - contactadas;
@@ -1729,17 +1750,25 @@ function App() {
 
     const canalCount = {};
     const rankingContatoCount = {};
+    const timelineDataFarmers = {};
     historicoFarmers.forEach(h => {
         canalCount[h.canal] = (canalCount[h.canal] || 0) + 1;
         const revenda = farmersPorId.get(h.id_lead);
         const nivel = revenda ? (revenda.ranking_level || 'Sem volume') : 'Desconhecido';
         rankingContatoCount[nivel] = (rankingContatoCount[nivel] || 0) + 1;
+        // NOVO: mesma lógica da "Evolução Diária de Contatos (Canal)" que já existe no dashboard de
+        // Hunters, agrupando por data e canal.
+        const dateKey = new Date(h.timestamp).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+        if (!timelineDataFarmers[dateKey]) timelineDataFarmers[dateKey] = { date: dateKey };
+        timelineDataFarmers[dateKey][h.canal] = (timelineDataFarmers[dateKey][h.canal] || 0) + 1;
     });
     const dataCanalFarmers = Object.keys(canalCount).map(c => ({ name: c, value: canalCount[c] }));
     const dataContatosPorRanking = ['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume'].map(nivel => ({
         name: nivel,
         qtde: rankingContatoCount[nivel] || 0
     }));
+    const lineChartDataFarmers = Object.values(timelineDataFarmers).reverse();
+    const canaisExistentesFarmers = Object.keys(canalCount);
 
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
@@ -1752,7 +1781,23 @@ function App() {
          )}
          <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
              <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>Métricas Farmers</h2>
-             <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}><option value="mes">Este Mês</option><option value="semana">Esta Semana</option><option value="tudo">Todo Período</option></select>
+             <div className="flex flex-col sm:flex-row gap-2 w-full xl:w-auto">
+                <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}><option value="mes">Este Mês</option><option value="semana">Esta Semana</option><option value="tudo">Todo Período</option></select>
+                {isAdmin && (
+                    <select className="text-sm font-bold text-white py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}} value={filtroFarmerCarteiraDash} onChange={e=>setFiltroFarmerCarteiraDash(e.target.value)}>
+                        <option value="todas">Carteira: Todas</option>
+                        <option value="C1">C1</option>
+                        <option value="C2">C2</option>
+                        <option value="C3">C3</option>
+                    </select>
+                )}
+                {isAdmin && (
+                    <select className="text-sm font-bold text-white py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{backgroundColor: BRAND.blueDark, borderColor: BRAND.black}} value={filtroFarmerVendedorDash} onChange={e=>setFiltroFarmerVendedorDash(e.target.value)}>
+                        <option value="todos">Farmer: Todos</option>
+                        {vendedores.filter(v=>v.ativo && v.perfil === 'Farmer').map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
+                    </select>
+                )}
+             </div>
          </div>
 
          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-6">
@@ -1789,6 +1834,8 @@ function App() {
                <div className="h-56 md:h-64"><ResponsiveContainer width="100%" height="100%"><BarChart data={dataContatosPorRanking} layout="vertical" margin={{ left: 40, right: 40, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" /><YAxis dataKey="name" type="category" width={90} tick={{fontSize: 11, fill: BRAND.gray, fontWeight: 'bold'}} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill={BRAND.yellow} radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer></div>
             </div>
          </div>
+
+         <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6"><h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Evolução Diária de Contatos (Canal)</h3><div className="h-56 md:h-64">{lineChartDataFarmers.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><LineChart data={lineChartDataFarmers} margin={{ top: 5, right: 10, left: -25, bottom: 5 }}><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" /><XAxis dataKey="date" tick={{fontSize: 10, fill: BRAND.gray}} /><YAxis tick={{fontSize: 10, fill: BRAND.gray}} /><Tooltip contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Legend wrapperStyle={{fontSize: '11px', fontWeight: 'bold'}} />{canaisExistentesFarmers.map((c, idx) => (<Line key={c} type="monotone" dataKey={c} stroke={CORES_GRAFICO[idx % CORES_GRAFICO.length]} strokeWidth={3} dot={{r: 4}} activeDot={{r: 6}} />))}</LineChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem dados para a linha do tempo.</div>}</div></div>
 
          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
             <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
@@ -2462,7 +2509,7 @@ function App() {
                         <input type="text" placeholder="🔍 Buscar por cidade..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerCidade} onChange={e => setFiltroFarmerCidade(e.target.value)} />
                      </div>
                      <div className="relative flex-1 min-w-[160px]">
-                        <input type="text" placeholder="🔍 Buscar por CNPJ ou código..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerBusca} onChange={e => setFiltroFarmerBusca(e.target.value)} />
+                        <input type="text" placeholder="🔍 Buscar por CNPJ, código ou telefone..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerBusca} onChange={e => setFiltroFarmerBusca(e.target.value)} />
                      </div>
                      <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerUf} onChange={e => setFiltroFarmerUf(e.target.value)}>
                         <option value="todas">Estado: Todos</option>
