@@ -302,6 +302,8 @@ function App() {
   const [modalLimpeza, setModalLimpeza] = useState(null);
   const [metricasFarmerHistorico, setMetricasFarmerHistorico] = useState([]);
   const [carregandoMetricas, setCarregandoMetricas] = useState(false);
+  const [analiseIA, setAnaliseIA] = useState('');
+  const [gerandoIA, setGerandoIA] = useState(false);
 
   const [historicoLead, setHistoricoLead] = useState([]);
   const [historicoDash, setHistoricoDash] = useState([]);
@@ -1307,6 +1309,7 @@ function App() {
     setCarregandoMetricas(true); 
     setMetricasFarmerHistorico([]);
     setHistoricoLead([]); 
+    setAnaliseIA(''); // Limpa a análise anterior ao abrir um novo card
     buscarHistoricoCard(revenda.id);
     try {
         const compIdStr = String(revenda.id_erp || revenda.id || revenda._id);
@@ -1330,6 +1333,77 @@ function App() {
         data.sort((a, b) => { if (b.year !== a.year) return b.year - a.year; return b.month - a.month; });
         setMetricasFarmerHistorico(data.slice(0, 3)); 
     } catch (e) { mostrarMensagem("Erro ao carregar histórico", true); } finally { setCarregandoMetricas(false); }
+  };
+
+  // Chamada direta do navegador para a API do Gemini, com a chave embutida no bundle.
+  // Decisão do time: sistema de uso interno, sem proxy/backend intermediário.
+  const GEMINI_API_KEY = "AIzaSyAkXZOW5nxH7L8MfDnnJp4daxt2AX8hxBk";
+
+  const gerarInsightsComGemini = async (revenda, metricas) => {
+    if (!metricas || metricas.length === 0) {
+        return mostrarMensagem('Sem histórico suficiente para analisar.', true);
+    }
+    setGerandoIA(true);
+    setAnaliseIA('');
+
+    try {
+        // Prepara um resumo enxuto dos meses para a IA ler
+        const dadosHistorico = metricas.map(m => ({
+            mes_ano: `${m.month}/${m.year}`,
+            score: m.total_score,
+            pedidos: m.total_orders,
+            aceitacao: m.metrics?.on_time_delivery_percentage || m.metrics?.acceptance_rate_percentage || 0,
+            sucesso: m.metrics?.success_rate_percentage || m.metrics?.success_rate || 0,
+            tempo_medio_minutos: m.metrics?.average_delivery_time || m.metrics?.average_acceptance_time || 0
+        })).reverse(); // Coloca em ordem cronológica para facilitar a leitura da IA
+
+        const prompt = `
+        Você é um analista comercial sênior da Appgas, especialista em gerenciar revendas parceiras.
+        Analise o desempenho da revenda "${revenda.nome || revenda.razao_social || revenda.code}" nos últimos meses.
+
+        Dados de desempenho: ${JSON.stringify(dadosHistorico)}
+
+        Sua tarefa é gerar um relatório direto e acionável contendo 3 partes:
+
+        1. Análise de Desempenho (Compare os meses e ache a causa raiz):
+           - Se 'aceitacao' caiu, sugira fortemente que a revenda ajuste/aumente o tempo de previsão de entrega no app.
+           - Se 'tempo_medio_minutos' subiu, indique que a entrega está demorando mais e é preciso investigar a operação física ou frota.
+           - Se 'sucesso' caiu, alerte para a alta taxa de cancelamentos e que o revendedor está perdendo dinheiro.
+
+        2. Pontos a Abordar:
+           - 3 tópicos práticos e rápidos (em bullet points) para o consultor Farmer (gerente de conta) abordar na reunião/ligação.
+
+        3. Mensagem WhatsApp:
+           - Escreva uma mensagem amigável, construtiva e pronta para ser disparada ao responsável da revenda via WhatsApp. A mensagem não deve soar como uma punição, mas como uma consultoria da Appgas para ajudá-los a faturar mais.
+
+        Formatação estrita: Utilize HTML limpo. Use <h3> para os títulos, <ul> e <li> para listas, <strong> para negrito. Não utilize markdown (como **, ##), apenas HTML.
+        `;
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.3 } // Temperatura mais baixa para uma análise mais precisa/analítica
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.error) throw new Error(data.error.message);
+
+        const textoIA = data.candidates[0].content.parts[0].text;
+        setAnaliseIA(textoIA);
+        mostrarMensagem('Análise gerada com sucesso!');
+
+    } catch (error) {
+        console.error(error);
+        mostrarMensagem('Erro ao gerar análise com IA.', true);
+    } finally {
+        setGerandoIA(false);
+    }
   };
 
   const consultarCNPJ = async () => {
@@ -2307,6 +2381,44 @@ function App() {
                              })}
                          </div>
                      )}
+
+                     {/* Módulo de Inteligência Artificial Gemini */}
+                     <div className="mt-8 mb-4">
+                         <div className="flex items-center justify-between mb-4">
+                             <h3 className="font-bold text-xl flex items-center gap-2 text-slate-800">
+                                 <span className="text-2xl">✨</span> Insights com IA
+                             </h3>
+                             <button
+                                 onClick={() => gerarInsightsComGemini(revendaPerformanceSelecionada, metricasFarmerHistorico)}
+                                 disabled={gerandoIA || metricasFarmerHistorico.length === 0}
+                                 className={`px-4 py-2.5 rounded-xl font-bold text-sm shadow-sm flex items-center gap-2 transition-all ${gerandoIA ? 'bg-slate-200 text-slate-500 cursor-not-allowed' : 'text-white hover:opacity-90 hover:-translate-y-0.5'}`}
+                                 style={{backgroundColor: gerandoIA ? '' : BRAND.blueDark}}
+                             >
+                                 {gerandoIA ? (
+                                     <>⏳ Analisando Padrões...</>
+                                 ) : (
+                                     <>🧠 Gerar Relatório e Mensagem</>
+                                 )}
+                             </button>
+                         </div>
+
+                         {analiseIA && (
+                             <div className="bg-gradient-to-br from-[#f8fafc] to-[#f1f5f9] p-6 rounded-2xl border border-[#e2e8f0] shadow-inner text-sm text-slate-700 leading-relaxed">
+                                 {/* Como o prompt pede HTML limpo, renderizamos diretamente */}
+                                 <div
+                                     className="ia-content space-y-4"
+                                     dangerouslySetInnerHTML={{ __html: analiseIA }}
+                                 />
+
+                                 <style>{`
+                                     .ia-content h3 { color: ${BRAND.blueDark}; font-size: 1.1rem; font-weight: 900; margin-top: 1rem; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
+                                     .ia-content ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 1rem; }
+                                     .ia-content li { margin-bottom: 0.5rem; }
+                                     .ia-content strong { color: ${BRAND.black}; }
+                                 `}</style>
+                             </div>
+                         )}
+                     </div>
 
                      {/* Formulário Interação Anti-Lag Farmers */}
                      <div className="mt-10 border-t border-slate-200 pt-8">
