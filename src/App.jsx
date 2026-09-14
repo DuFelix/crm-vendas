@@ -1267,7 +1267,7 @@ function App() {
     } catch (error) { mostrarMensagem('Erro ao consultar CNPJ na Receita.', true); } finally { setBuscandoCNPJ(false); }
   };
 
-  const abrirWhatsApp = async (lead, telefone) => {
+  const abrirWhatsApp = async (lead, telefone, isFarmerAlvo = false) => {
     const hora = new Date().getHours(); let saudacao = 'Bom dia';
     if (hora >= 12 && hora < 18) saudacao = 'Boa tarde'; else if (hora >= 18) saudacao = 'Boa noite';
     const nomeVendedor = vendedor || 'Consultor';
@@ -1279,17 +1279,41 @@ function App() {
     const msgSorteada = modelos[Math.floor(Math.random() * modelos.length)];
     const msgEncoded = encodeURIComponent(msgSorteada); const numLimpo = telefone.replace(/\D/g, '');
     const url = `https://wa.me/55${numLimpo}?text=${msgEncoded}`;
-    window.open(url, '_blank'); setModalContatoConfirma({ lead, telefone, msg: msgSorteada, canal: 'WhatsApp' });
+    window.open(url, '_blank'); setModalContatoConfirma({ lead, telefone, msg: msgSorteada, canal: 'WhatsApp', isFarmerAlvo });
   };
 
-  const abrirLigacao = (lead, telefone) => {
-    window.location.href = `tel:${telefone.replace(/\D/g, '')}`; setModalContatoConfirma({ lead, telefone, msg: '', canal: 'Ligação' });
+  const abrirLigacao = (lead, telefone, isFarmerAlvo = false) => {
+    window.location.href = `tel:${telefone.replace(/\D/g, '')}`; setModalContatoConfirma({ lead, telefone, msg: '', canal: 'Ligação', isFarmerAlvo });
   };
 
   const confirmarContato = async (deuCerto) => {
     if (!modalContatoConfirma) return;
-    const { lead, telefone, msg, canal } = modalContatoConfirma; const timestamp = Date.now(); const proximoDiaUtil = getNextBusinessDay().getTime();
+    const { lead, telefone, msg, canal, isFarmerAlvo } = modalContatoConfirma; const timestamp = Date.now(); const proximoDiaUtil = getNextBusinessDay().getTime();
     try {
+        // NOVO: fluxo simplificado quando o alvo é uma revenda de carteira_ativa (Farmer) — sem
+        // conceitos de funil/etapa (que não existem pra revenda), só registra o histórico e marca
+        // a revenda como contactada (ou o número como inválido, em caso de falha via WhatsApp).
+        if (isFarmerAlvo) {
+            if (deuCerto) {
+                let obsText = canal === 'WhatsApp' ? `✅ Contato ativo com SUCESSO via WhatsApp:\n\n"${msg}"` : `✅ Contato ativo com SUCESSO via Ligação.`;
+                await addDoc(collection(db, "historico"), { id_lead: lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: telefone, canal: canal, sucesso: true, observacao: obsText });
+                await updateDoc(doc(db, "carteira_ativa", lead.id), { ultima_interacao: timestamp });
+                mostrarMensagem('Contato registrado com sucesso!');
+            } else {
+                let obsText = canal === 'WhatsApp' ? `🚫 Número sem WhatsApp ou contato falhou.` : `🚫 Ligação não atendida ou falhou.`;
+                await addDoc(collection(db, "historico"), { id_lead: lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: telefone, canal: canal, sucesso: false, observacao: obsText });
+                if (canal === 'WhatsApp') {
+                    const invalidos = lead.telefones_invalidos || [];
+                    if (!invalidos.includes(telefone)) invalidos.push(telefone);
+                    await updateDoc(doc(db, "carteira_ativa", lead.id), { telefones_invalidos: invalidos });
+                    if (revendaPerformanceSelecionada?.id === lead.id) setRevendaPerformanceSelecionada(prev => ({ ...prev, telefones_invalidos: invalidos }));
+                }
+                mostrarMensagem('Falha registrada.');
+            }
+            buscarHistoricoCard(lead.id);
+            setModalContatoConfirma(null);
+            return;
+        }
         if (deuCerto) {
             let obsText = canal === 'WhatsApp' ? `✅ Contato ativo com SUCESSO via WhatsApp:\n\n"${msg}"\n\n(Follow-up agendado para o próximo dia útil)` : `✅ Contato ativo com SUCESSO via Ligação.\n\n(Follow-up agendado para o próximo dia útil)`;
             await addDoc(collection(db, "historico"), { id_lead: lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: telefone, canal: canal, sucesso: true, observacao: obsText });
@@ -1314,6 +1338,20 @@ function App() {
     if (!leadAtual) return;
     try { const invalidos = leadAtual.telefones_invalidos || []; if (!invalidos.includes(telefone)) { invalidos.push(telefone); await updateDoc(doc(db, "leads", leadAtual.id), { telefones_invalidos: invalidos }); mostrarMensagem('Número marcado como sem WhatsApp!'); }
     } catch(e) { mostrarMensagem('Erro ao marcar número.', true); }
+  };
+
+  // NOVO: equivalente ao marcarNumeroInvalido, porém gravando em carteira_ativa (revenda de Farmer)
+  // em vez de leads, e atualizando o estado local pra refletir na hora no card já aberto.
+  const marcarNumeroInvalidoFarmer = async (revenda, telefone) => {
+    try {
+        const invalidos = revenda.telefones_invalidos || [];
+        if (!invalidos.includes(telefone)) {
+            invalidos.push(telefone);
+            await updateDoc(doc(db, "carteira_ativa", revenda.id), { telefones_invalidos: invalidos });
+            setRevendaPerformanceSelecionada(prev => (prev && prev.id === revenda.id) ? { ...prev, telefones_invalidos: invalidos } : prev);
+            mostrarMensagem('Número marcado como sem WhatsApp!');
+        }
+    } catch (e) { mostrarMensagem('Erro ao marcar número.', true); }
   };
 
   const salvarNovoLead = async () => {
@@ -1499,7 +1537,9 @@ function App() {
   // já que "revenda de carteira" e "lead em funil" são conceitos diferentes (uma revenda não avança
   // por etapas, então reaproveitar os gráficos de funil/conversão não fazia sentido aqui).
   const renderDashboardFarmers = () => {
-    const baseFarmers = carteiraFarmersFiltrada; // já respeita a carteira do vendedor logado (ou tudo, se admin)
+    // CORREÇÃO: todos os cálculos desta aba devem considerar somente revendas com status
+    // diferente de "Descredenciada" — filtra logo no início, antes de qualquer contagem/soma.
+    const baseFarmers = carteiraFarmersFiltrada.filter(f => getFarmerStatus(f).key !== 'descredenciada');
 
     const contactadas = baseFarmers.filter(f => f.ultima_interacao).length;
     const semContato = baseFarmers.length - contactadas;
@@ -1982,12 +2022,92 @@ function App() {
                                  })()}
                              </div>
                          </div>
-                         <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
-                             <p className="text-[10px] font-bold text-slate-500 uppercase">Mês Atual/Apurado</p>
-                             <p className="text-xl font-black" style={{color: BRAND.blue}}>{revendaPerformanceSelecionada.ultimo_mes_apurado || 'N/A'}</p>
+                         <div className="flex gap-3">
+                             <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
+                                 <p className="text-[10px] font-bold text-slate-500 uppercase">Mês Atual/Apurado</p>
+                                 <p className="text-xl font-black" style={{color: BRAND.blue}}>{revendaPerformanceSelecionada.ultimo_mes_apurado || 'N/A'}</p>
+                             </div>
+                             {(() => {
+                                 // NOVO: diferença de pontuação entre o mês anterior e o último mês de apuração,
+                                 // com sinalização de alta/queda — usa o score_anterior gravado no import de métricas.
+                                 const scoreAtual = Number(revendaPerformanceSelecionada.total_score) || 0;
+                                 const temScoreAnterior = revendaPerformanceSelecionada.score_anterior !== undefined && revendaPerformanceSelecionada.score_anterior !== null;
+                                 const diffScore = temScoreAnterior ? scoreAtual - Number(revendaPerformanceSelecionada.score_anterior) : null;
+                                 return (
+                                     <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
+                                         <p className="text-[10px] font-bold text-slate-500 uppercase">Score Atual</p>
+                                         <div className="flex items-center justify-center gap-2">
+                                             <p className="text-xl font-black" style={{color: BRAND.black}}>{scoreAtual}</p>
+                                             {diffScore !== null && diffScore !== 0 && (
+                                                 <span className={`text-sm font-black flex items-center gap-0.5 ${diffScore > 0 ? 'text-emerald-600' : 'text-red-600'}`} title={`${diffScore > 0 ? 'Subiu' : 'Caiu'} ${Math.abs(diffScore)} pontos desde o mês anterior`}>
+                                                     {diffScore > 0 ? '▲' : '▼'}{Math.abs(diffScore)}
+                                                 </span>
+                                             )}
+                                             {diffScore === 0 && <span className="text-sm font-black text-slate-400" title="Sem variação desde o mês anterior">—</span>}
+                                         </div>
+                                     </div>
+                                 );
+                             })()}
                          </div>
                      </div>
-                     
+
+                     {/* NOVO: Telefones da revenda (financial_phone, mobile, phone) com o mesmo módulo de
+                         início de conversa via WhatsApp/Ligação usado no CRM de vendas (Hunters). */}
+                     {(() => {
+                         const rev = revendaPerformanceSelecionada;
+                         const listaTelefones = [
+                             { label: '📱 Celular', valor: rev.mobile },
+                             { label: '☎️ Fixo', valor: rev.phone },
+                             { label: '💰 Financeiro', valor: rev.financial_phone }
+                         ].filter(t => t.valor && String(t.valor).trim() !== '');
+
+                         const vistos = new Set();
+                         const telefonesUnicos = listaTelefones.filter(t => {
+                             const chave = String(t.valor).replace(/\D/g, '');
+                             if (!chave || vistos.has(chave)) return false;
+                             vistos.add(chave);
+                             return true;
+                         });
+
+                         if (telefonesUnicos.length === 0) return null;
+
+                         return (
+                             <div className="bg-slate-50 p-4 md:p-5 rounded-2xl border border-slate-200 mb-6">
+                                 <div className="flex items-center gap-2 mb-3" style={{color: BRAND.gray}}>
+                                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"></path></svg>
+                                     <span className="text-xs font-bold uppercase tracking-wider">Telefones</span>
+                                 </div>
+                                 <div className="flex flex-col gap-2">
+                                     {telefonesUnicos.map((t, idx) => {
+                                         const invalido = (rev.telefones_invalidos || []).includes(t.valor);
+                                         return (
+                                             <div key={idx} className="flex gap-2 items-center w-full">
+                                                 <div className="font-semibold text-sm flex-1 bg-white p-3 rounded-xl border border-slate-200 shadow-sm text-left" style={{color: BRAND.black}}>
+                                                     <span className="text-[10px] font-bold uppercase block" style={{color: BRAND.gray}}>{t.label}</span>
+                                                     {t.valor}
+                                                 </div>
+                                                 {invalido ? (
+                                                     <button onClick={() => abrirLigacao(rev, t.valor, true)} className="text-[10px] text-white px-4 py-3.5 rounded-xl font-bold flex items-center justify-center shadow-sm hover:opacity-90 transition-opacity gap-1.5" style={{backgroundColor: BRAND.blue}}>
+                                                         📞 Ligar
+                                                     </button>
+                                                 ) : (
+                                                     <>
+                                                         <button onClick={() => marcarNumeroInvalidoFarmer(rev, t.valor)} className="text-[10px] bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700 px-3 py-3 rounded-xl font-bold transition-colors border border-slate-200" title="Marcar como Inválido / Sem WhatsApp">
+                                                             🚫
+                                                         </button>
+                                                         <button onClick={() => abrirWhatsApp(rev, t.valor, true)} className="text-[10px] bg-[#25D366] hover:bg-[#20b858] text-white px-4 py-3 rounded-xl font-bold flex items-center justify-center gap-1.5 shadow-sm transition-colors">
+                                                             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                                                         </button>
+                                                     </>
+                                                 )}
+                                             </div>
+                                         );
+                                     })}
+                                 </div>
+                             </div>
+                         );
+                     })()}
+
                      <h3 className="font-bold text-xl mb-6 flex items-center gap-2 text-slate-800">
                          <span className="text-2xl">📈</span> Histórico de Desempenho
                      </h3>
