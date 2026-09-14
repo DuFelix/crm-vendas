@@ -4,7 +4,7 @@ import { initializeApp } from "firebase/app";
 import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc, getDocs, query, where } from "firebase/firestore";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDJs8Gzdb2eaop_7NLFb7qSuIduyhE5DDs",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: "crm-vendas-4f4d2.firebaseapp.com",
   projectId: "crm-vendas-4f4d2",
   storageBucket: "crm-vendas-4f4d2.firebasestorage.app",
@@ -15,7 +15,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
-const BITRIX_WEBHOOK_URL = "https://appgas.bitrix24.com.br/rest/1/dutan2jjkext5hgm/";
+const BITRIX_WEBHOOK_URL = import.meta.env.VITE_BITRIX_WEBHOOK;
 const BITRIX_ID_PEDRO = 88087;
 const BITRIX_ID_EDUARDO = 1;
 const BITRIX_ID_CAMILA = 9;
@@ -1337,7 +1337,7 @@ function App() {
 
   // Chamada direta do navegador para a API do Gemini, com a chave embutida no bundle.
   // Decisão do time: sistema de uso interno, sem proxy/backend intermediário.
-  const GEMINI_API_KEY = "AIzaSyAkXZOW5nxH7L8MfDnnJp4daxt2AX8hxBk";
+  const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
   const gerarInsightsComGemini = async (revenda, metricas) => {
     if (!metricas || metricas.length === 0) {
