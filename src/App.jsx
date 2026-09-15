@@ -58,6 +58,30 @@ const calcularRankingPelaRegra = (score, orders) => {
     return 'Desclassificado';
 };
 
+// NOVO: ordem crescente dos rankings, usada tanto no card do Kanban quanto no detalhe da revenda
+// pra saber se uma mudança de ranking foi uma subida ou uma queda.
+const RANKING_ORDEM = { 'Sem volume': 0, 'Desclassificado': 1, 'Bronze': 2, 'Prata': 3, 'Ouro': 4, 'Diamante': 5 };
+
+// NOVO: calcula a variação de pontos e de ranking de uma revenda em relação à apuração anterior,
+// usando só os campos já salvos no próprio documento (score_anterior/orders_anterior) — sem
+// precisar de nenhuma leitura extra no Firestore. É isso que permite mostrar a variação direto no
+// card do Kanban, pra todas as revendas ao mesmo tempo, sem ter que clicar em cada uma.
+const calcularVariacaoFarmer = (revenda) => {
+    const scoreAtual = Number(revenda.total_score) || 0;
+    const ordersAtual = Number(revenda.total_orders) || 0;
+    const temAnterior = revenda.score_anterior !== undefined && revenda.score_anterior !== null && revenda.orders_anterior !== undefined && revenda.orders_anterior !== null;
+    if (!temAnterior) return { diffScore: null, mudancaRanking: null };
+
+    const diffScore = scoreAtual - Number(revenda.score_anterior);
+    let mudancaRanking = null;
+    const rankingAtualNome = calcularRankingPelaRegra(scoreAtual, ordersAtual);
+    const rankingAnteriorNome = calcularRankingPelaRegra(revenda.score_anterior, revenda.orders_anterior);
+    if (rankingAtualNome !== rankingAnteriorNome) {
+        mudancaRanking = { subiu: (RANKING_ORDEM[rankingAtualNome] ?? 0) > (RANKING_ORDEM[rankingAnteriorNome] ?? 0), rankingAtualNome, rankingAnteriorNome };
+    }
+    return { diffScore, mudancaRanking };
+};
+
 const getFarmerStatus = (revenda) => {
     const enabled = revenda.enabled || revenda.ENABLED;
     if (String(enabled).toLowerCase() === 'true' || enabled === true) {
@@ -119,6 +143,26 @@ const normalizarTexto = (str) => String(str || '')
 // Chave única cidade+UF (ex: "SAO PAULO_SP") — é isso que resolve o problema de cidades
 // homônimas em estados diferentes, já que o UF entra na composição da chave.
 const chaveCidadeUf = (cidade, uf) => `${normalizarTexto(cidade)}_${normalizarTexto(uf)}`;
+
+// NOVO: gera a lista de telefones da revenda só com dígitos (sem DDD com parênteses, espaço ou
+// traço), deduplicada. É isso que fica salvo em "telefones_normalizados" — necessário porque os
+// campos originais (mobile, phone, financial_phone) vêm formatados como "(11) 94940-2117", e o
+// Firestore não faz busca por conteúdo parcial/normalizado: pra automação do n8n conseguir achar a
+// revenda pelo número puro do WhatsApp (ex: "11994402117"), precisa comparar contra um campo já
+// normalizado do mesmo jeito.
+const extrairTelefonesNormalizados = (obj) => {
+    const brutos = [obj.mobile, obj.phone, obj.financial_phone];
+    const vistos = new Set();
+    const resultado = [];
+    brutos.forEach(t => {
+        if (!t) return;
+        const limpo = String(t).replace(/\D/g, '');
+        if (!limpo || vistos.has(limpo)) return;
+        vistos.add(limpo);
+        resultado.push(limpo);
+    });
+    return resultado;
+};
 
 // CORREÇÃO: a carteira_ativa (CSV de revendas) traz o estado por EXTENSO no campo "state"
 // (ex: "São Paulo"), enquanto o Guia de Municípios usa a SIGLA (ex: "SP"). Sem essa conversão,
@@ -982,7 +1026,8 @@ function App() {
                     nome: findValueInObj(objNormalized, ['nome', 'razao', 'company']) || objOriginal.nome || objOriginal.name || 'Sem Nome', 
                     carteira: carteiraVinculada,
                     uf_padronizada: state,
-                    ...objOriginal 
+                    ...objOriginal,
+                    telefones_normalizados: extrairTelefonesNormalizados(objOriginal)
                 });
                 existingMap[idErp] = { docId: idErp, data: novos[novos.length - 1] }; // evita duplicar se o mesmo id_erp aparecer 2x no mesmo arquivo
             }
@@ -1326,6 +1371,46 @@ function App() {
       } catch (e) {
           setUploadProgresso('');
           mostrarMensagem('Erro ao sincronizar contatos.', true);
+      }
+  };
+
+  // NOVO: preenche telefones_normalizados nas revendas que já existiam antes desse campo ser criado
+  // — necessário pra automação do n8n (que cruza o WhatsApp do cliente contra esse campo) conseguir
+  // achar as revendas já cadastradas, e não só as importadas depois dessa atualização.
+  const normalizarTelefonesFarmers = async () => {
+      setUploadProgresso('Normalizando telefones das revendas...');
+      try {
+          const qs = await getDocs(collection(db, "carteira_ativa"));
+          const atualizacoes = [];
+          qs.docs.forEach(d => {
+              const data = d.data();
+              const normalizados = extrairTelefonesNormalizados(data);
+              const jaIguais = JSON.stringify(normalizados) === JSON.stringify(data.telefones_normalizados || []);
+              if (!jaIguais) atualizacoes.push({ id: d.id, telefones_normalizados: normalizados });
+          });
+
+          if (atualizacoes.length === 0) {
+              setUploadProgresso('');
+              return mostrarMensagem('Todas as revendas já estão com os telefones normalizados.', false);
+          }
+
+          const BATCH_SIZE = 400;
+          let atualizados = 0;
+          for (let i = 0; i < atualizacoes.length; i += BATCH_SIZE) {
+              const chunk = atualizacoes.slice(i, i + BATCH_SIZE);
+              const batch = writeBatch(db);
+              chunk.forEach(item => { batch.update(doc(db, "carteira_ativa", item.id), { telefones_normalizados: item.telefones_normalizados }); });
+              setUploadProgresso(`Normalizando telefones (${Math.min(i + chunk.length, atualizacoes.length)}/${atualizacoes.length})...`);
+              await batch.commit();
+              await delay(600);
+              atualizados += chunk.length;
+          }
+          setUploadProgresso('');
+          mostrarMensagem(`Telefones normalizados! ${atualizados} revenda(s) atualizadas.`);
+          carregarCarteiraFarmers();
+      } catch (e) {
+          setUploadProgresso('');
+          mostrarMensagem('Erro ao normalizar telefones.', true);
       }
   };
 
@@ -1764,7 +1849,11 @@ function App() {
     // apenas as entradas cujo id_lead pertence a uma revenda desta carteira).
     const idsFarmersSet = new Set(baseFarmers.map(f => f.id));
     const farmersPorId = new Map(baseFarmers.map(f => [f.id, f]));
-    const historicoFarmers = historicoDash.filter(h => idsFarmersSet.has(h.id_lead));
+    // CORREÇÃO: exclui mensagens registradas passivamente pela automação do WhatsApp (canal
+    // "WhatsApp (Auto)"/"Automático") das métricas de comentários — mesma regra já aplicada no
+    // dashboard de Hunters, pra essas entradas (que não são uma ação deliberada do Farmer) não
+    // inflarem "Comentários Inseridos" nem os gráficos de canal/ranking.
+    const historicoFarmers = historicoDash.filter(h => idsFarmersSet.has(h.id_lead) && h.canal !== 'Automático' && h.canal !== 'WhatsApp (Auto)');
     const totalComentarios = historicoFarmers.length;
 
     const canalCount = {};
@@ -2320,7 +2409,6 @@ function App() {
                                  // NOVO: além dos pontos, compara o RANKING (Diamante/Ouro/Prata/Bronze/Desclassificado/
                                  // Sem volume) do mês atual contra o anterior — essa comparação só muda 1x por mês,
                                  // já que depende da apuração mensal, diferente da pontuação que é só um número.
-                                 const RANKING_ORDEM = { 'Sem volume': 0, 'Desclassificado': 1, 'Bronze': 2, 'Prata': 3, 'Ouro': 4, 'Diamante': 5 };
                                  let mudancaRanking = null;
                                  if (scoreAnterior !== null && scoreAnterior !== undefined && ordersAnterior !== null && ordersAnterior !== undefined) {
                                      const rankingAtualNome = calcularRankingPelaRegra(scoreAtual, ordersAtual);
@@ -2628,11 +2716,12 @@ function App() {
                           {leadsNivel.map(rev => {
                               const statusFarmer = getFarmerStatus(rev);
                               const codeDisplay = rev.code || rev.CODE ? `[${rev.code || rev.CODE}] ` : '';
-
-                              // NOVO: variação de score em relação à apuração anterior (seta + diferença de pontos)
                               const scoreAtual = Number(rev.total_score) || 0;
-                              const temScoreAnterior = rev.score_anterior !== undefined && rev.score_anterior !== null;
-                              const diffScore = temScoreAnterior ? scoreAtual - Number(rev.score_anterior) : null;
+
+                              // NOVO: variação de pontos e de ranking vs. a apuração anterior, calculada só com
+                              // dados já em memória (score_anterior/orders_anterior) — sem nenhuma leitura extra —
+                              // pra aparecer direto no card, sem precisar abrir o detalhe da revenda.
+                              const { diffScore, mudancaRanking } = calcularVariacaoFarmer(rev);
 
                               return (
                                 <div key={rev.id} onClick={() => abrirPerformanceFarmer(rev)} className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm cursor-pointer hover:border-blue-400 hover:-translate-y-0.5 transition-all">
@@ -2655,23 +2744,25 @@ function App() {
                                    <div className="flex justify-between items-center bg-slate-50 p-2 rounded-xl border border-slate-100">
                                       <div className="text-center w-1/2 border-r border-slate-200">
                                           <p className="text-[9px] font-bold text-slate-400 uppercase">Score</p>
-                                          <div className="flex items-center justify-center gap-1">
-                                              <p className={`text-sm font-black ${scoreAtual>=50?'text-emerald-600':'text-red-500'}`}>{scoreAtual}</p>
-                                              {diffScore !== null && diffScore !== 0 && (
-                                                  <span className={`text-[10px] font-black flex items-center ${diffScore > 0 ? 'text-emerald-600' : 'text-red-600'}`} title={`${diffScore > 0 ? 'Subiu' : 'Caiu'} ${Math.abs(diffScore)} pontos desde a última apuração`}>
-                                                      {diffScore > 0 ? '▲' : '▼'}{Math.abs(diffScore)}
-                                                  </span>
-                                              )}
-                                              {diffScore === 0 && (
-                                                  <span className="text-[10px] font-black text-slate-400" title="Sem variação desde a última apuração">—</span>
-                                              )}
-                                          </div>
+                                          <p className={`text-sm font-black ${scoreAtual>=50?'text-emerald-600':'text-red-500'}`}>{scoreAtual}</p>
                                       </div>
                                       <div className="text-center w-1/2">
                                           <p className="text-[9px] font-bold text-slate-400 uppercase">Pedidos</p>
                                           <p className={`text-sm font-black ${rev.total_orders<=20?'text-orange-500':'text-blue-600'}`}>{rev.total_orders||0}</p>
                                       </div>
                                    </div>
+                                   {diffScore !== null && (
+                                       <div className={`mt-2 p-1.5 rounded-lg border text-center ${diffScore > 0 ? 'bg-emerald-50 border-emerald-200' : diffScore < 0 ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+                                           <p className={`text-[10px] font-black flex items-center justify-center gap-1 ${diffScore > 0 ? 'text-emerald-600' : diffScore < 0 ? 'text-red-600' : 'text-slate-400'}`}>
+                                               {diffScore > 0 ? '▲' : diffScore < 0 ? '▼' : '—'} {Math.abs(diffScore)} pts vs. mês anterior
+                                           </p>
+                                           {mudancaRanking && (
+                                               <p className={`text-[9px] font-bold ${mudancaRanking.subiu ? 'text-emerald-600' : 'text-red-600'}`}>
+                                                   {mudancaRanking.subiu ? '📈' : '📉'} {mudancaRanking.rankingAnteriorNome} → {mudancaRanking.rankingAtualNome}
+                                               </p>
+                                           )}
+                                       </div>
+                                   )}
                                    {(() => {
                                        // NOVO: sinaliza no card quando há um retorno agendado para essa revenda.
                                        const urgFarmer = getFarmerUrgency(rev);
@@ -2697,8 +2788,7 @@ function App() {
                         const statusFarmer = getFarmerStatus(rev);
                         const codeDisplay = rev.code || rev.CODE ? `[${rev.code || rev.CODE}] ` : '';
                         const scoreAtual = Number(rev.total_score) || 0;
-                        const temScoreAnterior = rev.score_anterior !== undefined && rev.score_anterior !== null;
-                        const diffScore = temScoreAnterior ? scoreAtual - Number(rev.score_anterior) : null;
+                        const { diffScore, mudancaRanking } = calcularVariacaoFarmer(rev);
                         const urgFarmer = getFarmerUrgency(rev);
                         const cidadeRev = rev.cidade || rev.city || rev.municipio || '';
                         const ufRev = obterSiglaUF(rev.uf || rev.estado || rev.state || '');
@@ -2726,15 +2816,24 @@ function App() {
                                   <div className="flex items-center gap-1">
                                      <span className="text-[9px] font-bold text-slate-400 uppercase">Score:</span>
                                      <span className={`text-xs font-black ${scoreAtual>=50?'text-emerald-600':'text-red-500'}`}>{scoreAtual}</span>
-                                     {diffScore !== null && diffScore !== 0 && (
-                                         <span className={`text-[10px] font-black ${diffScore > 0 ? 'text-emerald-600' : 'text-red-600'}`}>{diffScore > 0 ? '▲' : '▼'}{Math.abs(diffScore)}</span>
-                                     )}
                                   </div>
                                   <div className="flex items-center gap-1">
                                      <span className="text-[9px] font-bold text-slate-400 uppercase">Pedidos:</span>
                                      <span className={`text-xs font-black ${rev.total_orders<=20?'text-orange-500':'text-blue-600'}`}>{rev.total_orders||0}</span>
                                   </div>
                                </div>
+                               {diffScore !== null && (
+                                   <div className={`mt-2 p-1.5 rounded-lg border text-center ${diffScore > 0 ? 'bg-emerald-50 border-emerald-200' : diffScore < 0 ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+                                       <p className={`text-[10px] font-black flex items-center justify-center gap-1 ${diffScore > 0 ? 'text-emerald-600' : diffScore < 0 ? 'text-red-600' : 'text-slate-400'}`}>
+                                           {diffScore > 0 ? '▲' : diffScore < 0 ? '▼' : '—'} {Math.abs(diffScore)} pts vs. mês anterior
+                                       </p>
+                                       {mudancaRanking && (
+                                           <p className={`text-[9px] font-bold ${mudancaRanking.subiu ? 'text-emerald-600' : 'text-red-600'}`}>
+                                               {mudancaRanking.subiu ? '📈' : '📉'} {mudancaRanking.rankingAnteriorNome} → {mudancaRanking.rankingAtualNome}
+                                           </p>
+                                       )}
+                                   </div>
+                               )}
                                {urgFarmer && (
                                    <div className={`mt-2 text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-md text-center border ${urgFarmer.css}`}>{urgFarmer.texto}</div>
                                )}
@@ -2990,12 +3089,15 @@ function App() {
                         🗑️ Limpar Métricas
                     </button>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
                     <button onClick={recalcularCarteiraRevendas} className="text-emerald-700 bg-emerald-50 text-xs font-bold py-3.5 rounded-xl border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">
                         🔄 Recalcular Carteira das Revendas
                     </button>
                     <button onClick={backfillContatosFarmers} className="text-blue-700 bg-blue-50 text-xs font-bold py-3.5 rounded-xl border border-blue-200 hover:bg-blue-600 hover:text-white transition-colors">
                         📇 Sincronizar Contatos Já Registrados
+                    </button>
+                    <button onClick={normalizarTelefonesFarmers} className="text-purple-700 bg-purple-50 text-xs font-bold py-3.5 rounded-xl border border-purple-200 hover:bg-purple-600 hover:text-white transition-colors">
+                        📞 Normalizar Telefones (n8n)
                     </button>
                 </div>
              </div>
