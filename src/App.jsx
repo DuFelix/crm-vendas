@@ -144,12 +144,29 @@ const normalizarTexto = (str) => String(str || '')
 // homônimas em estados diferentes, já que o UF entra na composição da chave.
 const chaveCidadeUf = (cidade, uf) => `${normalizarTexto(cidade)}_${normalizarTexto(uf)}`;
 
+// NOVO: gera as variantes "com 9º dígito" e "sem 9º dígito" de um número brasileiro já limpo
+// (só dígitos, com DDD, sem "+55"). O WhatsApp às vezes entrega o número no formato antigo, sem
+// o 9 extra que os celulares brasileiros ganharam depois de 2016 — então um número cadastrado como
+// "51999906065" (11 dígitos) pode chegar como "5199906065" (10 dígitos) no numeroCliente do n8n, e
+// vice-versa. Sem gerar as duas variantes, o ARRAY_CONTAINS nunca bate quando o formato difere.
+const gerarVariantesDDD9 = (digitsOnly) => {
+    const variantes = new Set([digitsOnly]);
+    const ddd = digitsOnly.slice(0, 2);
+    const resto = digitsOnly.slice(2);
+    if (digitsOnly.length === 11 && resto[0] === '9') {
+        variantes.add(ddd + resto.slice(1)); // remove o 9 extra -> vira 10 dígitos
+    } else if (digitsOnly.length === 10) {
+        variantes.add(ddd + '9' + resto); // adiciona o 9 -> vira 11 dígitos
+    }
+    return [...variantes];
+};
+
 // NOVO: gera a lista de telefones da revenda só com dígitos (sem DDD com parênteses, espaço ou
-// traço), deduplicada. É isso que fica salvo em "telefones_normalizados" — necessário porque os
-// campos originais (mobile, phone, financial_phone) vêm formatados como "(11) 94940-2117", e o
-// Firestore não faz busca por conteúdo parcial/normalizado: pra automação do n8n conseguir achar a
-// revenda pelo número puro do WhatsApp (ex: "11994402117"), precisa comparar contra um campo já
-// normalizado do mesmo jeito.
+// traço), já incluindo as duas variantes de 9º dígito, deduplicada. É isso que fica salvo em
+// "telefones_normalizados" — necessário porque os campos originais (mobile, phone, financial_phone)
+// vêm formatados como "(11) 94940-2117", e o Firestore não faz busca por conteúdo parcial/
+// normalizado: pra automação do n8n conseguir achar a revenda pelo número puro do WhatsApp (ex:
+// "11994402117"), precisa comparar contra um campo já normalizado do mesmo jeito.
 const extrairTelefonesNormalizados = (obj) => {
     const brutos = [obj.mobile, obj.phone, obj.financial_phone];
     const vistos = new Set();
@@ -157,9 +174,10 @@ const extrairTelefonesNormalizados = (obj) => {
     brutos.forEach(t => {
         if (!t) return;
         const limpo = String(t).replace(/\D/g, '');
-        if (!limpo || vistos.has(limpo)) return;
-        vistos.add(limpo);
-        resultado.push(limpo);
+        if (!limpo) return;
+        gerarVariantesDDD9(limpo).forEach(v => {
+            if (!vistos.has(v)) { vistos.add(v); resultado.push(v); }
+        });
     });
     return resultado;
 };
