@@ -214,7 +214,7 @@ const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
   );
 };
 
-const MOTIVOS_COMENTARIO_FARMER = ['Engajamento', 'Boleto a Vencer', 'Cobrança Ativa', 'Cancelados', 'Problemas Operacionais'];
+const MOTIVOS_COMENTARIO_FARMER = ['Engajamento', 'Boleto a Vencer', 'Cobrança Ativa', 'Cancelados', 'Problemas Operacionais', 'Onboarding', 'Ajuste de Mapa', 'Dúvidas Faturamento'];
 
 const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, isFarmer = false, onFarmerFieldsSaved }) => {
     const [comentario, setComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' });
@@ -224,7 +224,15 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
         if (isFarmer && !comentario.motivo) return mostrarMensagem('Selecione o motivo do comentário!', true);
         const timestamp = Date.now();
         try {
-            const historicoData = { id_lead: alvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: comentario.contato, canal: comentario.canal, observacao: comentario.observacao, sucesso: true };
+            // NOVO: quando o Farmer agenda um retorno, a data escolhida agora fica registrada no
+            // próprio texto salvo na linha do tempo (antes só era gravada no campo proximo_contato
+            // da revenda, sem aparecer no histórico de comentários).
+            let observacaoFinal = comentario.observacao;
+            if (isFarmer && comentario.proximo_contato) {
+                const dataFormatada = new Date(comentario.proximo_contato).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+                observacaoFinal += `\n\n📅 Follow-up agendado para: ${dataFormatada}`;
+            }
+            const historicoData = { id_lead: alvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: comentario.contato, canal: comentario.canal, observacao: observacaoFinal, sucesso: true };
             if (isFarmer) historicoData.motivo = comentario.motivo;
             await addDoc(collection(db, "historico"), historicoData);
             
@@ -319,12 +327,15 @@ function App() {
   // NOVO: filtros e ordenação da visão Farmers
   const [filtroFarmerCidade, setFiltroFarmerCidade] = useState('');
   const [filtroFarmerBusca, setFiltroFarmerBusca] = useState('');
+  const [filtroFarmerDataContato, setFiltroFarmerDataContato] = useState('');
   // NOVO: filtros exclusivos do admin no Dash de Farmers, pra comparar o trabalho por carteira e por farmer
   const [filtroFarmerCarteiraDash, setFiltroFarmerCarteiraDash] = useState('todas');
   const [filtroFarmerVendedorDash, setFiltroFarmerVendedorDash] = useState('todos');
   const [filtroFarmerUf, setFiltroFarmerUf] = useState('todas');
   const [filtroFarmerStatus, setFiltroFarmerStatus] = useState('todos');
   const [ordenacaoFarmer, setOrdenacaoFarmer] = useState('padrao');
+  const [farmerVisualizacao, setFarmerVisualizacao] = useState('kanban');
+  const [itensVisiveisFarmerLista, setItensVisiveisFarmerLista] = useState(100);
   
   const [visaoAtual, setVisaoAtual] = useState('kanban'); 
   const [visaoAnterior, setVisaoAnterior] = useState('kanban'); 
@@ -697,9 +708,17 @@ function App() {
               const bateTelefone = termoDigits.length > 0 && telefonesRevenda.some(t => t.includes(termoDigits));
               if (!bateCnpj && !bateCode && !bateTelefone) return false;
           }
+          // NOVO: filtro por data de retorno agendado — mostra só as revendas cujo proximo_contato
+          // cai exatamente no dia selecionado, pra saber quem precisa ser contactado naquela data.
+          if (filtroFarmerDataContato) {
+              if (!f.proximo_contato) return false;
+              const dataRevenda = new Date(f.proximo_contato);
+              const dataFiltro = new Date(`${filtroFarmerDataContato}T00:00:00`);
+              if (dataRevenda.toDateString() !== dataFiltro.toDateString()) return false;
+          }
           return true;
       });
-  }, [carteiraFarmersFiltrada, filtroFarmerUf, filtroFarmerCidade, filtroFarmerStatus, filtroFarmerBusca]);
+  }, [carteiraFarmersFiltrada, filtroFarmerUf, filtroFarmerCidade, filtroFarmerStatus, filtroFarmerBusca, filtroFarmerDataContato]);
 
   // NOVO: comparador usado para ordenar os cards dentro de cada coluna do Kanban de Farmers
   const compararFarmers = (a, b) => {
@@ -2271,10 +2290,14 @@ function App() {
                                  })()}
                              </div>
                          </div>
-                         <div className="flex gap-3">
+                         <div className="flex flex-wrap gap-3">
                              <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
                                  <p className="text-[10px] font-bold text-slate-500 uppercase">Mês Atual/Apurado</p>
                                  <p className="text-xl font-black" style={{color: BRAND.blue}}>{revendaPerformanceSelecionada.ultimo_mes_apurado || 'N/A'}</p>
+                             </div>
+                             <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
+                                 <p className="text-[10px] font-bold text-slate-500 uppercase">Score Atual</p>
+                                 <p className="text-xl font-black" style={{color: BRAND.black}}>{metricasFarmerHistorico[0]?.total_score ?? (Number(revendaPerformanceSelecionada.total_score) || 0)}</p>
                              </div>
                              {(() => {
                                  // CORREÇÃO: a diferença não aparecia porque dependia só do campo score_anterior,
@@ -2283,23 +2306,44 @@ function App() {
                                  // este card, com os últimos meses de apuração vindos de ranking_metricas — e só
                                  // cai para o campo score_anterior se o histórico tiver menos de 2 meses registrados.
                                  const scoreAtual = metricasFarmerHistorico[0]?.total_score ?? (Number(revendaPerformanceSelecionada.total_score) || 0);
+                                 const ordersAtual = metricasFarmerHistorico[0]?.total_orders ?? (Number(revendaPerformanceSelecionada.total_orders) || 0);
                                  const scoreAnteriorHistorico = metricasFarmerHistorico[1]?.total_score;
+                                 const ordersAnteriorHistorico = metricasFarmerHistorico[1]?.total_orders;
                                  const scoreAnterior = (scoreAnteriorHistorico !== undefined && scoreAnteriorHistorico !== null)
                                      ? scoreAnteriorHistorico
                                      : (revendaPerformanceSelecionada.score_anterior !== undefined ? revendaPerformanceSelecionada.score_anterior : null);
+                                 const ordersAnterior = (ordersAnteriorHistorico !== undefined && ordersAnteriorHistorico !== null)
+                                     ? ordersAnteriorHistorico
+                                     : (revendaPerformanceSelecionada.orders_anterior !== undefined ? revendaPerformanceSelecionada.orders_anterior : null);
                                  const diffScore = (scoreAnterior !== null && scoreAnterior !== undefined) ? scoreAtual - Number(scoreAnterior) : null;
+
+                                 // NOVO: além dos pontos, compara o RANKING (Diamante/Ouro/Prata/Bronze/Desclassificado/
+                                 // Sem volume) do mês atual contra o anterior — essa comparação só muda 1x por mês,
+                                 // já que depende da apuração mensal, diferente da pontuação que é só um número.
+                                 const RANKING_ORDEM = { 'Sem volume': 0, 'Desclassificado': 1, 'Bronze': 2, 'Prata': 3, 'Ouro': 4, 'Diamante': 5 };
+                                 let mudancaRanking = null;
+                                 if (scoreAnterior !== null && scoreAnterior !== undefined && ordersAnterior !== null && ordersAnterior !== undefined) {
+                                     const rankingAtualNome = calcularRankingPelaRegra(scoreAtual, ordersAtual);
+                                     const rankingAnteriorNome = calcularRankingPelaRegra(scoreAnterior, ordersAnterior);
+                                     if (rankingAtualNome !== rankingAnteriorNome) {
+                                         mudancaRanking = { subiu: (RANKING_ORDEM[rankingAtualNome] ?? 0) > (RANKING_ORDEM[rankingAnteriorNome] ?? 0), rankingAtualNome, rankingAnteriorNome };
+                                     }
+                                 }
+
+                                 if (diffScore === null) return null;
+                                 const corClasse = diffScore > 0 ? 'bg-emerald-50 border-emerald-200' : diffScore < 0 ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200';
+                                 const corTexto = diffScore > 0 ? 'text-emerald-600' : diffScore < 0 ? 'text-red-600' : 'text-slate-400';
                                  return (
-                                     <div className="bg-slate-50 px-6 py-3 rounded-2xl border text-center">
-                                         <p className="text-[10px] font-bold text-slate-500 uppercase">Score Atual</p>
-                                         <div className="flex items-center justify-center gap-2">
-                                             <p className="text-xl font-black" style={{color: BRAND.black}}>{scoreAtual}</p>
-                                             {diffScore !== null && diffScore !== 0 && (
-                                                 <span className={`text-sm font-black flex items-center gap-0.5 ${diffScore > 0 ? 'text-emerald-600' : 'text-red-600'}`} title={`${diffScore > 0 ? 'Subiu' : 'Caiu'} ${Math.abs(diffScore)} pontos desde o mês anterior`}>
-                                                     {diffScore > 0 ? '▲' : '▼'}{Math.abs(diffScore)}
-                                                 </span>
-                                             )}
-                                             {diffScore === 0 && <span className="text-sm font-black text-slate-400" title="Sem variação desde o mês anterior">—</span>}
-                                         </div>
+                                     <div className={`px-6 py-3 rounded-2xl border text-center ${corClasse}`}>
+                                         <p className="text-[10px] font-bold uppercase" style={{color: BRAND.gray}}>Variação vs. Mês Anterior</p>
+                                         <p className={`text-xl font-black flex items-center justify-center gap-1 ${corTexto}`} title={`${diffScore > 0 ? 'Subiu' : diffScore < 0 ? 'Caiu' : 'Sem variação'} ${Math.abs(diffScore)} pontos desde o mês anterior`}>
+                                             {diffScore > 0 ? '▲' : diffScore < 0 ? '▼' : '—'} {Math.abs(diffScore)} pts
+                                         </p>
+                                         {mudancaRanking && (
+                                             <p className={`text-[10px] font-bold mt-1 ${mudancaRanking.subiu ? 'text-emerald-600' : 'text-red-600'}`}>
+                                                 {mudancaRanking.subiu ? '📈' : '📉'} {mudancaRanking.rankingAnteriorNome} → {mudancaRanking.rankingAtualNome}
+                                             </p>
+                                         )}
                                      </div>
                                  );
                              })()}
@@ -2407,10 +2451,19 @@ function App() {
                                              </div>
                                          </div>
                                          
-                                         {m.metrics && (
-                                             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                         {m.metrics && (() => {
+                                             // NOVO: número absoluto de pedidos cancelados (total_orders - volumetry) e a taxa
+                                             // proporcional de cancelamento. Acima de 20% sinaliza a revenda como "ofensora"
+                                             // naquele mês — ajustável se quiser um limiar diferente.
+                                             const totalOrdersMes = Number(m.total_orders) || 0;
+                                             const volumetriaMes = Number(m.metrics.volumetry) || 0;
+                                             const canceladosMes = Math.max(totalOrdersMes - volumetriaMes, 0);
+                                             const taxaCancelamento = totalOrdersMes > 0 ? (canceladosMes / totalOrdersMes) * 100 : 0;
+                                             const ehOfensora = taxaCancelamento >= 20;
+                                             return (
+                                             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                                                  <div className="bg-white/80 p-3 rounded-xl border border-black/5 shadow-sm">
-                                                     <p className="text-[10px] font-bold text-slate-500 uppercase">Aceitação</p>
+                                                     <p className="text-[10px] font-bold text-slate-500 uppercase">% Entregues no Prazo</p>
                                                      <p className="text-base font-black text-slate-800">{Number(m.metrics.on_time_delivery_percentage || m.metrics.acceptance_rate_percentage || 0).toFixed(1)}%</p>
                                                  </div>
                                                  <div className="bg-white/80 p-3 rounded-xl border border-black/5 shadow-sm">
@@ -2421,8 +2474,14 @@ function App() {
                                                      <p className="text-[10px] font-bold text-slate-500 uppercase">Tempo Médio</p>
                                                      <p className="text-base font-black text-slate-800">{m.metrics.average_delivery_time || m.metrics.average_acceptance_time || '00:00'}</p>
                                                  </div>
+                                                 <div className={`p-3 rounded-xl border shadow-sm ${ehOfensora ? 'bg-red-50 border-red-200' : 'bg-white/80 border-black/5'}`}>
+                                                     <p className={`text-[10px] font-bold uppercase ${ehOfensora ? 'text-red-500' : 'text-slate-500'}`}>Cancelados</p>
+                                                     <p className={`text-base font-black ${ehOfensora ? 'text-red-600' : 'text-slate-800'}`}>{canceladosMes} <span className="text-xs font-bold">({taxaCancelamento.toFixed(0)}%)</span></p>
+                                                     {ehOfensora && <p className="text-[9px] font-bold text-red-500 mt-0.5">⚠️ Revenda ofensora</p>}
+                                                 </div>
                                              </div>
-                                         )}
+                                             );
+                                         })()}
                                      </div>
                                  );
                              })}
@@ -2503,7 +2562,7 @@ function App() {
             ) : (
               <>
                 {/* NOVO: barra de filtros e ordenação da visão Farmers */}
-                <div className="px-4 md:px-6 pt-4 md:pt-6 shrink-0">
+                <div className="px-4 md:px-6 pt-4 md:pt-6 shrink-0 space-y-2">
                   <div className="w-full flex flex-wrap gap-2 bg-white p-3 rounded-2xl border border-slate-200 shadow-sm">
                      <div className="relative flex-1 min-w-[160px]">
                         <input type="text" placeholder="🔍 Buscar por cidade..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroFarmerCidade} onChange={e => setFiltroFarmerCidade(e.target.value)} />
@@ -2524,6 +2583,8 @@ function App() {
                         <option value="bloqueio_operacional">🟣 Bloq. Operacional</option>
                         <option value="desabilitada">⚪ Desabilitada</option>
                      </select>
+                     {/* NOVO: filtra as revendas que precisam de contato numa data específica (proximo_contato) */}
+                     <input type="date" title="Filtrar por data de retorno agendado" className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: filtroFarmerDataContato ? BRAND.blueDark : BRAND.gray}} value={filtroFarmerDataContato} onChange={e => setFiltroFarmerDataContato(e.target.value)} />
                      <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none bg-blue-50" style={{color: BRAND.blueDark}} value={ordenacaoFarmer} onChange={e => setOrdenacaoFarmer(e.target.value)}>
                         <option value="padrao">Ordenar: Padrão</option>
                         <option value="pedidos_desc">📦 Mais pedidos primeiro</option>
@@ -2531,14 +2592,20 @@ function App() {
                         <option value="score_asc">⚠️ Pior nota primeiro</option>
                         <option value="score_desc">⭐ Melhor nota primeiro</option>
                      </select>
-                     {(filtroFarmerCidade || filtroFarmerBusca || filtroFarmerUf !== 'todas' || filtroFarmerStatus !== 'todos' || ordenacaoFarmer !== 'padrao') && (
-                        <button onClick={() => { setFiltroFarmerCidade(''); setFiltroFarmerBusca(''); setFiltroFarmerUf('todas'); setFiltroFarmerStatus('todos'); setOrdenacaoFarmer('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
+                     {(filtroFarmerCidade || filtroFarmerBusca || filtroFarmerUf !== 'todas' || filtroFarmerStatus !== 'todos' || filtroFarmerDataContato || ordenacaoFarmer !== 'padrao') && (
+                        <button onClick={() => { setFiltroFarmerCidade(''); setFiltroFarmerBusca(''); setFiltroFarmerUf('todas'); setFiltroFarmerStatus('todos'); setFiltroFarmerDataContato(''); setOrdenacaoFarmer('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
                            ✕ Limpar
                         </button>
                      )}
                   </div>
+                  {/* NOVO: alterna entre Kanban (por ranking) e Lista (mesmos filtros, visualização em lista como nos Hunters) */}
+                  <div className="inline-flex bg-slate-100 p-1 rounded-xl gap-1">
+                     <button onClick={() => setFarmerVisualizacao('kanban')} className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-colors ${farmerVisualizacao === 'kanban' ? 'bg-white shadow-sm' : ''}`} style={{color: farmerVisualizacao === 'kanban' ? BRAND.blue : BRAND.gray}}>🗂️ Kanban</button>
+                     <button onClick={() => setFarmerVisualizacao('lista')} className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-colors ${farmerVisualizacao === 'lista' ? 'bg-white shadow-sm' : ''}`} style={{color: farmerVisualizacao === 'lista' ? BRAND.blue : BRAND.gray}}>📋 Lista</button>
+                  </div>
                 </div>
 
+                {farmerVisualizacao === 'kanban' ? (
                 <div className="flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 gap-4 md:gap-6 flex items-start">
                   {['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume'].map(nivel => {
                     const leadsNivel = carteiraFarmersExibida.filter(l => (l.ranking_level || 'Sem volume') === nivel).sort(compararFarmers);
@@ -2619,6 +2686,68 @@ function App() {
                     );
                   })}
                 </div>
+                ) : (
+                <div onScroll={(e) => {
+                     const { scrollTop, scrollHeight, clientHeight } = e.target;
+                     if (scrollHeight - scrollTop <= clientHeight * 1.5) {
+                         setItensVisiveisFarmerLista(prev => prev + 50);
+                     }
+                }} className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
+                    {carteiraFarmersExibida.slice().sort(compararFarmers).slice(0, itensVisiveisFarmerLista).map(rev => {
+                        const statusFarmer = getFarmerStatus(rev);
+                        const codeDisplay = rev.code || rev.CODE ? `[${rev.code || rev.CODE}] ` : '';
+                        const scoreAtual = Number(rev.total_score) || 0;
+                        const temScoreAnterior = rev.score_anterior !== undefined && rev.score_anterior !== null;
+                        const diffScore = temScoreAnterior ? scoreAtual - Number(rev.score_anterior) : null;
+                        const urgFarmer = getFarmerUrgency(rev);
+                        const cidadeRev = rev.cidade || rev.city || rev.municipio || '';
+                        const ufRev = obterSiglaUF(rev.uf || rev.estado || rev.state || '');
+
+                        return (
+                            <div key={rev.id} onClick={() => abrirPerformanceFarmer(rev)} className="bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md border-slate-200">
+                               <div className="flex justify-between items-start mb-1">
+                                  <h3 className="font-bold text-xs md:text-sm truncate mr-2" style={{color: BRAND.black}}>{codeDisplay}{rev.nome || rev.razao_social || 'Sem Nome'}</h3>
+                                  <span className={`shrink-0 text-[9px] md:text-[10px] font-black px-2 py-0.5 rounded border uppercase whitespace-nowrap ${statusFarmer.bg} ${statusFarmer.textCol} ${statusFarmer.border}`}>
+                                     {statusFarmer.text}
+                                  </span>
+                               </div>
+
+                               <div className="flex flex-wrap gap-1.5 mb-2">
+                                  <p className="text-[10px] md:text-xs truncate flex items-center gap-1" style={{color: BRAND.gray}}>
+                                     📍 {cidadeRev ? `${cidadeRev} - ${ufRev}` : '-'}
+                                  </p>
+                                  <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate">
+                                     {rev.carteira || 'SEM CARTEIRA'}
+                                  </span>
+                                  <span className="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase">Mês: {rev.ultimo_mes_apurado || 'N/A'}</span>
+                               </div>
+
+                               <div className="flex justify-between items-center gap-2">
+                                  <div className="flex items-center gap-1">
+                                     <span className="text-[9px] font-bold text-slate-400 uppercase">Score:</span>
+                                     <span className={`text-xs font-black ${scoreAtual>=50?'text-emerald-600':'text-red-500'}`}>{scoreAtual}</span>
+                                     {diffScore !== null && diffScore !== 0 && (
+                                         <span className={`text-[10px] font-black ${diffScore > 0 ? 'text-emerald-600' : 'text-red-600'}`}>{diffScore > 0 ? '▲' : '▼'}{Math.abs(diffScore)}</span>
+                                     )}
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                     <span className="text-[9px] font-bold text-slate-400 uppercase">Pedidos:</span>
+                                     <span className={`text-xs font-black ${rev.total_orders<=20?'text-orange-500':'text-blue-600'}`}>{rev.total_orders||0}</span>
+                                  </div>
+                               </div>
+                               {urgFarmer && (
+                                   <div className={`mt-2 text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-md text-center border ${urgFarmer.css}`}>{urgFarmer.texto}</div>
+                               )}
+                            </div>
+                        );
+                    })}
+                    {itensVisiveisFarmerLista < carteiraFarmersExibida.length && (
+                        <div className="py-4 text-center">
+                            <span className="text-xs font-bold text-slate-400 animate-pulse border border-slate-200 px-4 py-2 rounded-xl bg-white shadow-sm">Carregando mais...</span>
+                        </div>
+                    )}
+                </div>
+                )}
               </>
             )}
           </div>
