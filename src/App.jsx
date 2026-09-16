@@ -115,6 +115,9 @@ const getFarmerUrgency = (revenda) => {
 // lidarUploadMetricsJSON), sem precisar de nenhuma leitura extra por revenda. Isso é o que permite
 // mostrar o progresso de dezenas/centenas de planos ao mesmo tempo no painel geral.
 const METRICAS_PLANO_ACAO = [
+    { chave: 'total_score', label: 'Score Geral', unidade: ' pts', melhorQuandoMaior: true,
+      obterValorAtual: (rev) => Number(rev?.total_score ?? 0),
+      obterValorDoHistorico: (m) => (m?.total_score === undefined || m?.total_score === null) ? null : Number(m.total_score) },
     { chave: 'on_time_delivery_percentage', label: '% Entregues no Prazo', unidade: '%', melhorQuandoMaior: true,
       obterValorAtual: (rev) => Number(rev?.metrica_on_time_delivery_percentage ?? 0),
       // Lê o mesmo campo, mas direto de um documento de ranking_metricas (histórico já carregado na
@@ -143,15 +146,20 @@ const METRICAS_PLANO_ACAO = [
 
 // CORREÇÃO (Bug 1 — "Valor Atual em 0%" / "Meta calculada: 0.0%"): resolve o valor atual de uma
 // métrica com prioridade em 3 camadas:
-//   1) o registro diário mais recente feito pelo farmer dentro do PRÓPRIO plano (plano.andamento),
+//   1) o registro diário mais recente feito pelo farmer dentro do PRÓPRIO plano (plano.andamento)
+//      PARA AQUELA MÉTRICA ESPECÍFICA (um plano pode ter várias métricas — ver obterMetasDoPlano),
 //      mas só vale enquanto for mais novo que a última apuração oficial de métricas — depois disso
 //      a apuração oficial volta a valer, como pedido.
 //   2) o histórico de ranking_metricas já carregado na tela da revenda (metricasFarmerHistorico) —
 //      fonte mais fresca que o campo espelhado, que só é atualizado no próximo import em lote.
 //   3) o campo espelhado na carteira_ativa (metrica_*) — usado no painel geral de Planos de Ação,
 //      onde carregar o histórico de cada revenda custaria uma leitura extra por card.
-const obterValorAtualPlano = (metricaInfo, revenda, historico, plano) => {
-    const registros = (plano?.andamento || []).filter(a => a.valor !== null && a.valor !== undefined);
+const obterValorAtualPlano = (metricaInfo, revenda, historico, plano, metricaChave) => {
+    const chaveAlvo = metricaChave || metricaInfo?.chave;
+    // Registros antigos (de planos de 1 métrica só, criados antes desta atualização) não têm o campo
+    // "metrica" — nesse caso, qualquer registro sem essa marcação é tratado como sendo da única
+    // métrica do plano, preservando o comportamento anterior.
+    const registros = (plano?.andamento || []).filter(a => a.valor !== null && a.valor !== undefined && (!a.metrica || a.metrica === chaveAlvo));
     if (registros.length > 0) {
         const ultimoRegistro = registros[registros.length - 1];
         const dataApuracaoOficial = revenda?.ultima_atualizacao_metricas ? new Date(revenda.ultima_atualizacao_metricas).getTime() : 0;
@@ -169,20 +177,36 @@ const obterValorAtualPlano = (metricaInfo, revenda, historico, plano) => {
     return { valor: Number(metricaInfo?.obterValorAtual(revenda) ?? 0), fonte: 'espelhado', dataFonte: revenda?.ultima_atualizacao_metricas || null };
 };
 
-// Calcula o progresso de um plano de ação (0-100%) comparando valor inicial -> atual -> meta,
-// respeitando se a métrica é "melhor quando maior" ou "melhor quando menor". `historico` (opcional)
-// é o array de ranking_metricas já carregado da revenda (metricasFarmerHistorico) — quando não vem,
-// o cálculo cai direto pro registro diário (se houver) ou pro campo espelhado.
-const calcularProgressoPlano = (plano, revenda, historico) => {
-    const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === plano.metrica);
-    if (!metricaInfo) return null;
-    const { valor: valorAtual, fonte: fonteValorAtual, dataFonte } = obterValorAtualPlano(metricaInfo, revenda, historico, plano);
-    const distanciaTotal = metricaInfo.melhorQuandoMaior ? (plano.valor_meta - plano.valor_inicial) : (plano.valor_inicial - plano.valor_meta);
-    const distanciaPercorrida = metricaInfo.melhorQuandoMaior ? (valorAtual - plano.valor_inicial) : (plano.valor_inicial - valorAtual);
-    let percentual = distanciaTotal !== 0 ? (distanciaPercorrida / distanciaTotal) * 100 : 100;
-    percentual = Math.max(0, Math.min(100, percentual));
-    const atingiu = metricaInfo.melhorQuandoMaior ? valorAtual >= plano.valor_meta : valorAtual <= plano.valor_meta;
-    return { valorAtual, percentual, atingiu, metricaInfo, fonteValorAtual, dataFonte };
+// NOVO: um plano agora pode ter VÁRIAS métricas (campo "metas", array). Planos criados antes dessa
+// atualização só têm os campos antigos no singular (metrica/valor_inicial/valor_meta/tipo_meta/
+// variacao_percentual) — essa função normaliza os dois formatos num array único de metas, pra todo
+// o resto do código (progresso, andamento, exibição) trabalhar sempre com a mesma forma.
+const obterMetasDoPlano = (plano) => {
+    if (Array.isArray(plano.metas) && plano.metas.length > 0) return plano.metas;
+    if (plano.metrica) return [{ metrica: plano.metrica, valor_inicial: plano.valor_inicial, valor_meta: plano.valor_meta, tipo_meta: plano.tipo_meta, variacao_percentual: plano.variacao_percentual }];
+    return [];
+};
+
+// Calcula o progresso de CADA meta de um plano (0-100%), mais um agregado (% médio e se todas as
+// metas foram batidas). `historico` (opcional) é o array de ranking_metricas já carregado da
+// revenda (metricasFarmerHistorico) — quando não vem, o cálculo cai direto pro registro diário (se
+// houver) ou pro campo espelhado.
+const calcularProgressoMetasPlano = (plano, revenda, historico) => {
+    const metas = obterMetasDoPlano(plano);
+    const progressos = metas.map(meta => {
+        const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === meta.metrica);
+        if (!metricaInfo) return null;
+        const { valor: valorAtual, fonte: fonteValorAtual, dataFonte } = obterValorAtualPlano(metricaInfo, revenda, historico, plano, meta.metrica);
+        const distanciaTotal = metricaInfo.melhorQuandoMaior ? (meta.valor_meta - meta.valor_inicial) : (meta.valor_inicial - meta.valor_meta);
+        const distanciaPercorrida = metricaInfo.melhorQuandoMaior ? (valorAtual - meta.valor_inicial) : (meta.valor_inicial - valorAtual);
+        let percentual = distanciaTotal !== 0 ? (distanciaPercorrida / distanciaTotal) * 100 : 100;
+        percentual = Math.max(0, Math.min(100, percentual));
+        const atingiu = metricaInfo.melhorQuandoMaior ? valorAtual >= meta.valor_meta : valorAtual <= meta.valor_meta;
+        return { ...meta, metricaInfo, valorAtual, percentual, atingiu, fonteValorAtual, dataFonte };
+    }).filter(Boolean);
+    const percentualMedio = progressos.length > 0 ? progressos.reduce((acc, p) => acc + p.percentual, 0) / progressos.length : 0;
+    const todasAtingidas = progressos.length > 0 && progressos.every(p => p.atingiu);
+    return { progressos, percentualMedio, todasAtingidas };
 };
 
 // Sinalização de prazo do plano de ação — mesmo padrão visual dos outros indicadores de urgência do app.
@@ -195,29 +219,70 @@ const getPlanoUrgencia = (plano) => {
     return { texto: `📅 Prazo: ${new Date(plano.prazo).toLocaleDateString('pt-BR')}`, css: 'bg-blue-50 text-blue-600 border-blue-200' };
 };
 
-// NOVO: rótulos e cálculo automático de prazo por período — Diário/Semanal/Mensal — usado tanto na
-// criação de um plano individual quanto na criação em lote por critério.
+// NOVO: sinalização de follow-up do PLANO (diferente do follow-up geral da revenda/getFarmerUrgency)
+// — é a cadência que o próprio plano exige (ex: "todo plano mensal, ligar toda semana pra cobrar
+// andamento"). Só existe quando o plano tem periodo_followup definido.
+const getPlanoFollowupUrgencia = (plano) => {
+    if (plano.status !== 'em_andamento' || !plano.periodo_followup || !plano.proximo_followup) return null;
+    const now = Date.now();
+    if (plano.proximo_followup - now < 0) return { texto: '🚨 Follow-up do Plano Atrasado', css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse' };
+    if (new Date(plano.proximo_followup).toDateString() === new Date().toDateString()) return { texto: '📞 Follow-up do Plano Hoje', css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold' };
+    return { texto: `📞 Próximo Follow-up: ${new Date(plano.proximo_followup).toLocaleDateString('pt-BR')}`, css: 'bg-[#2D6FEF]/10 text-[#2D6FEF] border-[#2D6FEF]/30' };
+};
+
+// NOVO: rótulos e cálculo automático de prazo por período — Diário/Semanal/Quinzenal/Mensal/
+// Personalizado — usado tanto na criação de um plano individual quanto na criação em lote por
+// critério. "personalizado" usa a data exata escolhida no calendário (dataPersonalizada, string
+// "YYYY-MM-DD"); os demais períodos contam a partir de agora.
 const PERIODOS_PLANO = [
     { chave: 'diario', label: 'Diário (vence amanhã)' },
     { chave: 'semanal', label: 'Semanal (vence em 7 dias)' },
+    { chave: 'quinzenal', label: 'Quinzenal (vence em 15 dias)' },
     { chave: 'mensal', label: 'Mensal (vence em 30 dias)' },
+    { chave: 'personalizado', label: 'Personalizado (escolher data)' },
 ];
-const calcularPrazoPorPeriodo = (periodo) => {
+// Período de follow-up do plano é sempre recorrente, então "personalizado" (data fixa) não se aplica.
+const PERIODOS_FOLLOWUP_PLANO = PERIODOS_PLANO.filter(p => p.chave !== 'personalizado');
+
+const calcularPrazoPorPeriodo = (periodo, dataPersonalizada) => {
+    if (periodo === 'personalizado' && dataPersonalizada) {
+        return new Date(`${dataPersonalizada}T23:59:59`).getTime();
+    }
     const data = new Date();
     if (periodo === 'diario') data.setDate(data.getDate() + 1);
     else if (periodo === 'semanal') data.setDate(data.getDate() + 7);
+    else if (periodo === 'quinzenal') data.setDate(data.getDate() + 15);
     else data.setDate(data.getDate() + 30); // mensal (padrão)
     data.setHours(23, 59, 59, 999);
     return data.getTime();
 };
 
-// NOVO: calcula o valor absoluto da meta a partir do tipo escolhido — valor digitado direto
-// ("absoluto"), ou uma redução/aumento percentual relativo ao valor inicial da revenda naquele
-// momento (ex: taxa de cancelamento em 20% + "reduzir 10%" -> meta vira 18%, ou seja, 20 * 0.9).
+// NOVO: próximo follow-up do plano a partir de agora, dado o período de cadência escolhido —
+// reaproveitado tanto na criação do plano (primeiro follow-up) quanto toda vez que um follow-up é
+// registrado (recalcula o próximo a partir de hoje).
+const calcularProximoFollowup = (periodoFollowup) => {
+    if (!periodoFollowup) return null;
+    const data = new Date();
+    if (periodoFollowup === 'diario') data.setDate(data.getDate() + 1);
+    else if (periodoFollowup === 'semanal') data.setDate(data.getDate() + 7);
+    else if (periodoFollowup === 'quinzenal') data.setDate(data.getDate() + 15);
+    else data.setDate(data.getDate() + 30);
+    return data.getTime();
+};
+
+// NOVO: calcula o valor absoluto da meta a partir do tipo escolhido:
+// - "absoluto": valor digitado direto é a própria meta (ex: "chegar a 90 pontos")
+// - "reducao_percentual"/"aumento_percentual": variação relativa ao valor inicial (ex: taxa de
+//   cancelamento em 20% + "reduzir 10%" -> meta vira 18%, ou seja, 20 * 0.9)
+// - "aumento_pontos"/"reducao_pontos": soma/subtrai um número fixo de pontos do valor inicial (ex:
+//   score em 70 + "subir 10 pontos" -> meta vira 80) — pedido explicitamente pro Score, mas funciona
+//   pra qualquer métrica.
 const calcularValorMetaFinal = (tipoMeta, valorInicial, valorInformado) => {
     const num = Number(valorInformado) || 0;
     if (tipoMeta === 'reducao_percentual') return valorInicial * (1 - num / 100);
     if (tipoMeta === 'aumento_percentual') return valorInicial * (1 + num / 100);
+    if (tipoMeta === 'aumento_pontos') return valorInicial + num;
+    if (tipoMeta === 'reducao_pontos') return valorInicial - num;
     return num; // absoluto
 };
 
@@ -396,13 +461,13 @@ const MapaDinamico = ({ leads, onMarkerClick, initialView, onMapChange }) => {
   );
 };
 
-const MOTIVOS_COMENTARIO_FARMER = ['Engajamento', 'Boleto a Vencer', 'Cobrança Ativa', 'Cancelados', 'Problemas Operacionais', 'Onboarding', 'Ajuste de Mapa', 'Dúvidas Faturamento'];
+const MOTIVOS_COMENTARIO_FARMER = ['Engajamento', 'Boleto a Vencer', 'Cobrança Ativa', 'Cancelados', 'Problemas Operacionais', 'Onboarding', 'Ajuste de Mapa', 'Dúvidas Faturamento', 'Alterações de Dados Cadastrais'];
 
 const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, isFarmer = false, onFarmerFieldsSaved }) => {
-    const [comentario, setComentario] = useState({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' });
+    const [comentario, setComentario] = useState({ contatoNome: '', contatoCargo: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' });
 
     const salvarComentario = async () => {
-        if (!comentario.contato.trim() || !comentario.observacao.trim()) return mostrarMensagem('Preencha com quem falou e a observação!', true);
+        if (!comentario.contatoNome.trim() || !comentario.observacao.trim()) return mostrarMensagem('Preencha com quem falou e a observação!', true);
         if (isFarmer && !comentario.motivo) return mostrarMensagem('Selecione o motivo do comentário!', true);
         const timestamp = Date.now();
         try {
@@ -414,7 +479,14 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
                 const dataFormatada = new Date(comentario.proximo_contato).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
                 observacaoFinal += `\n\n📅 Follow-up agendado para: ${dataFormatada}`;
             }
-            const historicoData = { id_lead: alvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: comentario.contato, canal: comentario.canal, observacao: observacaoFinal, sucesso: true };
+            // NOVO: nome e cargo agora são campos separados na tela, mas continuam sendo combinados
+            // num único texto em "contato" (ex: "Sr. Marcos - Gerente") pra não quebrar nada que já
+            // lê esse campo (Linha do Tempo, CSV, etc.) — os dois campos crus também são salvos à
+            // parte, caso sejam úteis separadamente no futuro.
+            const nomeLimpo = comentario.contatoNome.trim();
+            const cargoLimpo = comentario.contatoCargo.trim();
+            const contatoCombinado = cargoLimpo ? `${nomeLimpo} - ${cargoLimpo}` : nomeLimpo;
+            const historicoData = { id_lead: alvo.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: contatoCombinado, contato_nome: nomeLimpo, contato_cargo: cargoLimpo || null, canal: comentario.canal, observacao: observacaoFinal, sucesso: true };
             if (isFarmer) historicoData.motivo = comentario.motivo;
             await addDoc(collection(db, "historico"), historicoData);
             
@@ -432,7 +504,7 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
                onFarmerFieldsSaved?.(attRevenda);
             }
             
-            setComentario({ contato: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' }); 
+            setComentario({ contatoNome: '', contatoCargo: '', canal: 'WhatsApp', observacao: '', proximo_contato: '', motivo: '' }); 
             onHistoricoSalvo(alvo.id); 
             mostrarMensagem('Histórico salvo na Nuvem!');
         } catch (e) { mostrarMensagem('Erro ao salvar.', true); }
@@ -444,9 +516,12 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
                <div className="p-2 rounded-xl" style={{backgroundColor: `${BRAND.blue}20`, color: BRAND.blue}}><svg className="w-5 md:w-6 h-5 md:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></div>
                Registrar Nova Interação
             </h2>
-            <div className={`grid grid-cols-1 ${isFarmer ? 'md:grid-cols-3' : 'md:grid-cols-2'} gap-4 md:gap-6 mb-4 md:mb-6`}>
+            <div className={`grid grid-cols-1 sm:grid-cols-2 ${isFarmer ? 'lg:grid-cols-4' : 'lg:grid-cols-3'} gap-4 md:gap-6 mb-4 md:mb-6`}>
               <div>
-                <input type="text" placeholder="Nome do Contato (Ex: Sr. Marcos - Gerente)" className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none font-medium text-sm md:text-base placeholder-slate-400 text-slate-800" value={comentario.contato} onChange={e => setComentario({...comentario, contato: e.target.value})} />
+                <input type="text" placeholder="Nome do Contato (Ex: Sr. Marcos)" className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none font-medium text-sm md:text-base placeholder-slate-400 text-slate-800" value={comentario.contatoNome} onChange={e => setComentario({...comentario, contatoNome: e.target.value})} />
+              </div>
+              <div>
+                <input type="text" placeholder="Cargo/Ocupação (Ex: Gerente)" className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none font-medium text-sm md:text-base placeholder-slate-400 text-slate-800" value={comentario.contatoCargo} onChange={e => setComentario({...comentario, contatoCargo: e.target.value})} />
               </div>
               <div>
                 <select className="w-full bg-slate-50 border-2 border-slate-100 p-3.5 md:p-4 rounded-2xl outline-none font-medium text-sm md:text-base text-slate-600" value={comentario.canal} onChange={e => setComentario({...comentario, canal: e.target.value})}>
@@ -484,14 +559,18 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
 // específica. Cada registro pode trazer um valor (o "termômetro" do dia, que passa a valer como
 // Atual do progresso até a próxima apuração oficial substituir — ver obterValorAtualPlano) e/ou só
 // um comentário livre (sem valor), pra permitir registrar contexto sem precisar de um número.
-const PainelAndamentoPlano = ({ plano, metricaInfo, vendedor, mostrarMensagem, onAtualizado }) => {
+// `metas` é a lista de metas do plano (ver obterMetasDoPlano/calcularProgressoMetasPlano) — quando
+// tem mais de uma, aparece um seletor pra escolher de qual métrica é o valor do dia.
+const PainelAndamentoPlano = ({ plano, metas, vendedor, mostrarMensagem, onAtualizado }) => {
     const [valorDia, setValorDia] = useState('');
     const [comentarioDia, setComentarioDia] = useState('');
+    const [metricaSelecionada, setMetricaSelecionada] = useState(metas?.[0]?.metrica || '');
     const [salvando, setSalvando] = useState(false);
     const [mostrarHistorico, setMostrarHistorico] = useState(false);
 
     const andamento = plano.andamento || [];
     const registrosOrdenados = andamento.slice().sort((a, b) => b.timestamp - a.timestamp);
+    const metricaInfoAtual = metas?.find(m => m.metrica === metricaSelecionada)?.metricaInfo || metas?.[0]?.metricaInfo;
 
     const salvarAndamento = async () => {
         if (!valorDia.trim() && !comentarioDia.trim()) return mostrarMensagem('Preencha um valor e/ou um comentário.', true);
@@ -499,6 +578,7 @@ const PainelAndamentoPlano = ({ plano, metricaInfo, vendedor, mostrarMensagem, o
         const novoRegistro = {
             tipo: valorDia.trim() ? 'registro' : 'comentario',
             valor: valorDia.trim() ? Number(valorDia) : null,
+            metrica: valorDia.trim() ? (metricaSelecionada || null) : null,
             observacao: comentarioDia.trim(),
             autor: vendedor,
             timestamp: Date.now(),
@@ -519,7 +599,12 @@ const PainelAndamentoPlano = ({ plano, metricaInfo, vendedor, mostrarMensagem, o
         <div className="mt-3 pt-3 border-t border-slate-200">
             <p className="text-[10px] font-black uppercase tracking-wider mb-2" style={{color: BRAND.gray}}>📝 Acompanhamento Diário</p>
             <div className="flex flex-col sm:flex-row gap-2 mb-2">
-                <input type="number" placeholder={`Valor hoje${metricaInfo?.unidade ? ` (${metricaInfo.unidade.trim()})` : ''}`} className="w-full sm:w-36 bg-white border-2 border-slate-200 p-2.5 rounded-xl text-xs font-bold outline-none" value={valorDia} onChange={e => setValorDia(e.target.value)} />
+                {metas && metas.length > 1 && (
+                    <select className="bg-white border-2 border-slate-200 p-2.5 rounded-xl text-xs font-bold outline-none" value={metricaSelecionada} onChange={e => setMetricaSelecionada(e.target.value)}>
+                        {metas.map(m => <option key={m.metrica} value={m.metrica}>{m.metricaInfo?.label || m.metrica}</option>)}
+                    </select>
+                )}
+                <input type="number" placeholder={`Valor hoje${metricaInfoAtual?.unidade ? ` (${metricaInfoAtual.unidade.trim()})` : ''}`} className="w-full sm:w-36 bg-white border-2 border-slate-200 p-2.5 rounded-xl text-xs font-bold outline-none" value={valorDia} onChange={e => setValorDia(e.target.value)} />
                 <input type="text" placeholder="Comentário (opcional)" className="flex-1 bg-white border-2 border-slate-200 p-2.5 rounded-xl text-xs font-medium outline-none" value={comentarioDia} onChange={e => setComentarioDia(e.target.value)} />
                 <button onClick={salvarAndamento} disabled={salvando} className="text-xs font-bold px-4 py-2.5 rounded-xl text-white shadow-sm hover:opacity-90 transition-opacity disabled:opacity-50 shrink-0" style={{backgroundColor: BRAND.blueDark}}>
                     {salvando ? '...' : '💬 Registrar'}
@@ -532,18 +617,22 @@ const PainelAndamentoPlano = ({ plano, metricaInfo, vendedor, mostrarMensagem, o
             )}
             {mostrarHistorico && (
                 <div className="mt-2 space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                    {registrosOrdenados.map((r, idx) => (
+                    {registrosOrdenados.map((r, idx) => {
+                        const unidadeRegistro = metas?.find(m => m.metrica === r.metrica)?.metricaInfo?.unidade || metricaInfoAtual?.unidade || '';
+                        const labelMetricaRegistro = metas?.find(m => m.metrica === r.metrica)?.metricaInfo?.label;
+                        return (
                         <div key={idx} className="bg-white p-2 rounded-lg border border-slate-100 text-[11px]">
                             <div className="flex justify-between items-center gap-2">
                                 <span className="font-black" style={{color: BRAND.black}}>
-                                    {r.tipo === 'registro' ? `📊 ${r.valor}${metricaInfo?.unidade || ''}` : '💬 Comentário'}
+                                    {r.tipo === 'registro' ? `📊 ${labelMetricaRegistro ? labelMetricaRegistro + ': ' : ''}${r.valor}${unidadeRegistro}` : '💬 Comentário'}
                                 </span>
                                 <span className="font-medium shrink-0" style={{color: BRAND.gray}}>{new Date(r.timestamp).toLocaleString('pt-BR', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'})}</span>
                             </div>
                             {r.observacao && <p className="mt-0.5 font-medium" style={{color: BRAND.gray}}>{r.observacao}</p>}
                             <p className="mt-0.5 text-[10px] font-bold" style={{color: BRAND.gray}}>— {r.autor}</p>
                         </div>
-                    ))}
+                        );
+                    })}
                 </div>
             )}
         </div>
@@ -563,10 +652,14 @@ function App() {
   const [planosAcao, setPlanosAcao] = useState([]);
   const [planosAcaoCarregados, setPlanosAcaoCarregados] = useState(false);
   const [modalNovoPlano, setModalNovoPlano] = useState(null);
-  const [novoPlanoMetrica, setNovoPlanoMetrica] = useState(METRICAS_PLANO_ACAO[0].chave);
+  // NOVO: agora é um array — o plano pode ter mais de uma métrica ao mesmo tempo (ou "todas")
+  const [novoPlanoMetricas, setNovoPlanoMetricas] = useState([METRICAS_PLANO_ACAO[0].chave]);
   const [novoPlanoTipoMeta, setNovoPlanoTipoMeta] = useState('reducao_percentual');
   const [novoPlanoValorMeta, setNovoPlanoValorMeta] = useState('');
   const [novoPlanoPeriodo, setNovoPlanoPeriodo] = useState('mensal');
+  const [novoPlanoDataPersonalizada, setNovoPlanoDataPersonalizada] = useState('');
+  // NOVO: cadência de follow-up do plano (opcional) — gera alertas separados do follow-up geral da revenda
+  const [novoPlanoPeriodoFollowup, setNovoPlanoPeriodoFollowup] = useState('');
   const [filtroPlanoStatus, setFiltroPlanoStatus] = useState('em_andamento');
   const [filtroPlanoCarteiraDash, setFiltroPlanoCarteiraDash] = useState('todas');
   const [filtroPlanoVendedorDash, setFiltroPlanoVendedorDash] = useState('todos');
@@ -580,6 +673,8 @@ function App() {
   const [criterioTipoMeta, setCriterioTipoMeta] = useState('reducao_percentual');
   const [criterioValor, setCriterioValor] = useState('');
   const [criterioPeriodo, setCriterioPeriodo] = useState('mensal');
+  const [criterioDataPersonalizada, setCriterioDataPersonalizada] = useState('');
+  const [criterioPeriodoFollowup, setCriterioPeriodoFollowup] = useState('');
   const [revendaPerformanceSelecionada, setRevendaPerformanceSelecionada] = useState(null);
   const [modalLimpeza, setModalLimpeza] = useState(null);
   const [metricasFarmerHistorico, setMetricasFarmerHistorico] = useState([]);
@@ -1679,26 +1774,39 @@ function App() {
       }
   };
 
-  // NOVO: cria um Plano de Ação para a revenda, capturando o valor ATUAL da métrica escolhida como
-  // ponto de partida (valor_inicial) — é contra esse ponto de partida que o progresso é medido.
+  // NOVO: cria um Plano de Ação para a revenda, capturando o valor ATUAL de CADA métrica selecionada
+  // como ponto de partida (valor_inicial) — é contra esse ponto de partida que o progresso é medido.
   // CORREÇÃO (Bug 1): usa obterValorAtualPlano, que prioriza o histórico de ranking_metricas já
   // carregado (metricasFarmerHistorico, sempre disponível aqui pois este modal só abre de dentro do
   // card da revenda) em vez do campo espelhado — que só é preenchido no PRÓXIMO import de métricas.
   const salvarNovoPlanoAcao = async () => {
       if (!modalNovoPlano) return;
       if (!novoPlanoValorMeta) return mostrarMensagem('Preencha a meta.', true);
-      const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === novoPlanoMetrica);
-      const valorInicial = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null).valor;
+      if (novoPlanoMetricas.length === 0) return mostrarMensagem('Selecione ao menos uma métrica.', true);
+      if (novoPlanoPeriodo === 'personalizado' && !novoPlanoDataPersonalizada) return mostrarMensagem('Escolha a data de término do período personalizado.', true);
       try {
+          // NOVO: uma entrada de meta por métrica selecionada — todas usam o mesmo tipo/valor de
+          // meta (ex: "reduzir 10%"), mas cada uma parte do SEU PRÓPRIO valor inicial.
+          const metas = novoPlanoMetricas.map(chaveMetrica => {
+              const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === chaveMetrica);
+              const valorInicial = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null).valor;
+              return {
+                  metrica: chaveMetrica,
+                  valor_inicial: valorInicial,
+                  tipo_meta: novoPlanoTipoMeta,
+                  variacao_percentual: novoPlanoTipoMeta !== 'absoluto' ? Number(novoPlanoValorMeta) : null,
+                  valor_meta: calcularValorMetaFinal(novoPlanoTipoMeta, valorInicial, novoPlanoValorMeta)
+              };
+          });
           const novoPlano = {
               revenda_id: modalNovoPlano.id,
-              metrica: novoPlanoMetrica,
-              valor_inicial: valorInicial,
-              tipo_meta: novoPlanoTipoMeta,
-              variacao_percentual: novoPlanoTipoMeta !== 'absoluto' ? Number(novoPlanoValorMeta) : null,
-              valor_meta: calcularValorMetaFinal(novoPlanoTipoMeta, valorInicial, novoPlanoValorMeta),
+              metas,
               periodo: novoPlanoPeriodo,
-              prazo: calcularPrazoPorPeriodo(novoPlanoPeriodo),
+              prazo: calcularPrazoPorPeriodo(novoPlanoPeriodo, novoPlanoDataPersonalizada),
+              // NOVO: cadência de follow-up do plano — opcional; quando definida, já agenda o
+              // primeiro follow-up a partir de hoje.
+              periodo_followup: novoPlanoPeriodoFollowup || null,
+              proximo_followup: novoPlanoPeriodoFollowup ? calcularProximoFollowup(novoPlanoPeriodoFollowup) : null,
               status: 'em_andamento',
               criado_por: vendedor,
               criado_em: Date.now(),
@@ -1709,6 +1817,8 @@ function App() {
           setPlanosAcao(prev => [...prev, { id: docRef.id, ...novoPlano }]);
           setModalNovoPlano(null);
           setNovoPlanoValorMeta('');
+          setNovoPlanoDataPersonalizada('');
+          setNovoPlanoPeriodoFollowup('');
           mostrarMensagem('Plano de ação criado!');
       } catch (e) {
           mostrarMensagem('Erro ao criar plano de ação.', true);
@@ -1719,6 +1829,18 @@ function App() {
   // diário/comentário salvo pelo PainelAndamentoPlano, sem precisar recarregar planosAcao inteiro.
   const atualizarAndamentoLocal = (planoId, novoAndamento) => {
       setPlanosAcao(prev => prev.map(p => p.id === planoId ? { ...p, andamento: novoAndamento } : p));
+  };
+
+  // NOVO: registra que o follow-up de cadência do plano foi feito hoje, e já agenda o próximo a
+  // partir de agora, seguindo o periodo_followup definido na criação do plano.
+  const registrarFollowupPlano = async (plano) => {
+      if (!plano.periodo_followup) return;
+      const novoProximo = calcularProximoFollowup(plano.periodo_followup);
+      try {
+          await updateDoc(doc(db, "planos_acao", plano.id), { proximo_followup: novoProximo, ultimo_followup: Date.now() });
+          setPlanosAcao(prev => prev.map(p => p.id === plano.id ? { ...p, proximo_followup: novoProximo, ultimo_followup: Date.now() } : p));
+          mostrarMensagem('Follow-up do plano registrado!');
+      } catch (e) { mostrarMensagem('Erro ao registrar follow-up.', true); }
   };
 
   const concluirPlanoAcao = async (plano) => {
@@ -1759,13 +1881,14 @@ function App() {
   // inteiro de uma vez, em vez de um por um.
   const criarPlanosPorCriterio = async () => {
       if (!criterioValor) return mostrarMensagem('Preencha o valor/percentual da meta.', true);
+      if (criterioPeriodo === 'personalizado' && !criterioDataPersonalizada) return mostrarMensagem('Escolha a data de término do período personalizado.', true);
       const revendasAlvo = revendasSelecionadasPeloCriterio;
       if (revendasAlvo.length === 0) return mostrarMensagem('Nenhuma revenda encontrada com esses critérios.', true);
 
       const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === criterioMetrica);
       const criterioInfo = CRITERIOS_SELECAO_REVENDA.find(c => c.chave === criterioSelecao);
       const loteId = `lote_${Date.now()}`;
-      const prazo = calcularPrazoPorPeriodo(criterioPeriodo);
+      const prazo = calcularPrazoPorPeriodo(criterioPeriodo, criterioDataPersonalizada);
 
       setUploadProgresso('Criando planos de ação em lote...');
       try {
@@ -1776,13 +1899,17 @@ function App() {
               const valorInicial = obterValorAtualPlano(metricaInfo, rev, null, null).valor;
               return {
                   revenda_id: rev.id,
-                  metrica: criterioMetrica,
-                  valor_inicial: valorInicial,
-                  tipo_meta: criterioTipoMeta,
-                  variacao_percentual: criterioTipoMeta !== 'absoluto' ? Number(criterioValor) : null,
-                  valor_meta: calcularValorMetaFinal(criterioTipoMeta, valorInicial, criterioValor),
+                  metas: [{
+                      metrica: criterioMetrica,
+                      valor_inicial: valorInicial,
+                      tipo_meta: criterioTipoMeta,
+                      variacao_percentual: criterioTipoMeta !== 'absoluto' ? Number(criterioValor) : null,
+                      valor_meta: calcularValorMetaFinal(criterioTipoMeta, valorInicial, criterioValor)
+                  }],
                   periodo: criterioPeriodo,
                   prazo,
+                  periodo_followup: criterioPeriodoFollowup || null,
+                  proximo_followup: criterioPeriodoFollowup ? calcularProximoFollowup(criterioPeriodoFollowup) : null,
                   status: 'em_andamento',
                   criado_por: vendedor,
                   criado_em: Date.now(),
@@ -1891,23 +2018,26 @@ function App() {
         })).reverse(); // Coloca em ordem cronológica para facilitar a leitura da IA
 
         // NOVO: resume os Planos de Ação desta revenda (ativos, concluídos e cancelados) — inclui o
-        // progresso já calculado (mesma lógica do card, prioriza registro diário > ranking_metricas
-        // > campo espelhado) e o último comentário deixado pelo Farmer, pra a IA apontar no relatório
-        // o que está funcionando e o que está falhando, em vez de só olhar as médias mensais.
+        // progresso de CADA métrica do plano já calculado (mesma lógica do card, prioriza registro
+        // diário > ranking_metricas > campo espelhado) e o último comentário deixado pelo Farmer, pra
+        // a IA apontar no relatório o que está funcionando e o que está falhando, em vez de só olhar
+        // as médias mensais.
         const dadosPlanos = (planos || []).map(p => {
-            const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === p.metrica);
-            const progresso = calcularProgressoPlano(p, revenda, metricas);
+            const { progressos, todasAtingidas } = calcularProgressoMetasPlano(p, revenda, metricas);
             const registros = (p.andamento || []).slice().sort((a, b) => b.timestamp - a.timestamp);
             const ultimoRegistro = registros.find(r => r.observacao);
             const vencido = p.status === 'em_andamento' && p.prazo < Date.now();
             return {
-                metrica: metricaInfo?.label || p.metrica,
+                metricas: progressos.map(pr => ({
+                    metrica: pr.metricaInfo?.label || pr.metrica,
+                    valor_inicial: Number(pr.valor_inicial).toFixed(1),
+                    valor_atual: Number(pr.valorAtual).toFixed(1),
+                    valor_meta: Number(pr.valor_meta).toFixed(1),
+                    progresso_percentual: Math.round(pr.percentual),
+                    meta_atingida: pr.atingiu
+                })),
                 status: p.status === 'em_andamento' ? (vencido ? 'em andamento — PRAZO VENCIDO' : 'em andamento') : (p.status === 'concluido' ? 'concluído' : 'cancelado'),
-                valor_inicial: progresso ? Number(p.valor_inicial).toFixed(1) : p.valor_inicial,
-                valor_atual: progresso ? Number(progresso.valorAtual).toFixed(1) : null,
-                valor_meta: Number(p.valor_meta).toFixed(1),
-                progresso_percentual: progresso?.percentual !== undefined ? Math.round(progresso.percentual) : null,
-                meta_atingida: progresso?.atingiu || false,
+                todas_metas_atingidas: todasAtingidas,
                 prazo: new Date(p.prazo).toLocaleDateString('pt-BR'),
                 ultimo_comentario_farmer: ultimoRegistro?.observacao || null,
             };
@@ -2331,6 +2461,47 @@ function App() {
     const lineChartDataFarmers = Object.values(timelineDataFarmers).reverse();
     const canaisExistentesFarmers = Object.keys(canalCount);
 
+    // NOVO: contatos com revendas únicas x contatos repetidos na mesma revenda — a diferença entre
+    // o total de contatos e o número de revendas distintas contactadas é quanto foi "repetição"
+    // (2º, 3º... contato na mesma revenda dentro do período).
+    const revendasContactadasSet = new Set(historicoFarmers.map(h => h.id_lead));
+    const qtdeRevendasUnicasContactadas = revendasContactadasSet.size;
+    const qtdeContatosRepetidos = Math.max(totalComentarios - qtdeRevendasUnicasContactadas, 0);
+
+    // NOVO: revendas mais contactadas no período (top 8), com a quantidade de contatos de cada uma.
+    const contatosPorRevendaCount = {};
+    historicoFarmers.forEach(h => { contatosPorRevendaCount[h.id_lead] = (contatosPorRevendaCount[h.id_lead] || 0) + 1; });
+    const dataRevendasMaisContactadas = Object.keys(contatosPorRevendaCount)
+        .map(id => {
+            const rev = farmersPorId.get(id);
+            return { name: rev ? (rev.code || rev.CODE ? `[${rev.code || rev.CODE}] ` : '') + (rev.nome || rev.razao_social || 'Revenda') : 'Revenda removida', qtde: contatosPorRevendaCount[id] };
+        })
+        .sort((a, b) => b.qtde - a.qtde)
+        .slice(0, 8);
+
+    // NOVO: quantidade de contatos por motivo do comentário.
+    const motivoCount = {};
+    historicoFarmers.forEach(h => { const m = h.motivo || 'Sem motivo'; motivoCount[m] = (motivoCount[m] || 0) + 1; });
+    const dataMotivoFarmers = Object.keys(motivoCount).map(m => ({ name: m, qtde: motivoCount[m] })).sort((a, b) => b.qtde - a.qtde);
+
+    // NOVO: fluxo de trabalho futuro — quantos follow-ups (da revenda em geral + de planos de ação
+    // com cadência definida) vencem em cada um dos próximos 14 dias.
+    const planosAtivosEscopo = planosAcao.filter(p => p.status === 'em_andamento' && farmersPorId.has(p.revenda_id));
+    const hojeZero = new Date(); hojeZero.setHours(0, 0, 0, 0);
+    const dataFollowupFuturo = [];
+    for (let i = 0; i < 14; i++) {
+        const dia = new Date(hojeZero); dia.setDate(dia.getDate() + i);
+        const inicioDia = dia.getTime();
+        const fimDia = new Date(dia); fimDia.setHours(23, 59, 59, 999);
+        const fimDiaTs = fimDia.getTime();
+        const qtdeRevenda = baseFarmers.filter(f => f.proximo_contato && f.proximo_contato >= inicioDia && f.proximo_contato <= fimDiaTs).length;
+        const qtdePlano = planosAtivosEscopo.filter(p => p.proximo_followup && p.proximo_followup >= inicioDia && p.proximo_followup <= fimDiaTs).length;
+        dataFollowupFuturo.push({ name: dia.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }), Revenda: qtdeRevenda, Plano: qtdePlano });
+    }
+
+    // NOVO: total de planos de ação ativos dentro do escopo selecionado (carteira/farmer).
+    const qtdePlanosAtivos = planosAtivosEscopo.length;
+
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
          <button onClick={voltarVisao} className="mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit" style={{color: BRAND.gray}}>← Voltar</button>
@@ -2409,6 +2580,41 @@ function App() {
             </div>
          </div>
 
+         {/* NOVO: cards de contatos únicos x repetidos e planos de ação ativos */}
+         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 md:gap-6 mb-6">
+             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4" style={{borderLeftColor: BRAND.blue}}>
+                 <p className="text-xs font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>👥 Revendas Únicas Contactadas</p>
+                 <p className="text-4xl font-black" style={{color: BRAND.black}}>{qtdeRevendasUnicasContactadas}</p>
+             </div>
+             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4" style={{borderLeftColor: BRAND.yellow}}>
+                 <p className="text-xs font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>🔁 Contatos Repetidos (mesma revenda)</p>
+                 <p className="text-4xl font-black" style={{color: BRAND.black}}>{qtdeContatosRepetidos}</p>
+             </div>
+             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4" style={{borderLeftColor: BRAND.blueDark}}>
+                 <p className="text-xs font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>🎯 Planos de Ação Ativos</p>
+                 <p className="text-4xl font-black" style={{color: BRAND.black}}>{qtdePlanosAtivos}</p>
+             </div>
+         </div>
+
+         {/* NOVO: revendas mais contactadas e contatos por motivo do comentário */}
+         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Revendas Mais Contactadas</h3>
+               <div className="h-64 md:h-72">{dataRevendasMaisContactadas.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><BarChart data={dataRevendasMaisContactadas} layout="vertical" margin={{ left: 10, right: 30, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" hide /><YAxis dataKey="name" type="category" width={160} tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill={BRAND.blue} radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem contatos no período</div>}</div>
+            </div>
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Contatos por Motivo do Comentário</h3>
+               <div className="h-64 md:h-72">{dataMotivoFarmers.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><BarChart data={dataMotivoFarmers} layout="vertical" margin={{ left: 10, right: 30, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" hide /><YAxis dataKey="name" type="category" width={140} tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill={BRAND.yellow} radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem contatos no período</div>}</div>
+            </div>
+         </div>
+
+         {/* NOVO: fluxo de trabalho futuro — follow-ups (revenda + planos) que vencem nos próximos 14 dias */}
+         <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6">
+            <h3 className="text-base md:text-lg font-bold mb-1" style={{color: BRAND.black}}>Follow-ups Futuros (próximos 14 dias)</h3>
+            <p className="text-xs mb-6" style={{color: BRAND.gray}}>Retornos agendados nas revendas + follow-ups de cadência dos planos de ação — pra planejar o fluxo de trabalho dos próximos dias.</p>
+            <div className="h-56 md:h-64"><ResponsiveContainer width="100%" height="100%"><BarChart data={dataFollowupFuturo} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" /><XAxis dataKey="name" tick={{fontSize: 10, fill: BRAND.gray}} /><YAxis tick={{fontSize: 10, fill: BRAND.gray}} allowDecimals={false} /><Tooltip contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Legend wrapperStyle={{fontSize: '11px', fontWeight: 'bold'}} /><Bar dataKey="Revenda" stackId="followup" fill={BRAND.blue} radius={[0,0,0,0]} /><Bar dataKey="Plano" stackId="followup" fill={BRAND.yellow} radius={[4,4,0,0]} /></BarChart></ResponsiveContainer></div>
+         </div>
+
          <div className="p-6 md:p-8 rounded-2xl text-white shadow-xl flex flex-col md:flex-row justify-between items-start md:items-center gap-6" style={{backgroundColor: BRAND.black}}>
              <div className="w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Total de Pedidos (última apuração)</p><p className="text-3xl md:text-4xl font-black" style={{color: BRAND.yellow}}>{totalPedidos.toLocaleString('pt-BR')}</p></div>
              <div className="text-left md:text-right border-t md:border-t-0 md:border-l border-white/20 pt-6 md:pt-0 md:pl-8 w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Revendas na Carteira</p><p className="text-3xl md:text-4xl font-black text-white">{baseFarmers.length}</p></div>
@@ -2480,9 +2686,9 @@ function App() {
             )}
             {planosVisiveis.map(plano => {
                 const revenda = revendasPorId.get(plano.revenda_id);
-                const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === plano.metrica);
-                const progresso = calcularProgressoPlano(plano, revenda);
+                const { progressos, todasAtingidas } = calcularProgressoMetasPlano(plano, revenda);
                 const urgencia = getPlanoUrgencia(plano);
+                const urgenciaFollowup = getPlanoFollowupUrgencia(plano);
                 const periodoInfo = PERIODOS_PLANO.find(p => p.chave === plano.periodo);
                 return (
                     <div key={plano.id} className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-sm">
@@ -2492,39 +2698,49 @@ function App() {
                           </button>
                           <div className="flex items-center gap-2 flex-wrap">
                              {plano.lote_id && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-purple-50 text-purple-700 border-purple-200" title={plano.lote_criterio || ''}>📦 Lote</span>}
-                             {periodoInfo && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-600 border-slate-200">{periodoInfo.chave === 'diario' ? 'Diário' : periodoInfo.chave === 'semanal' ? 'Semanal' : 'Mensal'}</span>}
+                             {periodoInfo && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-600 border-slate-200">{periodoInfo.chave === 'diario' ? 'Diário' : periodoInfo.chave === 'semanal' ? 'Semanal' : periodoInfo.chave === 'quinzenal' ? 'Quinzenal' : periodoInfo.chave === 'personalizado' ? 'Personalizado' : 'Mensal'}</span>}
                              {plano.status === 'concluido' && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-emerald-100 text-emerald-700 border-emerald-200">✅ Concluído</span>}
                              {plano.status === 'cancelado' && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-500 border-slate-200">✕ Cancelado</span>}
                              {urgencia && <span className={`text-[10px] font-bold px-2 py-1 rounded-md border ${urgencia.css}`}>{urgencia.texto}</span>}
+                             {urgenciaFollowup && <span className={`text-[10px] font-bold px-2 py-1 rounded-md border ${urgenciaFollowup.css}`}>{urgenciaFollowup.texto}</span>}
                           </div>
                        </div>
-                       <p className="text-xs font-bold mb-2" style={{color: BRAND.gray}}>
-                          {metricaInfo?.label}
-                          {plano.tipo_meta && plano.tipo_meta !== 'absoluto' && (
-                             <span className="ml-1 font-medium">({plano.tipo_meta === 'reducao_percentual' ? 'reduzir' : 'aumentar'} {plano.variacao_percentual}%)</span>
-                          )}
-                       </p>
-                       <div className="flex justify-between text-xs font-bold mb-1.5" style={{color: BRAND.gray}}>
-                          <span>Início: {Number(plano.valor_inicial).toFixed(1)}{metricaInfo?.unidade}</span>
-                          <span style={{color: progresso?.atingiu ? '#059669' : BRAND.black}}>
-                             Atual: {Number(progresso?.valorAtual).toFixed(1)}{metricaInfo?.unidade}
-                             {progresso?.fonteValorAtual === 'diario' && <span title="Veio do registro diário mais recente"> 📝</span>}
-                          </span>
-                          <span>Meta: {Number(plano.valor_meta).toFixed(1)}{metricaInfo?.unidade}</span>
-                       </div>
-                       <div className="w-full h-2.5 rounded-full bg-slate-100 overflow-hidden mb-3">
-                          <div className={`h-full transition-all duration-700 ${progresso?.atingiu ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{width: `${progresso?.percentual || 0}%`}}></div>
+                       <div className="space-y-2.5">
+                           {progressos.map(p => (
+                               <div key={p.metrica}>
+                                   <p className="text-xs font-bold mb-1" style={{color: BRAND.gray}}>
+                                      {p.metricaInfo?.label}
+                                      {p.tipo_meta && p.tipo_meta !== 'absoluto' && (
+                                         <span className="ml-1 font-medium">({p.tipo_meta === 'reducao_percentual' ? 'reduzir' : p.tipo_meta === 'aumento_percentual' ? 'aumentar' : p.tipo_meta === 'aumento_pontos' ? 'aumentar' : 'reduzir'} {p.variacao_percentual}{(p.tipo_meta === 'aumento_pontos' || p.tipo_meta === 'reducao_pontos') ? ' pts' : '%'})</span>
+                                      )}
+                                   </p>
+                                   <div className="flex justify-between text-xs font-bold mb-1" style={{color: BRAND.gray}}>
+                                      <span>Início: {Number(p.valor_inicial).toFixed(1)}{p.metricaInfo?.unidade}</span>
+                                      <span style={{color: p.atingiu ? '#059669' : BRAND.black}}>
+                                         Atual: {Number(p.valorAtual).toFixed(1)}{p.metricaInfo?.unidade}
+                                         {p.fonteValorAtual === 'diario' && <span title="Veio do registro diário mais recente"> 📝</span>}
+                                      </span>
+                                      <span>Meta: {Number(p.valor_meta).toFixed(1)}{p.metricaInfo?.unidade}</span>
+                                   </div>
+                                   <div className="w-full h-2.5 rounded-full bg-slate-100 overflow-hidden">
+                                      <div className={`h-full transition-all duration-700 ${p.atingiu ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{width: `${p.percentual || 0}%`}}></div>
+                                   </div>
+                               </div>
+                           ))}
                        </div>
                        {plano.status === 'em_andamento' && (
-                           <div className="flex gap-2 flex-wrap">
+                           <div className="flex gap-2 flex-wrap mt-3">
                               <button onClick={() => concluirPlanoAcao(plano)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">✅ Concluir</button>
                               <button onClick={() => cancelarPlanoAcao(plano)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">✕ Cancelar</button>
+                              {plano.periodo_followup && (
+                                  <button onClick={() => registrarFollowupPlano(plano)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-600 hover:text-white transition-colors">📞 Registrar Follow-up</button>
+                              )}
                               {plano.lote_id && (
                                   <button onClick={() => cancelarLotePlanos(plano.lote_id)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-purple-50 text-purple-700 border border-purple-200 hover:bg-purple-600 hover:text-white transition-colors">📦 Cancelar Lote Inteiro</button>
                               )}
                            </div>
                        )}
-                       <PainelAndamentoPlano plano={plano} metricaInfo={metricaInfo} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
+                       <PainelAndamentoPlano plano={plano} metas={progressos} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
                     </div>
                 );
             })}
@@ -3081,7 +3297,7 @@ function App() {
                                          <span className="text-xl">🎯</span>
                                          <span className="text-xs md:text-sm font-black uppercase tracking-wider">Planos de Ação {planosAtivos.length > 0 && `(${planosAtivos.length} em andamento)`}</span>
                                      </div>
-                                     <button onClick={() => { setModalNovoPlano(rev); setNovoPlanoMetrica(METRICAS_PLANO_ACAO[0].chave); setNovoPlanoValorMeta(''); setNovoPlanoPeriodo('mensal'); }} className="text-xs font-bold px-3 py-2 rounded-xl text-white shadow-sm hover:opacity-90 transition-opacity shrink-0" style={{backgroundColor: BRAND.blue}}>
+                                     <button onClick={() => { setModalNovoPlano(rev); setNovoPlanoMetricas([METRICAS_PLANO_ACAO[0].chave]); setNovoPlanoValorMeta(''); setNovoPlanoPeriodo('mensal'); setNovoPlanoDataPersonalizada(''); setNovoPlanoPeriodoFollowup(''); }} className="text-xs font-bold px-3 py-2 rounded-xl text-white shadow-sm hover:opacity-90 transition-opacity shrink-0" style={{backgroundColor: BRAND.blue}}>
                                          + Criar Plano
                                      </button>
                                  </div>
@@ -3090,35 +3306,45 @@ function App() {
                                  ) : (
                                      <div className="space-y-4">
                                          {planosAtivos.map(planoAtivo => {
-                                             const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === planoAtivo.metrica);
-                                             const progresso = calcularProgressoPlano(planoAtivo, rev, metricasFarmerHistorico);
+                                             const { progressos, todasAtingidas } = calcularProgressoMetasPlano(planoAtivo, rev, metricasFarmerHistorico);
                                              const urgencia = getPlanoUrgencia(planoAtivo);
+                                             const urgenciaFollowup = getPlanoFollowupUrgencia(planoAtivo);
                                              return (
                                                  <div key={planoAtivo.id} className="bg-white p-3.5 rounded-xl border border-slate-200">
                                                      <div className="flex justify-between items-center mb-2 flex-wrap gap-2">
-                                                         <span className="text-sm font-bold" style={{color: BRAND.black}}>{metricaInfo?.label}</span>
+                                                         <span className="text-sm font-bold" style={{color: BRAND.black}}>{progressos.map(p => p.metricaInfo?.label).join(' + ')}</span>
                                                          <div className="flex items-center gap-1.5 flex-wrap">
                                                              {planoAtivo.lote_id && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-purple-50 text-purple-700 border-purple-200" title={planoAtivo.lote_criterio || ''}>📦 Lote</span>}
                                                              {urgencia && <span className={`text-[10px] font-bold px-2 py-1 rounded-md border ${urgencia.css}`}>{urgencia.texto}</span>}
+                                                             {urgenciaFollowup && <span className={`text-[10px] font-bold px-2 py-1 rounded-md border ${urgenciaFollowup.css}`}>{urgenciaFollowup.texto}</span>}
                                                          </div>
                                                      </div>
-                                                     <div className="flex justify-between text-xs font-bold mb-1.5" style={{color: BRAND.gray}}>
-                                                         <span>Início: {Number(planoAtivo.valor_inicial).toFixed(1)}{metricaInfo?.unidade}</span>
-                                                         <span style={{color: progresso?.atingiu ? '#059669' : BRAND.black}}>
-                                                             Atual: {Number(progresso?.valorAtual).toFixed(1)}{metricaInfo?.unidade}
-                                                             {progresso?.fonteValorAtual === 'diario' && <span title="Veio do registro diário mais recente"> 📝</span>}
-                                                         </span>
-                                                         <span>Meta: {Number(planoAtivo.valor_meta).toFixed(1)}{metricaInfo?.unidade}</span>
+                                                     <div className="space-y-2.5">
+                                                         {progressos.map(p => (
+                                                             <div key={p.metrica}>
+                                                                 <div className="flex justify-between text-xs font-bold mb-1" style={{color: BRAND.gray}}>
+                                                                     <span className="truncate">{p.metricaInfo?.label}</span>
+                                                                     <span style={{color: p.atingiu ? '#059669' : BRAND.black}}>
+                                                                         {Number(p.valor_inicial).toFixed(1)}{p.metricaInfo?.unidade} → {Number(p.valorAtual).toFixed(1)}{p.metricaInfo?.unidade}
+                                                                         {p.fonteValorAtual === 'diario' && <span title="Veio do registro diário mais recente"> 📝</span>}
+                                                                         {' '}(meta: {Number(p.valor_meta).toFixed(1)}{p.metricaInfo?.unidade})
+                                                                     </span>
+                                                                 </div>
+                                                                 <div className="w-full h-2.5 rounded-full bg-slate-100 border border-slate-200 overflow-hidden">
+                                                                     <div className={`h-full transition-all duration-700 ${p.atingiu ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{width: `${p.percentual || 0}%`}}></div>
+                                                                 </div>
+                                                             </div>
+                                                         ))}
                                                      </div>
-                                                     <div className="w-full h-3 rounded-full bg-slate-100 border border-slate-200 overflow-hidden">
-                                                         <div className={`h-full transition-all duration-700 ${progresso?.atingiu ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{width: `${progresso?.percentual || 0}%`}}></div>
-                                                     </div>
-                                                     {progresso?.atingiu && <p className="text-xs font-bold text-emerald-600 mt-2">🎉 Meta atingida! Marque como concluído quando quiser.</p>}
-                                                     <div className="flex gap-2 mt-3">
+                                                     {todasAtingidas && <p className="text-xs font-bold text-emerald-600 mt-2">🎉 {progressos.length > 1 ? 'Todas as metas atingidas!' : 'Meta atingida!'} Marque como concluído quando quiser.</p>}
+                                                     <div className="flex gap-2 mt-3 flex-wrap">
                                                          <button onClick={() => concluirPlanoAcao(planoAtivo)} className="flex-1 text-xs font-bold py-2 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">✅ Concluir</button>
                                                          <button onClick={() => cancelarPlanoAcao(planoAtivo)} className="flex-1 text-xs font-bold py-2 rounded-xl bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">✕ Cancelar</button>
+                                                         {planoAtivo.periodo_followup && (
+                                                             <button onClick={() => registrarFollowupPlano(planoAtivo)} className="flex-1 text-xs font-bold py-2 rounded-xl bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-600 hover:text-white transition-colors">📞 Registrar Follow-up</button>
+                                                         )}
                                                      </div>
-                                                     <PainelAndamentoPlano plano={planoAtivo} metricaInfo={metricaInfo} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
+                                                     <PainelAndamentoPlano plano={planoAtivo} metas={progressos} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
                                                  </div>
                                              );
                                          })}
@@ -3129,16 +3355,17 @@ function App() {
                                          <summary className="text-[11px] font-bold cursor-pointer select-none" style={{color: BRAND.gray}}>📜 Ver planos finalizados desta revenda ({planosFinalizados.length})</summary>
                                          <div className="space-y-2 mt-2">
                                              {planosFinalizados.map(p => {
-                                                 const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === p.metrica);
-                                                 const progresso = calcularProgressoPlano(p, rev, metricasFarmerHistorico);
+                                                 const { progressos, todasAtingidas } = calcularProgressoMetasPlano(p, rev, metricasFarmerHistorico);
                                                  return (
                                                      <div key={p.id} className="bg-white p-3 rounded-xl border border-slate-200 text-xs">
                                                          <div className="flex justify-between items-center flex-wrap gap-1.5">
-                                                             <span className="font-bold" style={{color: BRAND.black}}>{metricaInfo?.label}</span>
-                                                             {p.status === 'concluido' ? <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-emerald-100 text-emerald-700 border-emerald-200">✅ Concluído {progresso?.atingiu ? '(meta batida)' : '(encerrado sem bater a meta)'}</span> : <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-500 border-slate-200">✕ Cancelado</span>}
+                                                             <span className="font-bold" style={{color: BRAND.black}}>{progressos.map(pr => pr.metricaInfo?.label).join(' + ')}</span>
+                                                             {p.status === 'concluido' ? <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-emerald-100 text-emerald-700 border-emerald-200">✅ Concluído {todasAtingidas ? '(meta batida)' : '(encerrado sem bater a meta)'}</span> : <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-500 border-slate-200">✕ Cancelado</span>}
                                                          </div>
-                                                         <p className="mt-1 font-medium" style={{color: BRAND.gray}}>Início: {Number(p.valor_inicial).toFixed(1)}{metricaInfo?.unidade} → Meta: {Number(p.valor_meta).toFixed(1)}{metricaInfo?.unidade} · Encerrado em {progresso ? Number(progresso.valorAtual).toFixed(1) + (metricaInfo?.unidade || '') : '—'}</p>
-                                                         <PainelAndamentoPlano plano={p} metricaInfo={metricaInfo} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
+                                                         {progressos.map(pr => (
+                                                             <p key={pr.metrica} className="mt-1 font-medium" style={{color: BRAND.gray}}>{pr.metricaInfo?.label}: Início: {Number(pr.valor_inicial).toFixed(1)}{pr.metricaInfo?.unidade} → Meta: {Number(pr.valor_meta).toFixed(1)}{pr.metricaInfo?.unidade} · Encerrado em {Number(pr.valorAtual).toFixed(1)}{pr.metricaInfo?.unidade}</p>
+                                                         ))}
+                                                         <PainelAndamentoPlano plano={p} metas={progressos} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
                                                      </div>
                                                  );
                                              })}
@@ -3349,8 +3576,13 @@ function App() {
 
                 {farmerVisualizacao === 'kanban' ? (
                 <div className="flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 gap-4 md:gap-6 flex items-start">
-                  {['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume'].map(nivel => {
-                    const leadsNivel = carteiraFarmersExibida.filter(l => (l.ranking_level || 'Sem volume') === nivel).sort(compararFarmers);
+                  {['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume', 'Descredenciados'].map(nivel => {
+                    // NOVO: "Descredenciados" é uma coluna por STATUS (não por ranking) — junta tudo que
+                    // está com status Descredenciada, seja qual for o ranking_level. As demais colunas de
+                    // ranking excluem essas revendas, pra não aparecerem duplicadas em duas colunas.
+                    const leadsNivel = nivel === 'Descredenciados'
+                        ? carteiraFarmersExibida.filter(l => getFarmerStatus(l).key === 'descredenciada').sort(compararFarmers)
+                        : carteiraFarmersExibida.filter(l => (l.ranking_level || 'Sem volume') === nivel && getFarmerStatus(l).key !== 'descredenciada').sort(compararFarmers);
                     
                     let borderColor = 'border-slate-200/60'; let headerColor = 'bg-slate-200/80'; let icon = '⚪';
                     if(nivel === 'Diamante') { borderColor = 'border-cyan-200'; headerColor = 'bg-cyan-100/80 text-cyan-800'; icon = '💎'; }
@@ -3358,6 +3590,7 @@ function App() {
                     if(nivel === 'Prata') { borderColor = 'border-slate-300'; headerColor = 'bg-slate-200 text-slate-700'; icon = '🥈'; }
                     if(nivel === 'Bronze') { borderColor = 'border-orange-200'; headerColor = 'bg-orange-100 text-orange-800'; icon = '🥉'; }
                     if(nivel === 'Desclassificado') { borderColor = 'border-red-200'; headerColor = 'bg-red-100 text-red-800'; icon = '🚨'; }
+                    if(nivel === 'Descredenciados') { borderColor = 'border-rose-300'; headerColor = 'bg-rose-100 text-rose-800'; icon = '🔴'; }
 
                     return (
                       <div key={nivel} className={`w-[85vw] sm:w-[320px] md:w-[340px] shrink-0 flex flex-col bg-slate-200/40 rounded-[20px] border-2 max-h-full overflow-hidden ${borderColor}`}>
@@ -3480,6 +3713,16 @@ function App() {
                                   <div className="flex items-center gap-1">
                                      <span className="text-[9px] font-bold text-slate-400 uppercase">Score:</span>
                                      <span className={`text-xs font-black ${scoreAtual>=50?'text-emerald-600':'text-red-500'}`}>{scoreAtual}</span>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                     <span className="text-[9px] font-bold text-slate-400 uppercase">Ranking:</span>
+                                     <span className="text-xs font-black" style={{color: BRAND.black}}>
+                                        {(() => {
+                                            const nivel = rev.ranking_level || 'Sem volume';
+                                            const icones = { 'Diamante': '💎', 'Ouro': '🥇', 'Prata': '🥈', 'Bronze': '🥉', 'Desclassificado': '🚨', 'Sem volume': '⚪' };
+                                            return `${icones[nivel] || '⚪'} ${nivel}`;
+                                        })()}
+                                     </span>
                                   </div>
                                   <div className="flex items-center gap-1">
                                      <span className="text-[9px] font-bold text-slate-400 uppercase">Pedidos:</span>
@@ -3979,12 +4222,14 @@ function App() {
                     <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioTipoMeta} onChange={e => setCriterioTipoMeta(e.target.value)}>
                       <option value="reducao_percentual">Reduzir %</option>
                       <option value="aumento_percentual">Aumentar %</option>
+                      <option value="aumento_pontos">Aumentar pontos</option>
+                      <option value="reducao_pontos">Reduzir pontos</option>
                       <option value="absoluto">Valor absoluto</option>
                     </select>
                   </div>
                   <div>
                     <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">
-                      {criterioTipoMeta === 'absoluto' ? 'Meta' : '%'}
+                      {criterioTipoMeta === 'absoluto' ? 'Meta' : (criterioTipoMeta === 'aumento_pontos' || criterioTipoMeta === 'reducao_pontos') ? 'Pontos' : '%'}
                     </label>
                     <input type="number" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioValor} onChange={e => setCriterioValor(e.target.value)} placeholder={criterioTipoMeta === 'absoluto' ? 'Ex: 80' : 'Ex: 10'} />
                   </div>
@@ -3993,6 +4238,16 @@ function App() {
                   <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Período</label>
                   <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioPeriodo} onChange={e => setCriterioPeriodo(e.target.value)}>
                     {PERIODOS_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label}</option>)}
+                  </select>
+                  {criterioPeriodo === 'personalizado' && (
+                    <input type="date" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none mt-2" style={{color: BRAND.black}} value={criterioDataPersonalizada} onChange={e => setCriterioDataPersonalizada(e.target.value)} />
+                  )}
+                </div>
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Follow-up com o revendedor (opcional)</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioPeriodoFollowup} onChange={e => setCriterioPeriodoFollowup(e.target.value)}>
+                    <option value="">Sem follow-up recorrente</option>
+                    {PERIODOS_FOLLOWUP_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label.replace(/\s*\(.*\)/, '')}</option>)}
                   </select>
                 </div>
 
@@ -4022,56 +4277,89 @@ function App() {
 
       {modalNovoPlano && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
-          <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl border-t-8" style={{borderTopColor: BRAND.blue}}>
-            <h3 className="text-xl md:text-2xl font-black mb-2" style={{color: BRAND.black}}>🎯 Criar Plano de Ação</h3>
-            <p className="text-sm mb-6 truncate font-medium" style={{color: BRAND.gray}}>{modalNovoPlano.nome || modalNovoPlano.razao_social || 'Revenda'}</p>
+          <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl border-t-8 flex flex-col max-h-[90vh]" style={{borderTopColor: BRAND.blue}}>
+            <div className="p-6 md:p-8 overflow-y-auto">
+              <h3 className="text-xl md:text-2xl font-black mb-2" style={{color: BRAND.black}}>🎯 Criar Plano de Ação</h3>
+              <p className="text-sm mb-6 truncate font-medium" style={{color: BRAND.gray}}>{modalNovoPlano.nome || modalNovoPlano.razao_social || 'Revenda'}</p>
 
-            <div className="space-y-4 mb-6">
-              <div>
-                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Métrica a melhorar</label>
-                <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoMetrica} onChange={e => setNovoPlanoMetrica(e.target.value)}>
-                  {METRICAS_PLANO_ACAO.map(m => <option key={m.chave} value={m.chave}>{m.label}</option>)}
-                </select>
-              </div>
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-100">
-                <p className="text-[10px] md:text-xs font-black uppercase tracking-wider text-slate-500 mb-1">Valor Atual</p>
-                <p className="text-lg font-black" style={{color: BRAND.black}}>
-                  {(() => {
-                      const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === novoPlanoMetrica);
+              <div className="space-y-4 mb-6">
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Métricas a melhorar</label>
+                  <div className="border-2 border-slate-200 rounded-xl p-3 space-y-1.5">
+                    <label className="flex items-center gap-2 pb-1.5 border-b border-slate-100 cursor-pointer">
+                      <input type="checkbox" checked={novoPlanoMetricas.length === METRICAS_PLANO_ACAO.length} onChange={e => setNovoPlanoMetricas(e.target.checked ? METRICAS_PLANO_ACAO.map(m => m.chave) : [])} />
+                      <span className="text-sm font-black" style={{color: BRAND.black}}>Todas as métricas</span>
+                    </label>
+                    {METRICAS_PLANO_ACAO.map(m => (
+                      <label key={m.chave} className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={novoPlanoMetricas.includes(m.chave)} onChange={e => setNovoPlanoMetricas(prev => e.target.checked ? [...prev, m.chave] : prev.filter(c => c !== m.chave))} />
+                        <span className="text-sm font-medium" style={{color: BRAND.black}}>{m.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 space-y-1.5">
+                  <p className="text-[10px] md:text-xs font-black uppercase tracking-wider text-slate-500 mb-1">Valor Atual</p>
+                  {novoPlanoMetricas.length === 0 && <p className="text-xs font-medium" style={{color: BRAND.gray}}>Selecione ao menos uma métrica.</p>}
+                  {novoPlanoMetricas.map(chave => {
+                      const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === chave);
                       const { valor, fonte } = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null);
-                      return <>{valor.toFixed(1)}{metricaInfo?.unidade}{fonte === 'espelhado' && <span className="text-[9px] font-medium ml-1 normal-case" style={{color: BRAND.gray}}>(última apuração espelhada — pode estar desatualizada)</span>}</>;
-                  })()}
-                </p>
-              </div>
-              <div>
-                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Tipo de Meta</label>
-                <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoTipoMeta} onChange={e => setNovoPlanoTipoMeta(e.target.value)}>
-                  <option value="reducao_percentual">Redução percentual (%)</option>
-                  <option value="aumento_percentual">Aumento percentual (%)</option>
-                  <option value="absoluto">Valor absoluto</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">
-                  {novoPlanoTipoMeta === 'absoluto' ? 'Meta a Atingir' : `${novoPlanoTipoMeta === 'reducao_percentual' ? 'Reduzir em' : 'Aumentar em'} (%)`}
-                </label>
-                <input type="number" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoValorMeta} onChange={e => setNovoPlanoValorMeta(e.target.value)} placeholder={novoPlanoTipoMeta === 'absoluto' ? 'Ex: 80' : 'Ex: 10'} />
-                {novoPlanoValorMeta && novoPlanoTipoMeta !== 'absoluto' && (() => {
-                    const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === novoPlanoMetrica);
-                    const valorInicial = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null).valor;
-                    const valorCalculado = calcularValorMetaFinal(novoPlanoTipoMeta, valorInicial, novoPlanoValorMeta);
-                    return <p className="text-xs font-bold mt-2" style={{color: BRAND.blue}}>Meta calculada: {valorCalculado.toFixed(1)}{metricaInfo?.unidade}</p>;
-                })()}
-              </div>
-              <div>
-                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Período</label>
-                <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoPeriodo} onChange={e => setNovoPlanoPeriodo(e.target.value)}>
-                  {PERIODOS_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label}</option>)}
-                </select>
+                      return (
+                          <p key={chave} className="text-sm font-black" style={{color: BRAND.black}}>
+                              {metricaInfo?.label}: {valor.toFixed(1)}{metricaInfo?.unidade}
+                              {fonte === 'espelhado' && <span className="text-[9px] font-medium ml-1 normal-case" style={{color: BRAND.gray}}>(última apuração espelhada)</span>}
+                          </p>
+                      );
+                  })}
+                </div>
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Tipo de Meta</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoTipoMeta} onChange={e => setNovoPlanoTipoMeta(e.target.value)}>
+                    <option value="reducao_percentual">Redução percentual (%)</option>
+                    <option value="aumento_percentual">Aumento percentual (%)</option>
+                    <option value="aumento_pontos">Aumento em pontos absolutos</option>
+                    <option value="reducao_pontos">Redução em pontos absolutos</option>
+                    {novoPlanoMetricas.length <= 1 && <option value="absoluto">Valor absoluto (meta exata)</option>}
+                  </select>
+                  {novoPlanoMetricas.length > 1 && <p className="text-[10px] font-medium mt-1" style={{color: BRAND.gray}}>Com mais de uma métrica selecionada, a variação escolhida se aplica a todas, cada uma a partir do seu próprio valor atual.</p>}
+                </div>
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">
+                    {novoPlanoTipoMeta === 'absoluto' ? 'Meta a Atingir' : novoPlanoTipoMeta === 'reducao_percentual' ? 'Reduzir em (%)' : novoPlanoTipoMeta === 'aumento_percentual' ? 'Aumentar em (%)' : novoPlanoTipoMeta === 'aumento_pontos' ? 'Aumentar em (pontos)' : 'Reduzir em (pontos)'}
+                  </label>
+                  <input type="number" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoValorMeta} onChange={e => setNovoPlanoValorMeta(e.target.value)} placeholder={novoPlanoTipoMeta === 'absoluto' ? 'Ex: 80' : 'Ex: 10'} />
+                  {novoPlanoValorMeta && novoPlanoTipoMeta !== 'absoluto' && (
+                    <div className="mt-2 space-y-0.5">
+                      {novoPlanoMetricas.map(chave => {
+                          const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === chave);
+                          const valorInicial = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null).valor;
+                          const valorCalculado = calcularValorMetaFinal(novoPlanoTipoMeta, valorInicial, novoPlanoValorMeta);
+                          return <p key={chave} className="text-xs font-bold" style={{color: BRAND.blue}}>{metricaInfo?.label} — meta calculada: {valorCalculado.toFixed(1)}{metricaInfo?.unidade}</p>;
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Período</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoPeriodo} onChange={e => setNovoPlanoPeriodo(e.target.value)}>
+                    {PERIODOS_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label}</option>)}
+                  </select>
+                  {novoPlanoPeriodo === 'personalizado' && (
+                    <input type="date" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none mt-2" style={{color: BRAND.black}} value={novoPlanoDataPersonalizada} onChange={e => setNovoPlanoDataPersonalizada(e.target.value)} />
+                  )}
+                </div>
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Follow-up com o revendedor (opcional)</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoPeriodoFollowup} onChange={e => setNovoPlanoPeriodoFollowup(e.target.value)}>
+                    <option value="">Sem follow-up recorrente</option>
+                    {PERIODOS_FOLLOWUP_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label.replace(/\s*\(.*\)/, '')}</option>)}
+                  </select>
+                  <p className="text-[10px] font-medium mt-1" style={{color: BRAND.gray}}>Define de quanto em quanto tempo você deve entrar em contato com o revendedor pra cobrar esse plano — gera alertas separados.</p>
+                </div>
               </div>
             </div>
 
-            <div className="flex gap-3">
+            <div className="flex gap-3 p-6 md:p-8 pt-0 shrink-0">
               <button onClick={() => setModalNovoPlano(null)} className="flex-1 px-4 py-3 bg-slate-100 font-bold rounded-xl hover:bg-slate-200 text-sm" style={{color: BRAND.gray}}>Cancelar</button>
               <button onClick={salvarNovoPlanoAcao} className="flex-1 px-4 py-3 text-white font-bold rounded-xl shadow-md text-sm hover:opacity-90" style={{backgroundColor: BRAND.blue}}>Criar Plano</button>
             </div>
