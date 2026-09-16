@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, CartesianGrid, Legend, LabelList } from 'recharts';
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc, getDocs, query, where } from "firebase/firestore";
+import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatch, setDoc, deleteDoc, getDocs, query, where, arrayUnion } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -109,6 +109,126 @@ const getFarmerUrgency = (revenda) => {
     if (new Date(revenda.proximo_contato).toDateString() === new Date().toDateString()) return { texto: '📅 Retorno Hoje', css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold' };
     return { texto: `📅 Agendado: ${new Date(revenda.proximo_contato).toLocaleDateString('pt-BR')}`, css: 'bg-[#2D6FEF]/10 text-[#2D6FEF] border-[#2D6FEF]/30' };
 };
+
+// NOVO: catálogo de métricas usadas nos Planos de Ação. Cada uma lê o valor ATUAL direto do
+// documento da revenda (campos "metrica_*" espelhados durante o import de métricas — ver
+// lidarUploadMetricsJSON), sem precisar de nenhuma leitura extra por revenda. Isso é o que permite
+// mostrar o progresso de dezenas/centenas de planos ao mesmo tempo no painel geral.
+const METRICAS_PLANO_ACAO = [
+    { chave: 'on_time_delivery_percentage', label: '% Entregues no Prazo', unidade: '%', melhorQuandoMaior: true,
+      obterValorAtual: (rev) => Number(rev?.metrica_on_time_delivery_percentage ?? 0),
+      // Lê o mesmo campo, mas direto de um documento de ranking_metricas (histórico já carregado na
+      // tela da revenda) em vez do campo espelhado na carteira_ativa — ver obterValorAtualPlano.
+      obterValorDoHistorico: (m) => { const v = m?.metrics?.on_time_delivery_percentage ?? m?.metrics?.acceptance_rate_percentage; return (v === undefined || v === null) ? null : Number(v); } },
+    { chave: 'average_delivery_time', label: 'Tempo Médio de Entrega', unidade: ' min', melhorQuandoMaior: false,
+      obterValorAtual: (rev) => Number(rev?.metrica_average_delivery_time ?? 0),
+      obterValorDoHistorico: (m) => { const v = m?.metrics?.average_delivery_time ?? m?.metrics?.average_acceptance_time; return (v === undefined || v === null) ? null : Number(v); } },
+    { chave: 'success_rate_percentage', label: 'Taxa de Sucesso', unidade: '%', melhorQuandoMaior: true,
+      obterValorAtual: (rev) => Number(rev?.metrica_success_rate_percentage ?? 0),
+      obterValorDoHistorico: (m) => { const v = m?.metrics?.success_rate_percentage ?? m?.metrics?.success_rate; return (v === undefined || v === null) ? null : Number(v); } },
+    { chave: 'taxa_cancelamento', label: 'Taxa de Cancelamento', unidade: '%', melhorQuandoMaior: false,
+      obterValorAtual: (rev) => Number(rev?.metrica_taxa_cancelamento ?? 0),
+      // Não existe um campo "taxa_cancelamento" pronto dentro de ranking_metricas — recalcula com a
+      // MESMA fórmula usada no import (ver lidarUploadMetricsJSON) pra bater com o valor espelhado.
+      obterValorDoHistorico: (m) => {
+          const totalOrders = Number(m?.total_orders) || 0;
+          if (totalOrders <= 0) return null;
+          const volumetry = Number(m?.metrics?.volumetry) || 0;
+          return Math.max(((totalOrders - volumetry) / totalOrders) * 100, 0);
+      } },
+    { chave: 'total_orders', label: 'Volume de Pedidos', unidade: '', melhorQuandoMaior: true,
+      obterValorAtual: (rev) => Number(rev?.total_orders ?? 0),
+      obterValorDoHistorico: (m) => (m?.total_orders === undefined || m?.total_orders === null) ? null : Number(m.total_orders) },
+];
+
+// CORREÇÃO (Bug 1 — "Valor Atual em 0%" / "Meta calculada: 0.0%"): resolve o valor atual de uma
+// métrica com prioridade em 3 camadas:
+//   1) o registro diário mais recente feito pelo farmer dentro do PRÓPRIO plano (plano.andamento),
+//      mas só vale enquanto for mais novo que a última apuração oficial de métricas — depois disso
+//      a apuração oficial volta a valer, como pedido.
+//   2) o histórico de ranking_metricas já carregado na tela da revenda (metricasFarmerHistorico) —
+//      fonte mais fresca que o campo espelhado, que só é atualizado no próximo import em lote.
+//   3) o campo espelhado na carteira_ativa (metrica_*) — usado no painel geral de Planos de Ação,
+//      onde carregar o histórico de cada revenda custaria uma leitura extra por card.
+const obterValorAtualPlano = (metricaInfo, revenda, historico, plano) => {
+    const registros = (plano?.andamento || []).filter(a => a.valor !== null && a.valor !== undefined);
+    if (registros.length > 0) {
+        const ultimoRegistro = registros[registros.length - 1];
+        const dataApuracaoOficial = revenda?.ultima_atualizacao_metricas ? new Date(revenda.ultima_atualizacao_metricas).getTime() : 0;
+        if (ultimoRegistro.timestamp >= dataApuracaoOficial) {
+            return { valor: Number(ultimoRegistro.valor), fonte: 'diario', dataFonte: ultimoRegistro.timestamp };
+        }
+    }
+    const docRecente = Array.isArray(historico) ? historico[0] : null;
+    if (docRecente && metricaInfo?.obterValorDoHistorico) {
+        const valorHistorico = metricaInfo.obterValorDoHistorico(docRecente);
+        if (valorHistorico !== null && valorHistorico !== undefined) {
+            return { valor: valorHistorico, fonte: 'ranking_metricas', dataFonte: docRecente.created_at || null };
+        }
+    }
+    return { valor: Number(metricaInfo?.obterValorAtual(revenda) ?? 0), fonte: 'espelhado', dataFonte: revenda?.ultima_atualizacao_metricas || null };
+};
+
+// Calcula o progresso de um plano de ação (0-100%) comparando valor inicial -> atual -> meta,
+// respeitando se a métrica é "melhor quando maior" ou "melhor quando menor". `historico` (opcional)
+// é o array de ranking_metricas já carregado da revenda (metricasFarmerHistorico) — quando não vem,
+// o cálculo cai direto pro registro diário (se houver) ou pro campo espelhado.
+const calcularProgressoPlano = (plano, revenda, historico) => {
+    const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === plano.metrica);
+    if (!metricaInfo) return null;
+    const { valor: valorAtual, fonte: fonteValorAtual, dataFonte } = obterValorAtualPlano(metricaInfo, revenda, historico, plano);
+    const distanciaTotal = metricaInfo.melhorQuandoMaior ? (plano.valor_meta - plano.valor_inicial) : (plano.valor_inicial - plano.valor_meta);
+    const distanciaPercorrida = metricaInfo.melhorQuandoMaior ? (valorAtual - plano.valor_inicial) : (plano.valor_inicial - valorAtual);
+    let percentual = distanciaTotal !== 0 ? (distanciaPercorrida / distanciaTotal) * 100 : 100;
+    percentual = Math.max(0, Math.min(100, percentual));
+    const atingiu = metricaInfo.melhorQuandoMaior ? valorAtual >= plano.valor_meta : valorAtual <= plano.valor_meta;
+    return { valorAtual, percentual, atingiu, metricaInfo, fonteValorAtual, dataFonte };
+};
+
+// Sinalização de prazo do plano de ação — mesmo padrão visual dos outros indicadores de urgência do app.
+const getPlanoUrgencia = (plano) => {
+    if (plano.status !== 'em_andamento') return null;
+    const now = Date.now();
+    if (plano.prazo - now < 0) return { texto: '🚨 Prazo Vencido', css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse' };
+    const diasRestantes = Math.ceil((plano.prazo - now) / (1000 * 60 * 60 * 24));
+    if (diasRestantes <= 3) return { texto: `⏰ Vence em ${diasRestantes}d`, css: 'bg-orange-100 text-orange-700 border-orange-400 font-bold' };
+    return { texto: `📅 Prazo: ${new Date(plano.prazo).toLocaleDateString('pt-BR')}`, css: 'bg-blue-50 text-blue-600 border-blue-200' };
+};
+
+// NOVO: rótulos e cálculo automático de prazo por período — Diário/Semanal/Mensal — usado tanto na
+// criação de um plano individual quanto na criação em lote por critério.
+const PERIODOS_PLANO = [
+    { chave: 'diario', label: 'Diário (vence amanhã)' },
+    { chave: 'semanal', label: 'Semanal (vence em 7 dias)' },
+    { chave: 'mensal', label: 'Mensal (vence em 30 dias)' },
+];
+const calcularPrazoPorPeriodo = (periodo) => {
+    const data = new Date();
+    if (periodo === 'diario') data.setDate(data.getDate() + 1);
+    else if (periodo === 'semanal') data.setDate(data.getDate() + 7);
+    else data.setDate(data.getDate() + 30); // mensal (padrão)
+    data.setHours(23, 59, 59, 999);
+    return data.getTime();
+};
+
+// NOVO: calcula o valor absoluto da meta a partir do tipo escolhido — valor digitado direto
+// ("absoluto"), ou uma redução/aumento percentual relativo ao valor inicial da revenda naquele
+// momento (ex: taxa de cancelamento em 20% + "reduzir 10%" -> meta vira 18%, ou seja, 20 * 0.9).
+const calcularValorMetaFinal = (tipoMeta, valorInicial, valorInformado) => {
+    const num = Number(valorInformado) || 0;
+    if (tipoMeta === 'reducao_percentual') return valorInicial * (1 - num / 100);
+    if (tipoMeta === 'aumento_percentual') return valorInicial * (1 + num / 100);
+    return num; // absoluto
+};
+
+// NOVO: critérios de seleção de revendas para a criação de planos em lote — cada um define como
+// ordenar a carteira/farmer escolhido antes de cortar as N primeiras (Top N).
+const CRITERIOS_SELECAO_REVENDA = [
+    { chave: 'top_pedidos', label: 'Top N por volume de pedidos (mais vendem)', ordenar: (a, b) => (Number(b.total_orders) || 0) - (Number(a.total_orders) || 0) },
+    { chave: 'top_cancelamento', label: 'Top N por maior taxa de cancelamento (mais ofensoras)', ordenar: (a, b) => (Number(b.metrica_taxa_cancelamento) || 0) - (Number(a.metrica_taxa_cancelamento) || 0) },
+    { chave: 'top_pior_score', label: 'Top N por menor score (piores no ranking)', ordenar: (a, b) => (Number(a.total_score) || 0) - (Number(b.total_score) || 0) },
+    { chave: 'todas', label: 'Todas as revendas do escopo selecionado (sem corte)', ordenar: null },
+];
 
 const getNextBusinessDay = (date = new Date()) => {
   let nextDay = new Date(date);
@@ -359,6 +479,77 @@ const PainelInteracao = ({ alvo, vendedor, onHistoricoSalvo, mostrarMensagem, is
     );
 };
 
+// NOVO: painel de acompanhamento diário + comentários de um Plano de Ação — reaproveitado tanto na
+// listagem geral (Admin/Farmer, em "🎯 Planos de Ação") quanto dentro do card de uma revenda
+// específica. Cada registro pode trazer um valor (o "termômetro" do dia, que passa a valer como
+// Atual do progresso até a próxima apuração oficial substituir — ver obterValorAtualPlano) e/ou só
+// um comentário livre (sem valor), pra permitir registrar contexto sem precisar de um número.
+const PainelAndamentoPlano = ({ plano, metricaInfo, vendedor, mostrarMensagem, onAtualizado }) => {
+    const [valorDia, setValorDia] = useState('');
+    const [comentarioDia, setComentarioDia] = useState('');
+    const [salvando, setSalvando] = useState(false);
+    const [mostrarHistorico, setMostrarHistorico] = useState(false);
+
+    const andamento = plano.andamento || [];
+    const registrosOrdenados = andamento.slice().sort((a, b) => b.timestamp - a.timestamp);
+
+    const salvarAndamento = async () => {
+        if (!valorDia.trim() && !comentarioDia.trim()) return mostrarMensagem('Preencha um valor e/ou um comentário.', true);
+        setSalvando(true);
+        const novoRegistro = {
+            tipo: valorDia.trim() ? 'registro' : 'comentario',
+            valor: valorDia.trim() ? Number(valorDia) : null,
+            observacao: comentarioDia.trim(),
+            autor: vendedor,
+            timestamp: Date.now(),
+        };
+        try {
+            await updateDoc(doc(db, "planos_acao", plano.id), { andamento: arrayUnion(novoRegistro) });
+            onAtualizado(plano.id, [...andamento, novoRegistro]);
+            setValorDia(''); setComentarioDia('');
+            mostrarMensagem('Andamento registrado!');
+        } catch (e) {
+            mostrarMensagem('Erro ao registrar andamento.', true);
+        } finally {
+            setSalvando(false);
+        }
+    };
+
+    return (
+        <div className="mt-3 pt-3 border-t border-slate-200">
+            <p className="text-[10px] font-black uppercase tracking-wider mb-2" style={{color: BRAND.gray}}>📝 Acompanhamento Diário</p>
+            <div className="flex flex-col sm:flex-row gap-2 mb-2">
+                <input type="number" placeholder={`Valor hoje${metricaInfo?.unidade ? ` (${metricaInfo.unidade.trim()})` : ''}`} className="w-full sm:w-36 bg-white border-2 border-slate-200 p-2.5 rounded-xl text-xs font-bold outline-none" value={valorDia} onChange={e => setValorDia(e.target.value)} />
+                <input type="text" placeholder="Comentário (opcional)" className="flex-1 bg-white border-2 border-slate-200 p-2.5 rounded-xl text-xs font-medium outline-none" value={comentarioDia} onChange={e => setComentarioDia(e.target.value)} />
+                <button onClick={salvarAndamento} disabled={salvando} className="text-xs font-bold px-4 py-2.5 rounded-xl text-white shadow-sm hover:opacity-90 transition-opacity disabled:opacity-50 shrink-0" style={{backgroundColor: BRAND.blueDark}}>
+                    {salvando ? '...' : '💬 Registrar'}
+                </button>
+            </div>
+            {registrosOrdenados.length > 0 && (
+                <button onClick={() => setMostrarHistorico(!mostrarHistorico)} className="text-[11px] font-bold hover:underline" style={{color: BRAND.blue}}>
+                    {mostrarHistorico ? '▲ Ocultar' : '▼ Ver'} histórico ({registrosOrdenados.length})
+                </button>
+            )}
+            {mostrarHistorico && (
+                <div className="mt-2 space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                    {registrosOrdenados.map((r, idx) => (
+                        <div key={idx} className="bg-white p-2 rounded-lg border border-slate-100 text-[11px]">
+                            <div className="flex justify-between items-center gap-2">
+                                <span className="font-black" style={{color: BRAND.black}}>
+                                    {r.tipo === 'registro' ? `📊 ${r.valor}${metricaInfo?.unidade || ''}` : '💬 Comentário'}
+                                </span>
+                                <span className="font-medium shrink-0" style={{color: BRAND.gray}}>{new Date(r.timestamp).toLocaleString('pt-BR', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'})}</span>
+                            </div>
+                            {r.observacao && <p className="mt-0.5 font-medium" style={{color: BRAND.gray}}>{r.observacao}</p>}
+                            <p className="mt-0.5 text-[10px] font-bold" style={{color: BRAND.gray}}>— {r.autor}</p>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
 function App() {
   const [vendedor, setVendedor] = useState('');
   const [senha, setSenha] = useState(''); 
@@ -368,6 +559,27 @@ function App() {
 
   const [leads, setLeads] = useState([]);
   const [carteiraFarmers, setCarteiraFarmers] = useState([]);
+  // NOVO: Planos de Ação (metas quantitativas por revenda, ligadas às métricas já rastreadas)
+  const [planosAcao, setPlanosAcao] = useState([]);
+  const [planosAcaoCarregados, setPlanosAcaoCarregados] = useState(false);
+  const [modalNovoPlano, setModalNovoPlano] = useState(null);
+  const [novoPlanoMetrica, setNovoPlanoMetrica] = useState(METRICAS_PLANO_ACAO[0].chave);
+  const [novoPlanoTipoMeta, setNovoPlanoTipoMeta] = useState('reducao_percentual');
+  const [novoPlanoValorMeta, setNovoPlanoValorMeta] = useState('');
+  const [novoPlanoPeriodo, setNovoPlanoPeriodo] = useState('mensal');
+  const [filtroPlanoStatus, setFiltroPlanoStatus] = useState('em_andamento');
+  const [filtroPlanoCarteiraDash, setFiltroPlanoCarteiraDash] = useState('todas');
+  const [filtroPlanoVendedorDash, setFiltroPlanoVendedorDash] = useState('todos');
+  // NOVO: criação de planos em lote por critério (ex: Top 10 revendas que mais vendem)
+  const [modalPlanoCriterio, setModalPlanoCriterio] = useState(false);
+  const [criterioCarteira, setCriterioCarteira] = useState('todas');
+  const [criterioVendedor, setCriterioVendedor] = useState('todos');
+  const [criterioSelecao, setCriterioSelecao] = useState('top_pedidos');
+  const [criterioQuantidade, setCriterioQuantidade] = useState('10');
+  const [criterioMetrica, setCriterioMetrica] = useState(METRICAS_PLANO_ACAO[0].chave);
+  const [criterioTipoMeta, setCriterioTipoMeta] = useState('reducao_percentual');
+  const [criterioValor, setCriterioValor] = useState('');
+  const [criterioPeriodo, setCriterioPeriodo] = useState('mensal');
   const [revendaPerformanceSelecionada, setRevendaPerformanceSelecionada] = useState(null);
   const [modalLimpeza, setModalLimpeza] = useState(null);
   const [metricasFarmerHistorico, setMetricasFarmerHistorico] = useState([]);
@@ -533,6 +745,19 @@ function App() {
       }
   };
 
+  // NOVO: carrega os Planos de Ação sob demanda (mesmo padrão de carteiraFarmers — getDocs uma vez,
+  // não onSnapshot). É uma coleção pequena (só revendas com plano ativo/histórico), então carregar
+  // tudo de uma vez é barato e evita leitura por revenda no painel geral.
+  const carregarPlanosAcao = async () => {
+      try {
+          const qs = await getDocs(collection(db, "planos_acao"));
+          setPlanosAcao(qs.docs.map(d => ({ id: d.id, ...d.data() })));
+          setPlanosAcaoCarregados(true);
+      } catch (e) {
+          mostrarMensagem('Erro ao carregar planos de ação.', true);
+      }
+  };
+
   const recalcularCarteiraRevendas = async () => {
       setUploadProgresso('Recalculando carteira das revendas...');
       try {
@@ -578,8 +803,11 @@ function App() {
   };
 
   useEffect(() => {
-      if ((visaoAtual === 'performance' || visaoAtual === 'dashboard') && carteiraFarmers.length === 0) {
+      if ((visaoAtual === 'performance' || visaoAtual === 'dashboard' || visaoAtual === 'planos_acao') && carteiraFarmers.length === 0) {
           carregarCarteiraFarmers();
+      }
+      if ((visaoAtual === 'performance' || visaoAtual === 'planos_acao') && !planosAcaoCarregados) {
+          carregarPlanosAcao();
       }
   }, [visaoAtual]);
 
@@ -781,6 +1009,12 @@ function App() {
           return true;
       });
   }, [carteiraFarmersFiltrada, filtroFarmerUf, filtroFarmerCidade, filtroFarmerStatus, filtroFarmerBusca, filtroFarmerDataContato]);
+
+  // NOVO: conjunto de IDs de revendas com plano de ação em andamento — usado só pra exibir o badge
+  // "🎯 Plano Ativo" nos cards do Kanban/Lista sem precisar filtrar o array de planos a cada render.
+  const revendaIdsComPlanoAtivo = useMemo(() => {
+      return new Set(planosAcao.filter(p => p.status === 'em_andamento').map(p => p.revenda_id));
+  }, [planosAcao]);
 
   // NOVO: comparador usado para ordenar os cards dentro de cada coluna do Kanban de Farmers
   const compararFarmers = (a, b) => {
@@ -1201,6 +1435,15 @@ function App() {
                     const metricUltimoMes = latestMetrics[compId];
                     const rankingLevel = calcularRankingPelaRegra(metricUltimoMes.total_score, metricUltimoMes.total_orders);
 
+                    // NOVO: espelha as métricas granulares (que hoje só existem dentro de
+                    // ranking_metricas.metrics) direto na carteira_ativa, pra Planos de Ação e o
+                    // painel geral conseguirem ler o progresso de cada revenda sem nenhuma leitura
+                    // extra por revenda.
+                    const metricsMes = metricUltimoMes.metrics || {};
+                    const totalOrdersMes = Number(metricUltimoMes.total_orders) || 0;
+                    const volumetryMes = Number(metricsMes.volumetry) || 0;
+                    const taxaCancelamentoMes = totalOrdersMes > 0 ? Math.max(((totalOrdersMes - volumetryMes) / totalOrdersMes) * 100, 0) : 0;
+
                     updatesCarteira.push({
                         id: revenda.id,
                         data: {
@@ -1213,7 +1456,11 @@ function App() {
                             orders_anterior: (revenda.total_orders !== undefined && revenda.total_orders !== null) ? revenda.total_orders : null,
                             ultimo_mes_apurado: `${metricUltimoMes.month}/${metricUltimoMes.year}`,
                             ranking_level: rankingLevel,
-                            ultima_atualizacao_metricas: metricUltimoMes.created_at
+                            ultima_atualizacao_metricas: metricUltimoMes.created_at,
+                            metrica_on_time_delivery_percentage: Number(metricsMes.on_time_delivery_percentage ?? metricsMes.acceptance_rate_percentage ?? 0),
+                            metrica_average_delivery_time: Number(metricsMes.average_delivery_time ?? metricsMes.average_acceptance_time ?? 0),
+                            metrica_success_rate_percentage: Number(metricsMes.success_rate_percentage ?? metricsMes.success_rate ?? 0),
+                            metrica_taxa_cancelamento: taxaCancelamentoMes
                         }
                     });
                 }
@@ -1432,6 +1679,164 @@ function App() {
       }
   };
 
+  // NOVO: cria um Plano de Ação para a revenda, capturando o valor ATUAL da métrica escolhida como
+  // ponto de partida (valor_inicial) — é contra esse ponto de partida que o progresso é medido.
+  // CORREÇÃO (Bug 1): usa obterValorAtualPlano, que prioriza o histórico de ranking_metricas já
+  // carregado (metricasFarmerHistorico, sempre disponível aqui pois este modal só abre de dentro do
+  // card da revenda) em vez do campo espelhado — que só é preenchido no PRÓXIMO import de métricas.
+  const salvarNovoPlanoAcao = async () => {
+      if (!modalNovoPlano) return;
+      if (!novoPlanoValorMeta) return mostrarMensagem('Preencha a meta.', true);
+      const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === novoPlanoMetrica);
+      const valorInicial = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null).valor;
+      try {
+          const novoPlano = {
+              revenda_id: modalNovoPlano.id,
+              metrica: novoPlanoMetrica,
+              valor_inicial: valorInicial,
+              tipo_meta: novoPlanoTipoMeta,
+              variacao_percentual: novoPlanoTipoMeta !== 'absoluto' ? Number(novoPlanoValorMeta) : null,
+              valor_meta: calcularValorMetaFinal(novoPlanoTipoMeta, valorInicial, novoPlanoValorMeta),
+              periodo: novoPlanoPeriodo,
+              prazo: calcularPrazoPorPeriodo(novoPlanoPeriodo),
+              status: 'em_andamento',
+              criado_por: vendedor,
+              criado_em: Date.now(),
+              lote_id: null,
+              andamento: [] // NOVO: histórico de registros diários + comentários deste plano
+          };
+          const docRef = await addDoc(collection(db, "planos_acao"), novoPlano);
+          setPlanosAcao(prev => [...prev, { id: docRef.id, ...novoPlano }]);
+          setModalNovoPlano(null);
+          setNovoPlanoValorMeta('');
+          mostrarMensagem('Plano de ação criado!');
+      } catch (e) {
+          mostrarMensagem('Erro ao criar plano de ação.', true);
+      }
+  };
+
+  // NOVO: atualiza localmente o array `andamento` de um plano específico depois de um registro
+  // diário/comentário salvo pelo PainelAndamentoPlano, sem precisar recarregar planosAcao inteiro.
+  const atualizarAndamentoLocal = (planoId, novoAndamento) => {
+      setPlanosAcao(prev => prev.map(p => p.id === planoId ? { ...p, andamento: novoAndamento } : p));
+  };
+
+  const concluirPlanoAcao = async (plano) => {
+      try {
+          await updateDoc(doc(db, "planos_acao", plano.id), { status: 'concluido', concluido_em: Date.now() });
+          setPlanosAcao(prev => prev.map(p => p.id === plano.id ? { ...p, status: 'concluido', concluido_em: Date.now() } : p));
+          mostrarMensagem('Plano marcado como concluído! 🎉');
+      } catch (e) { mostrarMensagem('Erro ao concluir plano.', true); }
+  };
+
+  const cancelarPlanoAcao = async (plano) => {
+      try {
+          await updateDoc(doc(db, "planos_acao", plano.id), { status: 'cancelado' });
+          setPlanosAcao(prev => prev.map(p => p.id === plano.id ? { ...p, status: 'cancelado' } : p));
+          mostrarMensagem('Plano cancelado.');
+      } catch (e) { mostrarMensagem('Erro ao cancelar plano.', true); }
+  };
+
+  // NOVO: revendas que batem com os critérios escolhidos no modal de criação em lote — usado tanto
+  // pra pré-visualizar quantas/quais revendas serão afetadas quanto pra efetivamente criar os planos.
+  const revendasSelecionadasPeloCriterio = useMemo(() => {
+      if (!modalPlanoCriterio) return [];
+      let base = carteiraFarmers.filter(f => getFarmerStatus(f).key !== 'descredenciada');
+      if (criterioCarteira !== 'todas') base = base.filter(f => f.carteira === criterioCarteira);
+      if (criterioVendedor !== 'todos') {
+          const farmerSel = vendedores.find(v => v.nome === criterioVendedor);
+          if (farmerSel && farmerSel.carteira && farmerSel.carteira !== 'Todas') base = base.filter(f => f.carteira === farmerSel.carteira);
+      }
+      const criterioInfo = CRITERIOS_SELECAO_REVENDA.find(c => c.chave === criterioSelecao);
+      if (criterioInfo?.ordenar) {
+          base = base.slice().sort(criterioInfo.ordenar).slice(0, Number(criterioQuantidade) || 10);
+      }
+      return base;
+  }, [modalPlanoCriterio, carteiraFarmers, criterioCarteira, criterioVendedor, criterioSelecao, criterioQuantidade, vendedores]);
+
+  // NOVO: cria um plano de ação para CADA revenda selecionada pelo critério, todos com a mesma
+  // métrica/meta/período, agrupados por um lote_id — é isso que permite depois cancelar o lote
+  // inteiro de uma vez, em vez de um por um.
+  const criarPlanosPorCriterio = async () => {
+      if (!criterioValor) return mostrarMensagem('Preencha o valor/percentual da meta.', true);
+      const revendasAlvo = revendasSelecionadasPeloCriterio;
+      if (revendasAlvo.length === 0) return mostrarMensagem('Nenhuma revenda encontrada com esses critérios.', true);
+
+      const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === criterioMetrica);
+      const criterioInfo = CRITERIOS_SELECAO_REVENDA.find(c => c.chave === criterioSelecao);
+      const loteId = `lote_${Date.now()}`;
+      const prazo = calcularPrazoPorPeriodo(criterioPeriodo);
+
+      setUploadProgresso('Criando planos de ação em lote...');
+      try {
+          const novosPlanos = revendasAlvo.map(rev => {
+              // Sem historico de ranking_metricas carregado por revenda aqui (custaria 1 leitura extra
+              // por revenda no lote) nem plano ainda criado — obterValorAtualPlano cai direto pro
+              // campo espelhado, igual ao comportamento anterior, só que pelo caminho unificado.
+              const valorInicial = obterValorAtualPlano(metricaInfo, rev, null, null).valor;
+              return {
+                  revenda_id: rev.id,
+                  metrica: criterioMetrica,
+                  valor_inicial: valorInicial,
+                  tipo_meta: criterioTipoMeta,
+                  variacao_percentual: criterioTipoMeta !== 'absoluto' ? Number(criterioValor) : null,
+                  valor_meta: calcularValorMetaFinal(criterioTipoMeta, valorInicial, criterioValor),
+                  periodo: criterioPeriodo,
+                  prazo,
+                  status: 'em_andamento',
+                  criado_por: vendedor,
+                  criado_em: Date.now(),
+                  lote_id: loteId,
+                  lote_criterio: criterioInfo?.label || '',
+                  andamento: []
+              };
+          });
+
+          const BATCH_SIZE = 400;
+          const criados = [];
+          for (let i = 0; i < novosPlanos.length; i += BATCH_SIZE) {
+              const chunk = novosPlanos.slice(i, i + BATCH_SIZE);
+              const batch = writeBatch(db);
+              chunk.forEach(plano => {
+                  const docRef = doc(collection(db, "planos_acao"));
+                  batch.set(docRef, plano);
+                  criados.push({ id: docRef.id, ...plano });
+              });
+              setUploadProgresso(`Criando planos (${Math.min(i + chunk.length, novosPlanos.length)}/${novosPlanos.length})...`);
+              await batch.commit();
+          }
+
+          setPlanosAcao(prev => [...prev, ...criados]);
+          setModalPlanoCriterio(false);
+          setCriterioValor('');
+          setUploadProgresso('');
+          mostrarMensagem(`${criados.length} plano(s) de ação criado(s)!`);
+      } catch (e) {
+          setUploadProgresso('');
+          mostrarMensagem('Erro ao criar planos em lote.', true);
+      }
+  };
+
+  // NOVO: cancela de uma vez todos os planos "em andamento" que pertencem ao mesmo lote — pensado
+  // pra quando a iniciativa inteira (não só uma revenda específica) precisa ser encerrada.
+  const cancelarLotePlanos = async (loteId) => {
+      const planosDoLote = planosAcao.filter(p => p.lote_id === loteId && p.status === 'em_andamento');
+      if (planosDoLote.length === 0) return;
+      try {
+          const BATCH_SIZE = 400;
+          for (let i = 0; i < planosDoLote.length; i += BATCH_SIZE) {
+              const chunk = planosDoLote.slice(i, i + BATCH_SIZE);
+              const batch = writeBatch(db);
+              chunk.forEach(p => batch.update(doc(db, "planos_acao", p.id), { status: 'cancelado' }));
+              await batch.commit();
+          }
+          setPlanosAcao(prev => prev.map(p => (p.lote_id === loteId && p.status === 'em_andamento') ? { ...p, status: 'cancelado' } : p));
+          mostrarMensagem(`${planosDoLote.length} plano(s) do lote cancelados.`);
+      } catch (e) {
+          mostrarMensagem('Erro ao cancelar o lote.', true);
+      }
+  };
+
   const abrirPerformanceFarmer = async (revenda) => {
     setRevendaPerformanceSelecionada(revenda); 
     setCarregandoMetricas(true); 
@@ -1467,7 +1872,7 @@ function App() {
   // Decisão do time: sistema de uso interno, sem proxy/backend intermediário.
   const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
-  const gerarInsightsComGemini = async (revenda, metricas) => {
+  const gerarInsightsComGemini = async (revenda, metricas, planos = []) => {
     if (!metricas || metricas.length === 0) {
         return mostrarMensagem('Sem histórico suficiente para analisar.', true);
     }
@@ -1485,13 +1890,38 @@ function App() {
             tempo_medio_minutos: m.metrics?.average_delivery_time || m.metrics?.average_acceptance_time || 0
         })).reverse(); // Coloca em ordem cronológica para facilitar a leitura da IA
 
+        // NOVO: resume os Planos de Ação desta revenda (ativos, concluídos e cancelados) — inclui o
+        // progresso já calculado (mesma lógica do card, prioriza registro diário > ranking_metricas
+        // > campo espelhado) e o último comentário deixado pelo Farmer, pra a IA apontar no relatório
+        // o que está funcionando e o que está falhando, em vez de só olhar as médias mensais.
+        const dadosPlanos = (planos || []).map(p => {
+            const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === p.metrica);
+            const progresso = calcularProgressoPlano(p, revenda, metricas);
+            const registros = (p.andamento || []).slice().sort((a, b) => b.timestamp - a.timestamp);
+            const ultimoRegistro = registros.find(r => r.observacao);
+            const vencido = p.status === 'em_andamento' && p.prazo < Date.now();
+            return {
+                metrica: metricaInfo?.label || p.metrica,
+                status: p.status === 'em_andamento' ? (vencido ? 'em andamento — PRAZO VENCIDO' : 'em andamento') : (p.status === 'concluido' ? 'concluído' : 'cancelado'),
+                valor_inicial: progresso ? Number(p.valor_inicial).toFixed(1) : p.valor_inicial,
+                valor_atual: progresso ? Number(progresso.valorAtual).toFixed(1) : null,
+                valor_meta: Number(p.valor_meta).toFixed(1),
+                progresso_percentual: progresso?.percentual !== undefined ? Math.round(progresso.percentual) : null,
+                meta_atingida: progresso?.atingiu || false,
+                prazo: new Date(p.prazo).toLocaleDateString('pt-BR'),
+                ultimo_comentario_farmer: ultimoRegistro?.observacao || null,
+            };
+        });
+
         const prompt = `
         Você é um analista comercial sênior da Appgas, especialista em gerenciar revendas parceiras.
         Analise o desempenho da revenda "${revenda.nome || revenda.razao_social || revenda.code}" nos últimos meses.
 
         Dados de desempenho: ${JSON.stringify(dadosHistorico)}
 
-        Sua tarefa é gerar um relatório direto e acionável contendo 3 partes:
+        ${dadosPlanos.length > 0 ? `Planos de Ação desta revenda (ativos e finalizados): ${JSON.stringify(dadosPlanos)}` : 'Esta revenda não possui nenhum Plano de Ação registrado no momento.'}
+
+        Sua tarefa é gerar um relatório direto e acionável contendo 4 partes:
 
         1. Análise de Desempenho (Compare os meses e ache a causa raiz):
            - Se 'aceitacao' caiu, sugira fortemente que a revenda ajuste/aumente o tempo de previsão de entrega no app.
@@ -1501,8 +1931,13 @@ function App() {
         2. Pontos a Abordar:
            - 3 tópicos práticos e rápidos (em bullet points) para o consultor Farmer (gerente de conta) abordar na reunião/ligação.
 
-        3. Mensagem WhatsApp:
-           - Escreva uma mensagem amigável, construtiva e pronta para ser disparada ao responsável da revenda via WhatsApp. A mensagem não deve soar como uma punição, mas como uma consultoria da Appgas para ajudá-los a faturar mais.
+        3. Planos de Ação — O Que Está Funcionando e O Que Está Falhando:
+           - Se houver planos de ação, avalie CADA UM: destaque os que estão com bom progresso (perto ou já batendo a meta) como sucesso, e trate como FALHA os que estão estagnados, piorando, ou com prazo vencido sem atingir a meta — seja direto ao apontar uma falha, sem suavizar.
+           - Use o campo "ultimo_comentario_farmer" (quando existir) para explicar o motivo provável por trás do resultado de cada plano.
+           - Se não houver nenhum plano de ação, diga isso explicitamente e sugira criar um com base na métrica mais crítica encontrada na Análise de Desempenho.
+
+        4. Mensagem WhatsApp:
+           - Escreva uma mensagem amigável, construtiva e pronta para ser disparada ao responsável da revenda via WhatsApp. A mensagem não deve soar como uma punição, mas como uma consultoria da Appgas para ajudá-los a faturar mais. Se houver um plano de ação falhando, mencione com tato.
 
         Formatação estrita: Utilize HTML limpo. Use <h3> para os títulos, <ul> e <li> para listas, <strong> para negrito. Não utilize markdown (como **, ##), apenas HTML.
         `;
@@ -1982,6 +2417,122 @@ function App() {
     );
   };
 
+  // NOVO: painel geral de Planos de Ação — visão pensada pra reunião diária do time de Farmers,
+  // listando todos os planos (por padrão, só os "em andamento") com progresso e prazo, filtráveis
+  // por carteira e por farmer específico (admin) ou já restritos à própria carteira (farmer logado).
+  const renderPlanosAcao = () => {
+    const revendasPorId = new Map(carteiraFarmers.map(f => [f.id, f]));
+    const vendedorLogado = vendedores.find(v => v.nome.toLowerCase() === vendedor.toLowerCase());
+
+    let planosVisiveis = planosAcao.filter(p => {
+        const revenda = revendasPorId.get(p.revenda_id);
+        if (!revenda) return false;
+        if (isAdmin) {
+            if (filtroPlanoCarteiraDash !== 'todas' && revenda.carteira !== filtroPlanoCarteiraDash) return false;
+            if (filtroPlanoVendedorDash !== 'todos') {
+                const farmerSelecionado = vendedores.find(v => v.nome === filtroPlanoVendedorDash);
+                if (farmerSelecionado && farmerSelecionado.carteira && farmerSelecionado.carteira !== 'Todas' && revenda.carteira !== farmerSelecionado.carteira) return false;
+            }
+        } else if (vendedorLogado?.carteira && vendedorLogado.carteira !== 'Todas' && revenda.carteira !== vendedorLogado.carteira) {
+            return false;
+        }
+        if (filtroPlanoStatus !== 'todos' && p.status !== filtroPlanoStatus) return false;
+        return true;
+    }).sort((a, b) => a.prazo - b.prazo);
+
+    return (
+      <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
+         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-6">
+            <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>🎯 Planos de Ação</h2>
+            <button onClick={() => { setModalPlanoCriterio(true); setCriterioValor(''); }} className="text-white text-sm font-bold px-5 py-3 rounded-xl shadow-sm hover:opacity-90 transition-opacity" style={{backgroundColor: BRAND.blue}}>
+               + Criar Plano por Critério
+            </button>
+         </div>
+
+         <div className="flex flex-wrap gap-2 bg-white p-3 rounded-2xl border border-slate-200 shadow-sm mb-6">
+            <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroPlanoStatus} onChange={e => setFiltroPlanoStatus(e.target.value)}>
+               <option value="em_andamento">Em Andamento</option>
+               <option value="concluido">Concluídos</option>
+               <option value="cancelado">Cancelados</option>
+               <option value="todos">Todos os Status</option>
+            </select>
+            {isAdmin && (
+               <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroPlanoCarteiraDash} onChange={e => setFiltroPlanoCarteiraDash(e.target.value)}>
+                  <option value="todas">Carteira: Todas</option>
+                  <option value="C1">C1</option>
+                  <option value="C2">C2</option>
+                  <option value="C3">C3</option>
+               </select>
+            )}
+            {isAdmin && (
+               <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroPlanoVendedorDash} onChange={e => setFiltroPlanoVendedorDash(e.target.value)}>
+                  <option value="todos">Farmer: Todos</option>
+                  {vendedores.filter(v => v.ativo && v.perfil === 'Farmer').map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
+               </select>
+            )}
+         </div>
+
+         <div className="space-y-3">
+            {planosVisiveis.length === 0 && (
+               <div className="bg-white p-10 rounded-2xl border border-dashed border-slate-200 text-center font-bold" style={{color: BRAND.gray}}>
+                  Nenhum plano de ação encontrado com esses filtros.
+               </div>
+            )}
+            {planosVisiveis.map(plano => {
+                const revenda = revendasPorId.get(plano.revenda_id);
+                const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === plano.metrica);
+                const progresso = calcularProgressoPlano(plano, revenda);
+                const urgencia = getPlanoUrgencia(plano);
+                const periodoInfo = PERIODOS_PLANO.find(p => p.chave === plano.periodo);
+                return (
+                    <div key={plano.id} className="bg-white p-4 md:p-5 rounded-2xl border border-slate-200 shadow-sm">
+                       <div className="flex flex-col md:flex-row justify-between md:items-center gap-2 mb-3">
+                          <button onClick={() => { abrirPerformanceFarmer(revenda); mudarVisao('performance'); }} className="font-black text-sm text-left hover:underline w-fit" style={{color: BRAND.blue}}>
+                             {revenda?.code || revenda?.CODE ? `[${revenda.code || revenda.CODE}] ` : ''}{revenda?.nome || revenda?.razao_social || 'Revenda'}
+                          </button>
+                          <div className="flex items-center gap-2 flex-wrap">
+                             {plano.lote_id && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-purple-50 text-purple-700 border-purple-200" title={plano.lote_criterio || ''}>📦 Lote</span>}
+                             {periodoInfo && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-600 border-slate-200">{periodoInfo.chave === 'diario' ? 'Diário' : periodoInfo.chave === 'semanal' ? 'Semanal' : 'Mensal'}</span>}
+                             {plano.status === 'concluido' && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-emerald-100 text-emerald-700 border-emerald-200">✅ Concluído</span>}
+                             {plano.status === 'cancelado' && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-500 border-slate-200">✕ Cancelado</span>}
+                             {urgencia && <span className={`text-[10px] font-bold px-2 py-1 rounded-md border ${urgencia.css}`}>{urgencia.texto}</span>}
+                          </div>
+                       </div>
+                       <p className="text-xs font-bold mb-2" style={{color: BRAND.gray}}>
+                          {metricaInfo?.label}
+                          {plano.tipo_meta && plano.tipo_meta !== 'absoluto' && (
+                             <span className="ml-1 font-medium">({plano.tipo_meta === 'reducao_percentual' ? 'reduzir' : 'aumentar'} {plano.variacao_percentual}%)</span>
+                          )}
+                       </p>
+                       <div className="flex justify-between text-xs font-bold mb-1.5" style={{color: BRAND.gray}}>
+                          <span>Início: {Number(plano.valor_inicial).toFixed(1)}{metricaInfo?.unidade}</span>
+                          <span style={{color: progresso?.atingiu ? '#059669' : BRAND.black}}>
+                             Atual: {Number(progresso?.valorAtual).toFixed(1)}{metricaInfo?.unidade}
+                             {progresso?.fonteValorAtual === 'diario' && <span title="Veio do registro diário mais recente"> 📝</span>}
+                          </span>
+                          <span>Meta: {Number(plano.valor_meta).toFixed(1)}{metricaInfo?.unidade}</span>
+                       </div>
+                       <div className="w-full h-2.5 rounded-full bg-slate-100 overflow-hidden mb-3">
+                          <div className={`h-full transition-all duration-700 ${progresso?.atingiu ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{width: `${progresso?.percentual || 0}%`}}></div>
+                       </div>
+                       {plano.status === 'em_andamento' && (
+                           <div className="flex gap-2 flex-wrap">
+                              <button onClick={() => concluirPlanoAcao(plano)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">✅ Concluir</button>
+                              <button onClick={() => cancelarPlanoAcao(plano)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">✕ Cancelar</button>
+                              {plano.lote_id && (
+                                  <button onClick={() => cancelarLotePlanos(plano.lote_id)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-purple-50 text-purple-700 border border-purple-200 hover:bg-purple-600 hover:text-white transition-colors">📦 Cancelar Lote Inteiro</button>
+                              )}
+                           </div>
+                       )}
+                       <PainelAndamentoPlano plano={plano} metricaInfo={metricaInfo} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
+                    </div>
+                );
+            })}
+         </div>
+      </div>
+    );
+  };
+
   if (erroPermissaoFirebase) {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-50 w-full p-4 md:p-6">
@@ -2119,6 +2670,7 @@ function App() {
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' ? BRAND.blue : BRAND.gray}}>Lista</button>}
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' ? BRAND.blue : BRAND.gray}}>Kanban</button>}
           {(isAdmin || isFarmerProfile) && <button onClick={() => mudarVisao('performance')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'performance' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'performance' ? BRAND.blue : BRAND.gray}}>Farmers</button>}
+          {(isAdmin || isFarmerProfile) && <button onClick={() => mudarVisao('planos_acao')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'planos_acao' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'planos_acao' ? BRAND.blue : BRAND.gray}}>🎯 Planos</button>}
           {(isAdmin || isHunterProfile || isFarmerProfile) && <button onClick={() => mudarVisao('dashboard')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'dashboard' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'dashboard' ? BRAND.blue : BRAND.gray}}>Dash</button>}
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('mapa')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'mapa' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'mapa' ? BRAND.blue : BRAND.gray}}>Mapa</button>}
         </div>
@@ -2513,6 +3065,90 @@ function App() {
                          );
                      })()}
 
+                     {/* NOVO: Planos de Ação — meta quantitativa ligada a uma métrica, com progresso calculado
+                         em tempo real. Suporta VÁRIOS planos simultâneos para a mesma revenda (ex: um pra
+                         cancelamento e outro pra tempo de entrega ao mesmo tempo), cada um com seu próprio
+                         acompanhamento diário e comentários (ver PainelAndamentoPlano). */}
+                     {(() => {
+                         const rev = revendaPerformanceSelecionada;
+                         const planosDaRevenda = planosAcao.filter(p => p.revenda_id === rev.id);
+                         const planosAtivos = planosDaRevenda.filter(p => p.status === 'em_andamento');
+                         const planosFinalizados = planosDaRevenda.filter(p => p.status !== 'em_andamento').sort((a, b) => (b.concluido_em || b.criado_em || 0) - (a.concluido_em || a.criado_em || 0));
+                         return (
+                             <div className="bg-slate-50 p-4 md:p-5 rounded-2xl border-2 border-slate-200 mb-6">
+                                 <div className="flex justify-between items-center mb-3">
+                                     <div className="flex items-center gap-2" style={{color: BRAND.black}}>
+                                         <span className="text-xl">🎯</span>
+                                         <span className="text-xs md:text-sm font-black uppercase tracking-wider">Planos de Ação {planosAtivos.length > 0 && `(${planosAtivos.length} em andamento)`}</span>
+                                     </div>
+                                     <button onClick={() => { setModalNovoPlano(rev); setNovoPlanoMetrica(METRICAS_PLANO_ACAO[0].chave); setNovoPlanoValorMeta(''); setNovoPlanoPeriodo('mensal'); }} className="text-xs font-bold px-3 py-2 rounded-xl text-white shadow-sm hover:opacity-90 transition-opacity shrink-0" style={{backgroundColor: BRAND.blue}}>
+                                         + Criar Plano
+                                     </button>
+                                 </div>
+                                 {planosAtivos.length === 0 ? (
+                                     <p className="text-xs font-medium" style={{color: BRAND.gray}}>Nenhum plano de ação ativo para esta revenda no momento.</p>
+                                 ) : (
+                                     <div className="space-y-4">
+                                         {planosAtivos.map(planoAtivo => {
+                                             const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === planoAtivo.metrica);
+                                             const progresso = calcularProgressoPlano(planoAtivo, rev, metricasFarmerHistorico);
+                                             const urgencia = getPlanoUrgencia(planoAtivo);
+                                             return (
+                                                 <div key={planoAtivo.id} className="bg-white p-3.5 rounded-xl border border-slate-200">
+                                                     <div className="flex justify-between items-center mb-2 flex-wrap gap-2">
+                                                         <span className="text-sm font-bold" style={{color: BRAND.black}}>{metricaInfo?.label}</span>
+                                                         <div className="flex items-center gap-1.5 flex-wrap">
+                                                             {planoAtivo.lote_id && <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-purple-50 text-purple-700 border-purple-200" title={planoAtivo.lote_criterio || ''}>📦 Lote</span>}
+                                                             {urgencia && <span className={`text-[10px] font-bold px-2 py-1 rounded-md border ${urgencia.css}`}>{urgencia.texto}</span>}
+                                                         </div>
+                                                     </div>
+                                                     <div className="flex justify-between text-xs font-bold mb-1.5" style={{color: BRAND.gray}}>
+                                                         <span>Início: {Number(planoAtivo.valor_inicial).toFixed(1)}{metricaInfo?.unidade}</span>
+                                                         <span style={{color: progresso?.atingiu ? '#059669' : BRAND.black}}>
+                                                             Atual: {Number(progresso?.valorAtual).toFixed(1)}{metricaInfo?.unidade}
+                                                             {progresso?.fonteValorAtual === 'diario' && <span title="Veio do registro diário mais recente"> 📝</span>}
+                                                         </span>
+                                                         <span>Meta: {Number(planoAtivo.valor_meta).toFixed(1)}{metricaInfo?.unidade}</span>
+                                                     </div>
+                                                     <div className="w-full h-3 rounded-full bg-slate-100 border border-slate-200 overflow-hidden">
+                                                         <div className={`h-full transition-all duration-700 ${progresso?.atingiu ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{width: `${progresso?.percentual || 0}%`}}></div>
+                                                     </div>
+                                                     {progresso?.atingiu && <p className="text-xs font-bold text-emerald-600 mt-2">🎉 Meta atingida! Marque como concluído quando quiser.</p>}
+                                                     <div className="flex gap-2 mt-3">
+                                                         <button onClick={() => concluirPlanoAcao(planoAtivo)} className="flex-1 text-xs font-bold py-2 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">✅ Concluir</button>
+                                                         <button onClick={() => cancelarPlanoAcao(planoAtivo)} className="flex-1 text-xs font-bold py-2 rounded-xl bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">✕ Cancelar</button>
+                                                     </div>
+                                                     <PainelAndamentoPlano plano={planoAtivo} metricaInfo={metricaInfo} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
+                                                 </div>
+                                             );
+                                         })}
+                                     </div>
+                                 )}
+                                 {planosFinalizados.length > 0 && (
+                                     <details className="mt-4">
+                                         <summary className="text-[11px] font-bold cursor-pointer select-none" style={{color: BRAND.gray}}>📜 Ver planos finalizados desta revenda ({planosFinalizados.length})</summary>
+                                         <div className="space-y-2 mt-2">
+                                             {planosFinalizados.map(p => {
+                                                 const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === p.metrica);
+                                                 const progresso = calcularProgressoPlano(p, rev, metricasFarmerHistorico);
+                                                 return (
+                                                     <div key={p.id} className="bg-white p-3 rounded-xl border border-slate-200 text-xs">
+                                                         <div className="flex justify-between items-center flex-wrap gap-1.5">
+                                                             <span className="font-bold" style={{color: BRAND.black}}>{metricaInfo?.label}</span>
+                                                             {p.status === 'concluido' ? <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-emerald-100 text-emerald-700 border-emerald-200">✅ Concluído {progresso?.atingiu ? '(meta batida)' : '(encerrado sem bater a meta)'}</span> : <span className="text-[10px] font-bold px-2 py-1 rounded-md border bg-slate-100 text-slate-500 border-slate-200">✕ Cancelado</span>}
+                                                         </div>
+                                                         <p className="mt-1 font-medium" style={{color: BRAND.gray}}>Início: {Number(p.valor_inicial).toFixed(1)}{metricaInfo?.unidade} → Meta: {Number(p.valor_meta).toFixed(1)}{metricaInfo?.unidade} · Encerrado em {progresso ? Number(progresso.valorAtual).toFixed(1) + (metricaInfo?.unidade || '') : '—'}</p>
+                                                         <PainelAndamentoPlano plano={p} metricaInfo={metricaInfo} vendedor={vendedor} mostrarMensagem={mostrarMensagem} onAtualizado={atualizarAndamentoLocal} />
+                                                     </div>
+                                                 );
+                                             })}
+                                         </div>
+                                     </details>
+                                 )}
+                             </div>
+                         );
+                     })()}
+
                      <h3 className="font-bold text-xl mb-6 flex items-center gap-2 text-slate-800">
                          <span className="text-2xl">📈</span> Histórico de Desempenho
                      </h3>
@@ -2601,7 +3237,7 @@ function App() {
                                  <span className="text-2xl">✨</span> Insights com IA
                              </h3>
                              <button
-                                 onClick={() => gerarInsightsComGemini(revendaPerformanceSelecionada, metricasFarmerHistorico)}
+                                 onClick={() => gerarInsightsComGemini(revendaPerformanceSelecionada, metricasFarmerHistorico, planosAcao.filter(p => p.revenda_id === revendaPerformanceSelecionada.id))}
                                  disabled={gerandoIA || metricasFarmerHistorico.length === 0}
                                  className={`px-4 py-2.5 rounded-xl font-bold text-sm shadow-sm flex items-center gap-2 transition-all ${gerandoIA ? 'bg-slate-200 text-slate-500 cursor-not-allowed' : 'text-white hover:opacity-90 hover:-translate-y-0.5'}`}
                                  style={{backgroundColor: gerandoIA ? '' : BRAND.blueDark}}
@@ -2754,6 +3390,11 @@ function App() {
                                        <span className="text-[9px] font-bold px-2 py-0.5 rounded-md border bg-blue-50 text-blue-700 border-blue-200">
                                            {rev.carteira || 'SEM CARTEIRA'}
                                        </span>
+                                       {revendaIdsComPlanoAtivo.has(rev.id) && (
+                                           <span className="text-[9px] font-bold px-2 py-0.5 rounded-md border bg-purple-50 text-purple-700 border-purple-200">
+                                               🎯 Plano Ativo
+                                           </span>
+                                       )}
                                        <p className="text-[10px] uppercase font-bold text-slate-400 flex items-center ml-auto">
                                            Mês: {rev.ultimo_mes_apurado || 'N/A'}
                                        </p>
@@ -2827,6 +3468,11 @@ function App() {
                                   <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate">
                                      {rev.carteira || 'SEM CARTEIRA'}
                                   </span>
+                                  {revendaIdsComPlanoAtivo.has(rev.id) && (
+                                      <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-purple-50 text-purple-700 border border-purple-200">
+                                          🎯 Plano Ativo
+                                      </span>
+                                  )}
                                   <span className="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase">Mês: {rev.ultimo_mes_apurado || 'N/A'}</span>
                                </div>
 
@@ -2993,6 +3639,7 @@ function App() {
 
         {/* OUTRAS VIEWS (Dash, Mapa, Appgas, Gerenciar) */}
         {!leadAtual && visaoAtual === 'dashboard' && (isFarmerProfile ? renderDashboardFarmers() : (dashboardAba === 'farmers' ? renderDashboardFarmers() : renderDashboard()))}
+        {!leadAtual && visaoAtual === 'planos_acao' && renderPlanosAcao()}
         
         {!leadAtual && visaoAtual === 'mapa' && (
           <div className="flex-1 p-4 md:p-6 h-full flex flex-col relative bg-slate-50">
@@ -3275,6 +3922,158 @@ function App() {
             <div className="flex gap-3">
               <button onClick={() => setModalLimpeza(null)} className="flex-1 px-4 py-3 bg-slate-100 font-bold rounded-xl text-slate-600 hover:bg-slate-200">Cancelar</button>
               <button onClick={() => { executarLimpezaBase(modalLimpeza); setModalLimpeza(null); }} className="flex-1 px-4 py-3 text-white font-bold rounded-xl bg-red-600 hover:bg-red-700 shadow-md">Apagar Tudo</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modalPlanoCriterio && (
+        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
+          <div className="bg-white rounded-3xl max-w-lg w-full shadow-2xl border-t-8 flex flex-col max-h-[90vh]" style={{borderTopColor: BRAND.blue}}>
+            <div className="p-6 md:p-8 overflow-y-auto">
+              <h3 className="text-xl md:text-2xl font-black mb-2" style={{color: BRAND.black}}>🎯 Criar Plano por Critério</h3>
+              <p className="text-sm mb-6 font-medium" style={{color: BRAND.gray}}>Cria um plano de ação igual para todas as revendas que baterem com o critério escolhido.</p>
+
+              <div className="space-y-4 mb-6">
+                {isAdmin && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Carteira</label>
+                      <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioCarteira} onChange={e => setCriterioCarteira(e.target.value)}>
+                        <option value="todas">Todas</option>
+                        <option value="C1">C1</option>
+                        <option value="C2">C2</option>
+                        <option value="C3">C3</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Farmer</label>
+                      <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioVendedor} onChange={e => setCriterioVendedor(e.target.value)}>
+                        <option value="todos">Todos</option>
+                        {vendedores.filter(v => v.ativo && v.perfil === 'Farmer').map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                )}
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Critério de Seleção</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioSelecao} onChange={e => setCriterioSelecao(e.target.value)}>
+                    {CRITERIOS_SELECAO_REVENDA.map(c => <option key={c.chave} value={c.chave}>{c.label}</option>)}
+                  </select>
+                </div>
+                {CRITERIOS_SELECAO_REVENDA.find(c => c.chave === criterioSelecao)?.ordenar && (
+                  <div>
+                    <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Quantidade (N)</label>
+                    <input type="number" min="1" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioQuantidade} onChange={e => setCriterioQuantidade(e.target.value)} />
+                  </div>
+                )}
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Métrica da Meta</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioMetrica} onChange={e => setCriterioMetrica(e.target.value)}>
+                    {METRICAS_PLANO_ACAO.map(m => <option key={m.chave} value={m.chave}>{m.label}</option>)}
+                  </select>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Tipo de Meta</label>
+                    <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioTipoMeta} onChange={e => setCriterioTipoMeta(e.target.value)}>
+                      <option value="reducao_percentual">Reduzir %</option>
+                      <option value="aumento_percentual">Aumentar %</option>
+                      <option value="absoluto">Valor absoluto</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">
+                      {criterioTipoMeta === 'absoluto' ? 'Meta' : '%'}
+                    </label>
+                    <input type="number" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioValor} onChange={e => setCriterioValor(e.target.value)} placeholder={criterioTipoMeta === 'absoluto' ? 'Ex: 80' : 'Ex: 10'} />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Período</label>
+                  <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={criterioPeriodo} onChange={e => setCriterioPeriodo(e.target.value)}>
+                    {PERIODOS_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label}</option>)}
+                  </select>
+                </div>
+
+                <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl">
+                  <p className="text-xs font-bold" style={{color: BRAND.blueDark}}>
+                    📋 {revendasSelecionadasPeloCriterio.length} revenda(s) serão afetadas
+                  </p>
+                  {revendasSelecionadasPeloCriterio.length > 0 && (
+                    <p className="text-[11px] font-medium mt-1 truncate" style={{color: BRAND.gray}}>
+                      {revendasSelecionadasPeloCriterio.slice(0, 4).map(r => r.nome || r.razao_social).join(', ')}
+                      {revendasSelecionadasPeloCriterio.length > 4 ? ` e mais ${revendasSelecionadasPeloCriterio.length - 4}...` : ''}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-3 p-6 md:p-8 pt-0 shrink-0">
+              <button onClick={() => setModalPlanoCriterio(false)} className="flex-1 px-4 py-3 bg-slate-100 font-bold rounded-xl hover:bg-slate-200 text-sm" style={{color: BRAND.gray}}>Cancelar</button>
+              <button onClick={criarPlanosPorCriterio} className="flex-1 px-4 py-3 text-white font-bold rounded-xl shadow-md text-sm hover:opacity-90" style={{backgroundColor: BRAND.blue}}>
+                Criar {revendasSelecionadasPeloCriterio.length} Plano(s)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modalNovoPlano && (
+        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
+          <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl border-t-8" style={{borderTopColor: BRAND.blue}}>
+            <h3 className="text-xl md:text-2xl font-black mb-2" style={{color: BRAND.black}}>🎯 Criar Plano de Ação</h3>
+            <p className="text-sm mb-6 truncate font-medium" style={{color: BRAND.gray}}>{modalNovoPlano.nome || modalNovoPlano.razao_social || 'Revenda'}</p>
+
+            <div className="space-y-4 mb-6">
+              <div>
+                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Métrica a melhorar</label>
+                <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoMetrica} onChange={e => setNovoPlanoMetrica(e.target.value)}>
+                  {METRICAS_PLANO_ACAO.map(m => <option key={m.chave} value={m.chave}>{m.label}</option>)}
+                </select>
+              </div>
+              <div className="bg-slate-50 p-3 rounded-xl border border-slate-100">
+                <p className="text-[10px] md:text-xs font-black uppercase tracking-wider text-slate-500 mb-1">Valor Atual</p>
+                <p className="text-lg font-black" style={{color: BRAND.black}}>
+                  {(() => {
+                      const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === novoPlanoMetrica);
+                      const { valor, fonte } = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null);
+                      return <>{valor.toFixed(1)}{metricaInfo?.unidade}{fonte === 'espelhado' && <span className="text-[9px] font-medium ml-1 normal-case" style={{color: BRAND.gray}}>(última apuração espelhada — pode estar desatualizada)</span>}</>;
+                  })()}
+                </p>
+              </div>
+              <div>
+                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Tipo de Meta</label>
+                <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoTipoMeta} onChange={e => setNovoPlanoTipoMeta(e.target.value)}>
+                  <option value="reducao_percentual">Redução percentual (%)</option>
+                  <option value="aumento_percentual">Aumento percentual (%)</option>
+                  <option value="absoluto">Valor absoluto</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">
+                  {novoPlanoTipoMeta === 'absoluto' ? 'Meta a Atingir' : `${novoPlanoTipoMeta === 'reducao_percentual' ? 'Reduzir em' : 'Aumentar em'} (%)`}
+                </label>
+                <input type="number" className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoValorMeta} onChange={e => setNovoPlanoValorMeta(e.target.value)} placeholder={novoPlanoTipoMeta === 'absoluto' ? 'Ex: 80' : 'Ex: 10'} />
+                {novoPlanoValorMeta && novoPlanoTipoMeta !== 'absoluto' && (() => {
+                    const metricaInfo = METRICAS_PLANO_ACAO.find(m => m.chave === novoPlanoMetrica);
+                    const valorInicial = obterValorAtualPlano(metricaInfo, modalNovoPlano, metricasFarmerHistorico, null).valor;
+                    const valorCalculado = calcularValorMetaFinal(novoPlanoTipoMeta, valorInicial, novoPlanoValorMeta);
+                    return <p className="text-xs font-bold mt-2" style={{color: BRAND.blue}}>Meta calculada: {valorCalculado.toFixed(1)}{metricaInfo?.unidade}</p>;
+                })()}
+              </div>
+              <div>
+                <label className="block text-[10px] md:text-xs font-black mb-2 uppercase tracking-wider text-slate-500">Período</label>
+                <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm font-bold outline-none" style={{color: BRAND.black}} value={novoPlanoPeriodo} onChange={e => setNovoPlanoPeriodo(e.target.value)}>
+                  {PERIODOS_PLANO.map(p => <option key={p.chave} value={p.chave}>{p.label}</option>)}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={() => setModalNovoPlano(null)} className="flex-1 px-4 py-3 bg-slate-100 font-bold rounded-xl hover:bg-slate-200 text-sm" style={{color: BRAND.gray}}>Cancelar</button>
+              <button onClick={salvarNovoPlanoAcao} className="flex-1 px-4 py-3 text-white font-bold rounded-xl shadow-md text-sm hover:opacity-90" style={{backgroundColor: BRAND.blue}}>Criar Plano</button>
             </div>
           </div>
         </div>
