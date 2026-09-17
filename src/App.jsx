@@ -25,9 +25,33 @@ const ETAPAS = {
   PRIMEIRO_CONTATO: 'Primeiro contato',
   AGUARDANDO_RESPOSTA: '2. Aguardando resposta', 
   NEGOCIACAO: '3. Negociação',
-  CADASTRO: '4. Cadastro / Lançamento',
+  CADASTRO: '4. Cadastro',
   TREINAMENTO: '5. Treinamento Appgas',
   FINALIZADO: 'Finalizados'
+};
+
+// ITEM 7: a etapa "4. Cadastro / Lançamento" virou só "4. Cadastro". Como o texto da etapa é o
+// próprio valor gravado em `etapa_funil` no Firestore, os leads antigos continuam com o texto
+// velho — sem essa tradução eles sumiriam da coluna do Kanban. `normalizarEtapa` roda na leitura
+// de cada lead (ver o onSnapshot de "leads"), então o resto do app só enxerga o nome novo. Assim
+// não é preciso migrar a base: o valor antigo é corrigido no documento assim que o lead é movido.
+const ETAPAS_LEGADO = {
+  '4. Cadastro / Lançamento': ETAPAS.CADASTRO,
+  '4. Cadastro / Lancamento': ETAPAS.CADASTRO,
+};
+const normalizarEtapa = (etapa) => ETAPAS_LEGADO[etapa] || etapa;
+
+// ITEM 3: cada telefone do lead passa a guardar também NOME e CARGO de quem atende naquele número.
+// Os leads antigos têm `telefones` como um array de strings, então tudo que lê telefone passa por
+// aqui e recebe sempre o mesmo formato {numero, nome, cargo} — string vira {numero, nome:'', cargo:''}.
+const normalizarTelefone = (t) => {
+    if (!t) return { numero: '', nome: '', cargo: '' };
+    if (typeof t === 'string') return { numero: t, nome: '', cargo: '' };
+    return { numero: t.numero || t.valor || '', nome: t.nome || '', cargo: t.cargo || '' };
+};
+const listaTelefonesLead = (lead) => {
+    const brutos = (lead?.telefones?.length > 0) ? lead.telefones : (lead?.telefone ? [lead.telefone] : []);
+    return brutos.map(normalizarTelefone).filter(t => t.numero);
 };
 
 const DEFAULT_MOTIVOS_PERDA = [
@@ -693,6 +717,14 @@ function App() {
   const [busca, setBusca] = useState('');
   const [filtroDistribuidora, setFiltroDistribuidora] = useState('todas');
 
+  // ITEM 8: filtros e ordenação do Kanban de Hunters, espelhando os que já existem na visão Farmers
+  // (cidade, busca livre, UF, etapa do funil, data de retorno agendado e ordenação).
+  const [filtroHunterCidade, setFiltroHunterCidade] = useState('');
+  const [filtroHunterUf, setFiltroHunterUf] = useState('todas');
+  const [filtroHunterEtapa, setFiltroHunterEtapa] = useState('todas');
+  const [filtroHunterDataContato, setFiltroHunterDataContato] = useState('');
+  const [ordenacaoHunter, setOrdenacaoHunter] = useState('padrao');
+
   // NOVO: filtros e ordenação da visão Farmers
   const [filtroFarmerCidade, setFiltroFarmerCidade] = useState('');
   const [filtroFarmerBusca, setFiltroFarmerBusca] = useState('');
@@ -715,6 +747,9 @@ function App() {
   
   const [filtroVendedorDash, setFiltroVendedorDash] = useState('todos');
   const [filtroTempoDash, setFiltroTempoDash] = useState('mes');
+  // ITEM 10: datas do intervalo quando filtroTempoDash === 'personalizado' (formato YYYY-MM-DD).
+  const [dataInicioDash, setDataInicioDash] = useState('');
+  const [dataFimDash, setDataFimDash] = useState('');
   const [filtroExportacao, setFiltroExportacao] = useState('mes');
   const [filtroExportacaoFarmer, setFiltroExportacaoFarmer] = useState('mes');
   const [dashboardAba, setDashboardAba] = useState('hunters');
@@ -741,7 +776,8 @@ function App() {
   
   const [modalFinalizar, setModalFinalizar] = useState(null); 
   const [motivoPerda, setMotivoPerda] = useState('');
-  const [onboardingForm, setOnboardingForm] = useState({ dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não' });
+  // ITEM 5: `oQueFuncionou` e `oQueDeuErrado` são o registro de sucesso/erro preenchido no popup do 🏆.
+  const [onboardingForm, setOnboardingForm] = useState({ dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não', oQueFuncionou: '', oQueDeuErrado: '' });
 
   const [draggedLeadId, setDraggedLeadId] = useState(null);
   const [leadParaExcluir, setLeadParaExcluir] = useState(null);
@@ -823,7 +859,13 @@ function App() {
           : query(collection(db, "leads"), where("responsavel", "==", vendedor));
 
       const unsubLeads = onSnapshot(leadsQuery, (snap) => {
-          const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          // ITEM 7: normaliza a etapa logo na leitura, para que leads gravados com o nome antigo
+          // ("4. Cadastro / Lançamento") continuem caindo na coluna certa do Kanban.
+          const data = snap.docs.map(doc => {
+              const d = { id: doc.id, ...doc.data() };
+              if (d.etapa_funil) d.etapa_funil = normalizarEtapa(d.etapa_funil);
+              return d;
+          });
           setLeads(data); setErroPermissaoFirebase(false);
       }, lidarComErroFirebase);
 
@@ -908,31 +950,90 @@ function App() {
 
   const historicoDashCacheRef = useRef({ filtro: null, data: null });
 
+  // ITEM 10: traduz o filtro de período do dashboard numa janela {inicio, fim} em ms. Antes só
+  // existiam "mes", "semana" e "tudo" (um único corte inferior); agora "ontem" e "personalizado"
+  // também têm um corte SUPERIOR, então toda contagem precisa checar os dois lados do intervalo.
+  const getJanelaTempoDash = () => {
+      const now = new Date();
+      if (filtroTempoDash === 'mes') return { inicio: new Date(now.getFullYear(), now.getMonth(), 1).getTime(), fim: Infinity };
+      if (filtroTempoDash === 'semana') return { inicio: now.getTime() - (7 * 24 * 60 * 60 * 1000), fim: Infinity };
+      if (filtroTempoDash === 'ontem') {
+          const ontem = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+          const fimOntem = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          return { inicio: ontem.getTime(), fim: fimOntem.getTime() - 1 };
+      }
+      if (filtroTempoDash === 'personalizado') {
+          // Sem as duas datas preenchidas ainda, não corta nada (evita a tela ficar zerada enquanto
+          // o usuário escolhe só a primeira data).
+          if (!dataInicioDash || !dataFimDash) return { inicio: 0, fim: Infinity };
+          const [ai, mi, di] = [dataInicioDash.slice(0,4), dataInicioDash.slice(5,7), dataInicioDash.slice(8,10)].map(Number);
+          const [af, mf, df] = [dataFimDash.slice(0,4), dataFimDash.slice(5,7), dataFimDash.slice(8,10)].map(Number);
+          const inicio = new Date(ai, mi - 1, di, 0, 0, 0, 0).getTime();
+          const fim = new Date(af, mf - 1, df, 23, 59, 59, 999).getTime();
+          return { inicio, fim };
+      }
+      return { inicio: 0, fim: Infinity }; // 'tudo'
+  };
+
+  // Rótulo curto do período selecionado, usado nos títulos dos cards do dashboard.
+  const getLabelPeriodoDash = () => {
+      if (filtroTempoDash === 'mes') return 'este mês';
+      if (filtroTempoDash === 'semana') return 'esta semana';
+      if (filtroTempoDash === 'ontem') return 'ontem';
+      if (filtroTempoDash === 'personalizado') return (dataInicioDash && dataFimDash) ? `${dataInicioDash.split('-').reverse().join('/')} a ${dataFimDash.split('-').reverse().join('/')}` : 'período personalizado';
+      return 'todo período';
+  };
+
+  // ITEM 10: seletor de período do dashboard, reutilizado nas abas Hunters e Farmers. Quando
+  // "personalizado" está ativo, mostra os dois inputs de data ao lado do select.
+  const renderFiltroPeriodoDash = () => (
+     <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+        <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}>
+           <option value="mes">Este Mês</option>
+           <option value="semana">Esta Semana</option>
+           <option value="ontem">Dia Anterior</option>
+           <option value="personalizado">Data Personalizada</option>
+           <option value="tudo">Todo Período</option>
+        </select>
+        {filtroTempoDash === 'personalizado' && (
+           <div className="flex gap-2 items-center bg-white border border-slate-200 py-2 px-3 rounded-xl shadow-sm">
+              <input type="date" className="text-xs font-bold outline-none bg-transparent" style={{color: BRAND.black}} value={dataInicioDash} onChange={e => setDataInicioDash(e.target.value)} />
+              <span className="text-xs font-bold" style={{color: BRAND.gray}}>até</span>
+              <input type="date" className="text-xs font-bold outline-none bg-transparent" style={{color: BRAND.black}} value={dataFimDash} onChange={e => setDataFimDash(e.target.value)} />
+           </div>
+        )}
+     </div>
+  );
+
   const carregarHistoricoDash = async (forcar = false) => {
-      if (!forcar && historicoDashCacheRef.current.filtro === filtroTempoDash && historicoDashCacheRef.current.data) {
+      // A chave do cache passa a incluir as datas personalizadas, senão trocar o intervalo não
+      // recarregaria nada (o filtro continuaria sendo a string "personalizado").
+      const chaveFiltro = filtroTempoDash === 'personalizado' ? `personalizado:${dataInicioDash}:${dataFimDash}` : filtroTempoDash;
+      if (!forcar && historicoDashCacheRef.current.filtro === chaveFiltro && historicoDashCacheRef.current.data) {
           setHistoricoDash(historicoDashCacheRef.current.data);
           return;
       }
       setUploadProgresso('Calculando métricas da Nuvem...');
       try {
-          const now = new Date(); let timeLimit = 0;
-          if (filtroTempoDash === 'mes') timeLimit = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-          else if (filtroTempoDash === 'semana') timeLimit = now.getTime() - (7 * 24 * 60 * 60 * 1000);
-          
+          const { inicio: timeLimit, fim: timeMax } = getJanelaTempoDash();
+
           let q = collection(db, "historico");
           if (timeLimit > 0) q = query(collection(db, "historico"), where("timestamp", ">=", timeLimit));
-          
+
           const qs = await getDocs(q);
-          const data = qs.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          let data = qs.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          // O corte superior é aplicado em memória: o Firestore já devolveu só o que é >= inicio, e
+          // filtrar o teto aqui evita precisar de um índice composto novo só pra isso.
+          if (timeMax !== Infinity) data = data.filter(h => h.timestamp <= timeMax);
           setHistoricoDash(data);
-          historicoDashCacheRef.current = { filtro: filtroTempoDash, data };
+          historicoDashCacheRef.current = { filtro: chaveFiltro, data };
       } catch (error) { console.error("Erro Dash", error); }
       setUploadProgresso('');
   };
 
   useEffect(() => {
       if (visaoAtual === 'dashboard') carregarHistoricoDash();
-  }, [visaoAtual, filtroTempoDash]);
+  }, [visaoAtual, filtroTempoDash, dataInicioDash, dataFimDash]);
 
   useEffect(() => {
       if (leads.length === 0 || autoMoveExecutadoRef.current) return;
@@ -1042,15 +1143,43 @@ function App() {
   };
 
   const leadsFiltradosGeral = useMemo(() => {
-    return leads.filter(l => {
+    const filtrados = leads.filter(l => {
       if (!isAdmin && (!l.responsavel || l.responsavel.toLowerCase() !== vendedor.toLowerCase())) return false;
       const dist = getDistNome(l);
       if (filtroDistribuidora !== 'todas' && dist.toLowerCase() !== filtroDistribuidora.toLowerCase()) return false;
+
+      // ITEM 8: mesmos filtros já disponíveis na visão Farmers, agora também no Kanban de Hunters.
+      if (filtroHunterCidade && !(l.cidade || '').toLowerCase().includes(filtroHunterCidade.toLowerCase())) return false;
+      if (filtroHunterUf !== 'todas' && (l.uf || '') !== filtroHunterUf) return false;
+      if (filtroHunterEtapa !== 'todas' && (l.etapa_funil || ETAPAS.LEAD) !== filtroHunterEtapa) return false;
+      if (filtroHunterDataContato) {
+          // Compara só a parte da data (YYYY-MM-DD) do retorno agendado do lead.
+          if (!l.proximo_contato) return false;
+          const dataLead = new Date(l.proximo_contato);
+          const iso = `${dataLead.getFullYear()}-${String(dataLead.getMonth()+1).padStart(2,'0')}-${String(dataLead.getDate()).padStart(2,'0')}`;
+          if (iso !== filtroHunterDataContato) return false;
+      }
+
       if (!busca) return true;
       const termo = busca.toLowerCase();
       return (l.nome?.toLowerCase().includes(termo) || l['CPF/CNPJ']?.includes(termo) || l.cidade?.toLowerCase().includes(termo) || l.uf?.toLowerCase().includes(termo) || l.telefone?.includes(termo) || dist.toLowerCase().includes(termo));
     });
-  }, [leads, isAdmin, vendedor, filtroDistribuidora, busca]);
+
+    // ITEM 8: ordenação opcional. No 'padrao' devolve como está — cada visão aplica a sua própria
+    // ordem (o Kanban ordena por urgência dentro de cada coluna).
+    if (ordenacaoHunter === 'nome_asc') return [...filtrados].sort((a, b) => (a.nome || '').localeCompare(b.nome || ''));
+    if (ordenacaoHunter === 'recentes') return [...filtrados].sort((a, b) => (b.data_criacao || 0) - (a.data_criacao || 0));
+    if (ordenacaoHunter === 'antigos') return [...filtrados].sort((a, b) => (a.data_criacao || 0) - (b.data_criacao || 0));
+    if (ordenacaoHunter === 'sem_contato') return [...filtrados].sort((a, b) => (a.ultima_interacao || 0) - (b.ultima_interacao || 0));
+    return filtrados;
+  }, [leads, isAdmin, vendedor, filtroDistribuidora, busca, filtroHunterCidade, filtroHunterUf, filtroHunterEtapa, filtroHunterDataContato, ordenacaoHunter]);
+
+  // ITEM 8: lista de UFs presentes nos leads visíveis, pra montar o select de estado sem hardcode.
+  const listaUfsHunters = useMemo(() => {
+     const ufs = new Set();
+     leads.forEach(l => { if (l.uf) ufs.add(l.uf); });
+     return Array.from(ufs).sort();
+  }, [leads]);
 
   const carteiraFarmersFiltrada = useMemo(() => {
      if (isAdmin) return carteiraFarmers;
@@ -2113,8 +2242,13 @@ function App() {
 
         if (data.ddd_telefone_1) {
             const telApi = data.ddd_telefone_1.replace(/\D/g, '');
-            const existingTels = leadAtual.telefones || [];
-            if (!existingTels.includes(telApi) && telApi.length >= 10) { updateData.telefones = [...existingTels, telApi]; if (!leadAtual.telefone) updateData.telefone = telApi; }
+            // ITEM 3: telefones agora são objetos {numero, nome, cargo}. O que vem da Receita entra
+            // sem nome/cargo — o vendedor preenche depois, ao falar com alguém naquele número.
+            const existingTels = listaTelefonesLead(leadAtual);
+            if (!existingTels.some(t => t.numero === telApi) && telApi.length >= 10) {
+                updateData.telefones = [...existingTels, { numero: telApi, nome: '', cargo: '' }];
+                if (!leadAtual.telefone) updateData.telefone = telApi;
+            }
         }
         await updateDoc(doc(db, "leads", leadAtual.id), updateData);
         mostrarMensagem('✅ Dados da Receita sincronizados!');
@@ -2140,8 +2274,12 @@ function App() {
     window.location.href = `tel:${telefone.replace(/\D/g, '')}`; setModalContatoConfirma({ lead, telefone, msg: '', canal: 'Ligação', isFarmerAlvo });
   };
 
+  // ITEM 6: `deuCerto` agora aceita três valores — true (deu certo), false (não deu certo) e null
+  // ("fechar sem classificar"). No caso null nada é gravado: o vendedor só descarta a pergunta,
+  // sem registrar sucesso nem falha e sem marcar o número como inválido.
   const confirmarContato = async (deuCerto) => {
     if (!modalContatoConfirma) return;
+    if (deuCerto === null) { setModalContatoConfirma(null); return; }
     const { lead, telefone, msg, canal, isFarmerAlvo } = modalContatoConfirma; const timestamp = Date.now(); const proximoDiaUtil = getNextBusinessDay().getTime();
     try {
         // NOVO: fluxo simplificado quando o alvo é uma revenda de carteira_ativa (Farmer) — sem
@@ -2237,7 +2375,12 @@ function App() {
     if (modalFinalizar.type === 'perda') { if (!motivoPerda) return mostrarMensagem('Selecione o motivo.', true); obs = `❌ Negócio Perdido: ${motivoPerda}`;
     } else {
         if (!onboardingForm.dataHora || !onboardingForm.gestor || !onboardingForm.telefone) return mostrarMensagem('Preencha os campos de Onboarding!', true);
-        obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`; setUploadProgresso('Criando tarefa no Bitrix24...');
+        obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`;
+        // ITEM 5: registra na linha do tempo o que funcionou e o que deu errado nessa venda, pra
+        // virar histórico de aprendizado do time (e não só um "ganho" sem contexto).
+        if (onboardingForm.oQueFuncionou) obs += `\n\n✅ O que funcionou: ${onboardingForm.oQueFuncionou}`;
+        if (onboardingForm.oQueDeuErrado) obs += `\n⚠️ Dificuldades/o que deu errado: ${onboardingForm.oQueDeuErrado}`;
+        setUploadProgresso('Criando tarefa no Bitrix24...');
         try {
             const leadCNPJ = modalFinalizar.lead['CPF/CNPJ'] || 'Sem CNPJ'; const leadRazao = modalFinalizar.lead.razao_social || modalFinalizar.lead.nome; const dataDataHoraStr = new Date(onboardingForm.dataHora).toLocaleString('pt-BR');
             const desc = `**AGENDAMENTO DE ONBOARDING**\n\nData e hora: ${dataDataHoraStr}\nProprietário ou Gestor: ${onboardingForm.gestor}\nContatos: ${onboardingForm.telefone}\nModelo/formato: ${onboardingForm.formato}\nPossui cadastro de outra revenda no App? ${onboardingForm.outroCadastro}\n\nVendedor Responsável: ${vendedor}`;
@@ -2271,8 +2414,10 @@ function App() {
   };
 
   const renderDashboard = () => {
-    const isMes = filtroTempoDash === 'mes'; const isSemana = filtroTempoDash === 'semana'; const now = new Date();
-    const checkTime = (timestamp) => { if (!timestamp) return false; const tDate = new Date(timestamp); if (isMes) return tDate.getMonth() === now.getMonth() && tDate.getFullYear() === now.getFullYear(); if (isSemana) return tDate >= new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000)); return true; };
+    // ITEM 10: checkTime agora deriva da janela centralizada (getJanelaTempoDash), que entende
+    // também "ontem" e o intervalo personalizado — antes só sabia tratar mês e semana.
+    const { inicio: janelaInicio, fim: janelaFim } = getJanelaTempoDash();
+    const checkTime = (timestamp) => { if (!timestamp) return false; return timestamp >= janelaInicio && timestamp <= janelaFim; };
 
     let baseLeads = leads.filter(l => { if (!isAdmin) return l.responsavel && l.responsavel.toLowerCase() === vendedor.toLowerCase(); if (filtroVendedorDash === 'todos') return true; return l.responsavel && l.responsavel.toLowerCase() === filtroVendedorDash.toLowerCase(); });
 
@@ -2332,6 +2477,52 @@ function App() {
     const dataCanais = Object.keys(contagensCanais).map(c => ({ name: c, value: contagensCanais[c] })); const lineChartData = Object.values(timelineData).reverse(); const canaisExistentes = Object.keys(contagensCanais);
     const META_POR_VENDEDOR = 20; const COMISSAO_REVENDA = 300; const qtdeVendedores = vendedores.filter(v=>v.ativo).length || 1; const metaAtual = filtroVendedorDash === 'todos' ? META_POR_VENDEDOR * qtdeVendedores : META_POR_VENDEDOR; const valorComissao = leadsConvertidos.length * COMISSAO_REVENDA;
 
+    // ITEM 9: análises por cidade. A cidade sai dos campos `cidade` e `uf` da coleção `leads` — os
+    // dois entram na chave ("Campinas - SP") pra não misturar cidades homônimas de estados diferentes.
+    const statsPorCidade = {};
+    baseLeads.forEach(l => {
+        const chave = l.cidade ? `${l.cidade}${l.uf ? ` - ${l.uf}` : ''}` : 'Sem cidade';
+        if (!statsPorCidade[chave]) statsPorCidade[chave] = { name: chave, total: 0, ganhos: 0, perdidos: 0, captados: 0, etapas: {} };
+        const s = statsPorCidade[chave];
+        s.total++;
+        if (l.status_venda === 'Ganho') s.ganhos++;
+        if (l.status_venda === 'Perdido') s.perdidos++;
+        // "Captação" = leads que ENTRARAM na base dentro do período selecionado.
+        if (checkTime(l.data_criacao)) s.captados++;
+        const etapa = l.etapa_funil === ETAPAS.FINALIZADO
+            ? (l.status_venda === 'Ganho' ? 'Ganhos' : 'Perdidos')
+            : (l.etapa_funil || ETAPAS.LEAD);
+        s.etapas[etapa] = (s.etapas[etapa] || 0) + 1;
+    });
+    const todasCidades = Object.values(statsPorCidade);
+
+    // Gráfico 1: captação por cidade (quantos leads novos entraram no período), top 10.
+    const dataCaptacaoCidade = todasCidades
+        .filter(c => c.captados > 0)
+        .sort((a, b) => b.captados - a.captados)
+        .slice(0, 10)
+        .map(c => ({ name: c.name, captados: c.captados }));
+
+    // Gráfico 2: marketshare por cidade = fatia da cidade que já virou venda (ganhos ÷ total de
+    // leads daquela cidade). Só considera cidades com base mínima de 3 leads, senão 1 ganho em 1
+    // lead vira "100% de share" e polui o ranking.
+    const dataMarketshareCidade = todasCidades
+        .filter(c => c.total >= 3 && c.name !== 'Sem cidade')
+        .map(c => ({ name: c.name, share: Number(((c.ganhos / c.total) * 100).toFixed(1)), ganhos: c.ganhos, total: c.total }))
+        .sort((a, b) => b.share - a.share)
+        .slice(0, 10);
+
+    // Gráfico 3: leads por cidade e etapa do funil (barras empilhadas), top 8 cidades por volume.
+    const etapasFunilGrafico = [ETAPAS.LEAD, ETAPAS.PRIMEIRO_CONTATO, ETAPAS.AGUARDANDO_RESPOSTA, ETAPAS.NEGOCIACAO, ETAPAS.CADASTRO, ETAPAS.TREINAMENTO, 'Ganhos', 'Perdidos'];
+    const dataCidadeEtapa = todasCidades
+        .sort((a, b) => b.total - a.total)
+        .slice(0, 8)
+        .map(c => {
+            const linha = { name: c.name };
+            etapasFunilGrafico.forEach(e => { linha[e] = c.etapas[e] || 0; });
+            return linha;
+        });
+
     return (
       <div className="flex-1 overflow-y-auto p-4 md:p-10 bg-slate-50">
          <button onClick={voltarVisao} className={`mb-4 bg-white border border-slate-200 px-3 md:px-4 py-2 rounded-xl text-xs md:text-sm font-bold hover:bg-slate-50 flex items-center gap-2 shadow-sm transition-colors w-fit`} style={{color: BRAND.gray}}>← Voltar</button>
@@ -2344,7 +2535,7 @@ function App() {
          <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
              <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>Métricas e Inteligência</h2>
              <div className="flex flex-col sm:flex-row gap-2 w-full xl:w-auto">
-                 <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}><option value="mes">Este Mês</option><option value="semana">Esta Semana</option><option value="tudo">Todo Período</option></select>
+                 {renderFiltroPeriodoDash()}
                  {isAdmin && (<select className="text-sm font-bold text-white py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}} value={filtroVendedorDash} onChange={e=>setFiltroVendedorDash(e.target.value)}><option value="todos">Vendedor: Todos</option>{vendedores.filter(v=>v.ativo).map(v => <option key={v.id} value={v.nome}>{v.nome}</option>)}</select>)}
              </div>
          </div>
@@ -2379,8 +2570,82 @@ function App() {
             <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm"><h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Motivos de Perda (Top 5)</h3><div className="h-56 md:h-64">{dataMotivos.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><BarChart data={dataMotivos} layout="vertical" margin={{ left: 10, right: 30, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" hide /><YAxis dataKey="name" type="category" width={150} tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill="#ef4444" radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Nenhuma perda registrada</div>}</div></div>
          </div>
 
+         {/* ITEM 9: análises geográficas, montadas a partir dos campos `cidade` e `uf` da coleção `leads`. */}
+         <h3 className="text-lg md:text-xl font-black tracking-tight mb-4 mt-8 flex items-center gap-2" style={{color: BRAND.black}}>
+            <span>🗺️</span> Análise por Cidade
+         </h3>
+
+         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <div className="mb-6">
+                  <h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Captação por Cidade (Top 10)</h3>
+                  <p className="text-[10px] text-slate-500 mt-1">Leads novos que entraram na base no período selecionado ({getLabelPeriodoDash()}).</p>
+               </div>
+               <div className="h-72 md:h-80">
+                  {dataCaptacaoCidade.length > 0 ? (
+                     <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={dataCaptacaoCidade} layout="vertical" margin={{ left: 10, right: 35, top: 5, bottom: 5 }}>
+                           <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/>
+                           <XAxis type="number" hide />
+                           <YAxis dataKey="name" type="category" width={130} tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} />
+                           <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} formatter={(v) => [`${v} leads`, 'Captados']} />
+                           <Bar dataKey="captados" fill={BRAND.blue} radius={[0, 4, 4, 0]}>
+                              <LabelList dataKey="captados" position="right" fill={BRAND.gray} fontSize={11} fontWeight="bold" />
+                           </Bar>
+                        </BarChart>
+                     </ResponsiveContainer>
+                  ) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Nenhum lead captado no período</div>}
+               </div>
+            </div>
+
+            <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <div className="mb-6">
+                  <h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Marketshare por Cidade (Top 10)</h3>
+                  <p className="text-[10px] text-slate-500 mt-1">% dos leads da cidade que viraram venda. Só cidades com 3+ leads na base.</p>
+               </div>
+               <div className="h-72 md:h-80">
+                  {dataMarketshareCidade.length > 0 ? (
+                     <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={dataMarketshareCidade} layout="vertical" margin={{ left: 10, right: 45, top: 5, bottom: 5 }}>
+                           <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/>
+                           <XAxis type="number" domain={[0, 100]} hide />
+                           <YAxis dataKey="name" type="category" width={130} tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} />
+                           <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} formatter={(v, n, props) => [`${v}% (${props.payload.ganhos} de ${props.payload.total})`, 'Conversão']} />
+                           <Bar dataKey="share" fill={BRAND.yellow} radius={[0, 4, 4, 0]}>
+                              <LabelList dataKey="share" position="right" fill={BRAND.gray} fontSize={11} fontWeight="bold" formatter={(v) => `${v}%`} />
+                           </Bar>
+                        </BarChart>
+                     </ResponsiveContainer>
+                  ) : <div className="h-full flex items-center justify-center font-medium text-sm px-6 text-center" style={{color: BRAND.gray}}>Sem cidades com base suficiente (mínimo de 3 leads) para calcular o share</div>}
+               </div>
+            </div>
+         </div>
+
+         <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6">
+            <div className="mb-6">
+               <h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Leads por Cidade e Etapa do Funil (Top 8)</h3>
+               <p className="text-[10px] text-slate-500 mt-1">Distribuição da base atual de cada cidade ao longo do funil. Barras empilhadas.</p>
+            </div>
+            <div className="h-80 md:h-96">
+               {dataCidadeEtapa.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                     <BarChart data={dataCidadeEtapa} margin={{ left: -20, right: 10, top: 10, bottom: 60 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0"/>
+                        <XAxis dataKey="name" tick={{fontSize: 9, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} angle={-35} textAnchor="end" height={70} />
+                        <YAxis tick={{fontSize: 10, fill: BRAND.gray}} />
+                        <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
+                        <Legend wrapperStyle={{fontSize: '10px', fontWeight: 'bold', paddingTop: '10px'}} />
+                        {etapasFunilGrafico.map((etapa, idx) => (
+                           <Bar key={etapa} dataKey={etapa} stackId="funil" fill={etapa === 'Ganhos' ? '#10b981' : etapa === 'Perdidos' ? '#ef4444' : CORES_GRAFICO[idx % CORES_GRAFICO.length]} />
+                        ))}
+                     </BarChart>
+                  </ResponsiveContainer>
+               ) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Sem leads com cidade cadastrada</div>}
+            </div>
+         </div>
+
          <div className="p-6 md:p-8 rounded-2xl text-white shadow-xl flex flex-col md:flex-row justify-between items-start md:items-center gap-6" style={{backgroundColor: BRAND.black}}>
-             <div className="w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Meta de Vendas ({filtroTempoDash})</p><div className="flex items-end gap-2 mb-3"><span className="text-3xl md:text-4xl font-black" style={{color: BRAND.yellow}}>{leadsConvertidos.length}</span><span className="text-lg md:text-xl text-white/50 mb-0.5">/ {metaAtual} fechamentos</span></div><div className="w-full md:w-64 h-3 rounded-full overflow-hidden" style={{backgroundColor: 'rgba(255,255,255,0.1)'}}><div className="h-full rounded-full transition-all duration-1000" style={{backgroundColor: BRAND.yellow, width: `${Math.min((leadsConvertidos.length/metaAtual)*100, 100)}%`}}></div></div></div>
+             <div className="w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Meta de Vendas ({getLabelPeriodoDash()})</p><div className="flex items-end gap-2 mb-3"><span className="text-3xl md:text-4xl font-black" style={{color: BRAND.yellow}}>{leadsConvertidos.length}</span><span className="text-lg md:text-xl text-white/50 mb-0.5">/ {metaAtual} fechamentos</span></div><div className="w-full md:w-64 h-3 rounded-full overflow-hidden" style={{backgroundColor: 'rgba(255,255,255,0.1)'}}><div className="h-full rounded-full transition-all duration-1000" style={{backgroundColor: BRAND.yellow, width: `${Math.min((leadsConvertidos.length/metaAtual)*100, 100)}%`}}></div></div></div>
              <div className="text-left md:text-right border-t md:border-t-0 md:border-l border-white/20 pt-6 md:pt-0 md:pl-8 w-full md:w-auto"><p className="text-white/60 text-xs md:text-sm font-bold uppercase tracking-widest mb-1">Projeção de Ganhos</p><p className="text-3xl md:text-4xl font-black text-white">R$ {valorComissao.toLocaleString('pt-BR')}</p><p className="text-xs md:text-sm font-medium mt-1" style={{color: BRAND.yellow}}>+ R$ {COMISSAO_REVENDA} por venda</p></div>
          </div>
       </div>
@@ -2514,7 +2779,7 @@ function App() {
          <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-4">
              <h2 className="text-2xl md:text-3xl font-black tracking-tight" style={{color: BRAND.black}}>Métricas Farmers</h2>
              <div className="flex flex-col sm:flex-row gap-2 w-full xl:w-auto">
-                <select className="bg-white border border-slate-200 text-sm font-bold py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{color: BRAND.black}} value={filtroTempoDash} onChange={e=>setFiltroTempoDash(e.target.value)}><option value="mes">Este Mês</option><option value="semana">Esta Semana</option><option value="tudo">Todo Período</option></select>
+                {renderFiltroPeriodoDash()}
                 {isAdmin && (
                     <select className="text-sm font-bold text-white py-3 px-4 rounded-xl shadow-sm outline-none w-full sm:w-auto" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}} value={filtroFarmerCarteiraDash} onChange={e=>setFiltroFarmerCarteiraDash(e.target.value)}>
                         <option value="todas">Carteira: Todas</option>
@@ -2552,7 +2817,7 @@ function App() {
          </div>
 
          <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6 border-l-4" style={{borderLeftColor: BRAND.blue}}>
-             <h3 className="text-xs font-bold uppercase tracking-widest mb-1" style={{color: BRAND.gray}}>💬 Comentários Inseridos ({filtroTempoDash === 'mes' ? 'este mês' : filtroTempoDash === 'semana' ? 'esta semana' : 'todo período'})</h3>
+             <h3 className="text-xs font-bold uppercase tracking-widest mb-1" style={{color: BRAND.gray}}>💬 Comentários Inseridos ({getLabelPeriodoDash()})</h3>
              <p className="text-4xl md:text-5xl font-black" style={{color: BRAND.black}}>{totalComentarios}</p>
          </div>
 
@@ -2883,7 +3148,6 @@ function App() {
 
         {/* MENU NAVEGAÇÃO HORIZONTAL */}
         <div className="flex bg-slate-100 p-1.5 mx-4 mt-4 rounded-xl gap-1 shrink-0 overflow-x-auto relative">
-          {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('lista')} className={`flex-1 min-w-[50px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'lista' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'lista' ? BRAND.blue : BRAND.gray}}>Lista</button>}
           {(isAdmin || isHunterProfile) && <button onClick={() => mudarVisao('kanban')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'kanban' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'kanban' ? BRAND.blue : BRAND.gray}}>Kanban</button>}
           {(isAdmin || isFarmerProfile) && <button onClick={() => mudarVisao('performance')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'performance' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'performance' ? BRAND.blue : BRAND.gray}}>Farmers</button>}
           {(isAdmin || isFarmerProfile) && <button onClick={() => mudarVisao('planos_acao')} className={`flex-1 min-w-[60px] text-[10px] md:text-[11px] font-bold py-2 px-1 rounded-lg transition-all ${visaoAtual === 'planos_acao' ? 'bg-white shadow-sm' : 'hover:text-slate-800'}`} style={{color: visaoAtual === 'planos_acao' ? BRAND.blue : BRAND.gray}}>🎯 Planos</button>}
@@ -3013,14 +3277,19 @@ function App() {
                              <span className="text-xs font-bold uppercase tracking-wider">Telefones</span>
                          </div>
                          {!editandoTels ? (
-                             <button onClick={() => { setTelsTemp(leadAtual.telefones?.length > 0 ? [...leadAtual.telefones] : (leadAtual.telefone ? [leadAtual.telefone] : [])); setEditandoTels(true); }} className="bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-slate-50 transition-colors" style={{color: BRAND.blue}}>Editar</button>
+                             <button onClick={() => { setTelsTemp(listaTelefonesLead(leadAtual)); setEditandoTels(true); }} className="bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-slate-50 transition-colors" style={{color: BRAND.blue}}>Editar</button>
                          ) : (
                              <div className="flex gap-2">
                                  <button onClick={() => setEditandoTels(false)} className="bg-white border border-slate-200 text-slate-500 px-3 py-1.5 rounded-lg text-[10px] md:text-xs font-bold shadow-sm hover:bg-slate-50">Cancelar</button>
                                  <button onClick={async () => {
-                                     const limpos = telsTemp.map(t => t.trim()).filter(t => t !== '');
+                                     // ITEM 3: grava cada telefone como objeto {numero, nome, cargo}. O campo `telefone`
+                                     // (string) continua sendo mantido com o primeiro número por compatibilidade com o
+                                     // resto do app (busca, disparo de WhatsApp, exportação).
+                                     const limpos = telsTemp
+                                         .map(t => ({ numero: (t.numero || '').trim(), nome: (t.nome || '').trim(), cargo: (t.cargo || '').trim() }))
+                                         .filter(t => t.numero !== '');
                                      try {
-                                         await updateDoc(doc(db, "leads", leadAtual.id), { telefones: limpos, telefone: limpos[0] || '' });
+                                         await updateDoc(doc(db, "leads", leadAtual.id), { telefones: limpos, telefone: limpos[0]?.numero || '' });
                                          setEditandoTels(false);
                                          mostrarMensagem('Telefones salvos!');
                                      } catch(e) { mostrarMensagem('Erro ao salvar', true); }
@@ -3032,14 +3301,21 @@ function App() {
                       {!editandoTels ? (
                          <div className="flex flex-col gap-2">
                              {(() => {
-                                 const displayTels = leadAtual.telefones?.length > 0 ? leadAtual.telefones : (leadAtual.telefone ? [leadAtual.telefone] : []);
+                                 const displayTels = listaTelefonesLead(leadAtual);
                                  if (displayTels.length === 0) return <span className="font-semibold text-sm md:text-base" style={{color: BRAND.gray}}>Sem telefone cadastrado</span>;
-                                 
-                                 return displayTels.map((tel, idx) => {
+
+                                 return displayTels.map((t, idx) => {
+                                     const tel = t.numero;
                                      const invalido = (leadAtual.telefones_invalidos || []).includes(tel);
                                      return (
                                          <div key={idx} className="flex gap-2 items-center w-full">
                                              <div className="font-semibold text-sm md:text-base flex-1 bg-white p-3 rounded-xl border border-slate-200 shadow-sm transition-all text-left" style={{color: BRAND.black}}>
+                                                 {/* ITEM 3: quem atende neste número, preenchido pelo vendedor */}
+                                                 {(t.nome || t.cargo) && (
+                                                     <span className="text-[10px] font-bold uppercase block" style={{color: BRAND.gray}}>
+                                                         {t.nome}{t.nome && t.cargo ? ' · ' : ''}{t.cargo}
+                                                     </span>
+                                                 )}
                                                  {tel}
                                              </div>
                                              {invalido ? (
@@ -3062,14 +3338,21 @@ function App() {
                              })()}
                          </div>
                       ) : (
-                         <div className="flex flex-col gap-2">
+                         <div className="flex flex-col gap-3">
+                             {/* ITEM 3: além do número, o vendedor informa NOME e CARGO de quem falou naquele contato. */}
                              {telsTemp.map((tel, idx) => (
-                                 <div key={idx} className="flex gap-2 items-center">
-                                     <input type="text" className="flex-1 border-2 border-slate-200 p-2.5 rounded-xl text-sm font-semibold outline-none bg-white" style={{color: BRAND.black}} value={tel} onChange={e => { const n = [...telsTemp]; n[idx] = e.target.value; setTelsTemp(n); }} placeholder="Ex: 11999999999" />
-                                     <button onClick={() => { const n = [...telsTemp]; n.splice(idx, 1); setTelsTemp(n); }} className="bg-red-50 text-red-500 hover:bg-red-100 p-2.5 rounded-xl font-bold transition-colors">✕</button>
+                                 <div key={idx} className="bg-white p-3 rounded-xl border-2 border-slate-200 space-y-2">
+                                     <div className="flex gap-2 items-center">
+                                         <input type="text" className="flex-1 border-2 border-slate-200 p-2.5 rounded-xl text-sm font-semibold outline-none bg-white" style={{color: BRAND.black}} value={tel.numero || ''} onChange={e => { const n = [...telsTemp]; n[idx] = { ...n[idx], numero: e.target.value }; setTelsTemp(n); }} placeholder="Telefone. Ex: 11999999999" />
+                                         <button onClick={() => { const n = [...telsTemp]; n.splice(idx, 1); setTelsTemp(n); }} className="bg-red-50 text-red-500 hover:bg-red-100 p-2.5 rounded-xl font-bold transition-colors shrink-0">✕</button>
+                                     </div>
+                                     <div className="flex flex-col sm:flex-row gap-2">
+                                         <input type="text" className="flex-1 border-2 border-slate-200 p-2.5 rounded-xl text-xs font-semibold outline-none bg-white" style={{color: BRAND.black}} value={tel.nome || ''} onChange={e => { const n = [...telsTemp]; n[idx] = { ...n[idx], nome: e.target.value }; setTelsTemp(n); }} placeholder="Nome de quem falou" />
+                                         <input type="text" className="flex-1 border-2 border-slate-200 p-2.5 rounded-xl text-xs font-semibold outline-none bg-white" style={{color: BRAND.black}} value={tel.cargo || ''} onChange={e => { const n = [...telsTemp]; n[idx] = { ...n[idx], cargo: e.target.value }; setTelsTemp(n); }} placeholder="Cargo (ex: Proprietário)" />
+                                     </div>
                                  </div>
                              ))}
-                             <button onClick={() => setTelsTemp([...telsTemp, ''])} className="mt-1 text-xs font-bold border py-3 rounded-xl transition-colors border-dashed w-full text-center" style={{color: BRAND.blue, borderColor: BRAND.blue, backgroundColor: `${BRAND.blue}10`}}>+ Adicionar Número</button>
+                             <button onClick={() => setTelsTemp([...telsTemp, { numero: '', nome: '', cargo: '' }])} className="mt-1 text-xs font-bold border py-3 rounded-xl transition-colors border-dashed w-full text-center" style={{color: BRAND.blue, borderColor: BRAND.blue, backgroundColor: `${BRAND.blue}10`}}>+ Adicionar Número</button>
                          </div>
                       )}
                     </div>
@@ -3086,10 +3369,35 @@ function App() {
                         {Object.values(ETAPAS).map(e => <option key={e} value={e}>{e}</option>)}
                      </select>
                   </div>
+
+                  {/* ITEM 5: os botões de finalização vieram do card do Kanban pra cá. Agora o vendedor
+                      é obrigado a ABRIR o lead antes de mandar pra "Finalizados", e o 🏆 abre o popup
+                      de registro (onde entram as informações de sucesso e os aprendizados). */}
+                  {leadAtual.etapa_funil !== ETAPAS.FINALIZADO ? (
+                     <div className="mt-4 bg-[#f8fafc] p-4 rounded-2xl border border-slate-200">
+                        <p className="text-xs font-bold uppercase tracking-widest mb-3" style={{color: BRAND.gray}}>Finalizar Negociação</p>
+                        <div className="flex flex-col sm:flex-row gap-3">
+                           <button onClick={() => setModalFinalizar({type: 'perda', lead: leadAtual})} className="flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">
+                              👎 Registrar Perda
+                           </button>
+                           <button onClick={() => setModalFinalizar({type: 'ganho', lead: leadAtual})} className="flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">
+                              🏆 Registrar Venda
+                           </button>
+                        </div>
+                     </div>
+                  ) : (
+                     <div className={`mt-4 p-4 rounded-2xl border text-sm font-bold flex items-center justify-between gap-3 flex-wrap ${leadAtual.status_venda === 'Ganho' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-600 border-red-200'}`}>
+                        <span>
+                           {leadAtual.status_venda === 'Ganho' ? '🏆 Venda fechada' : `👎 Negócio perdido${leadAtual.motivo_perda ? `: ${leadAtual.motivo_perda}` : ''}`}
+                        </span>
+                        {/* Permite reabrir um lead finalizado por engano, voltando-o para a negociação. */}
+                        <button onClick={() => mudarEtapaLead(leadAtual, ETAPAS.NEGOCIACAO)} className="text-xs font-bold px-3 py-2 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 transition-colors" style={{color: BRAND.gray}}>
+                           ♻️ Reabrir
+                        </button>
+                     </div>
+                  )}
                 </div>
               </div>
-
-              {/* Formulário Interação Anti-Lag */}
               <PainelInteracao alvo={leadAtual} vendedor={vendedor} onHistoricoSalvo={buscarHistoricoCard} mostrarMensagem={mostrarMensagem} />
 
               <div className="space-y-4">
@@ -3759,71 +4067,43 @@ function App() {
           </div>
         )}
 
-        {/* VIEW: Lista (Hunters) */}
-        <div onScroll={(e) => {
-             const { scrollTop, scrollHeight, clientHeight } = e.target;
-             if (scrollHeight - scrollTop <= clientHeight * 1.5) {
-                 setItensVisiveisLista(prev => prev + 50);
-             }
-         }} className={`${!leadAtual && visaoAtual === 'lista' ? 'block' : 'hidden'} flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50`}>
-          {leadsFiltradosGeral.slice(0, itensVisiveisLista).map(lead => {
-            const urg = getUrgency(lead);
-            const distNome = getDistNome(lead);
-            const telefones = lead.telefones?.length > 0 ? lead.telefones : (lead.telefone ? [lead.telefone] : []);
-            const telValido = telefones.find(t => !(lead.telefones_invalidos || []).includes(t));
-
-            return (
-              <div key={lead.id} onClick={() => abrirCardLead(lead.id)} className={`bg-white p-4 rounded-2xl cursor-pointer transition-all border shadow-sm hover:shadow-md ${urg.status === 'atrasado' || urg.status === 'ocioso' || urg.status === 'vacuo' ? 'border-red-400 border-2' : 'border-slate-200'}`}>
-                <div className="flex justify-between items-start mb-1">
-                   <h3 className="font-bold text-xs md:text-sm truncate mr-2" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h3>
-                   <span className="shrink-0 bg-purple-100 text-purple-700 text-[9px] md:text-[10px] font-black px-2 py-0.5 rounded border border-purple-200 uppercase whitespace-nowrap">
-                      {lead.etapa_funil || ETAPAS.LEAD}
-                   </span>
-                </div>
-                
-                <div className="flex flex-wrap gap-1.5 mb-2">
-                  <p className="text-[10px] md:text-xs truncate flex items-center gap-1" style={{color: BRAND.gray}}>
-                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                     {lead.cidade ? `${lead.cidade} - ${lead.uf}` : '-'}
-                  </p>
-                  {distNome && (
-                     <span className="text-[9px] md:text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate flex items-center gap-1">
-                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path></svg>
-                       {distNome}
-                     </span>
-                  )}
-                </div>
-
-                <div className="flex justify-between items-center mb-2 gap-2">
-                  {telValido ? (
-                      <button onClick={(e) => { e.stopPropagation(); abrirWhatsApp(lead, telValido); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-[#f0fdf4] text-[#166534] border-[#bbf7d0] hover:bg-[#dcfce7] transition-colors flex items-center gap-1 shadow-sm">
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
-                          Chamar
-                      </button>
-                  ) : telefones.length > 0 ? (
-                      <button onClick={(e) => { e.stopPropagation(); abrirLigacao(lead, telefones[0]); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase text-white shadow-sm flex items-center gap-1 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}}>
-                          📞 Ligar
-                      </button>
-                  ) : (
-                      <span className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-slate-50 text-slate-500 border-slate-200">Sem Tel</span>
-                  )}
-                  <span className="text-[9px] md:text-[10px] font-extrabold uppercase px-2 py-1 rounded-lg border" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue, borderColor: `${BRAND.blue}30`}}>{lead.responsavel || 'SEM DONO'}</span>
-                </div>
-                {urg.status !== 'novo' && urg.status !== 'em_dia' && urg.status !== 'finalizado' && (
-                   <div className={`text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-md text-center border ${urg.css}`}>{urg.texto}</div>
-                )}
-              </div>
-            )
-          })}
-          {itensVisiveisLista < leadsFiltradosGeral.length && (
-              <div className="py-4 text-center">
-                  <span className="text-xs font-bold text-slate-400 animate-pulse border border-slate-200 px-4 py-2 rounded-xl bg-white shadow-sm">Carregando mais...</span>
-              </div>
-          )}
-        </div>
-
         {/* VIEW: Kanban (Hunters) */}
-        <div className={`${!leadAtual && visaoAtual === 'kanban' ? 'flex' : 'hidden'} flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6 gap-4 md:gap-6 h-full bg-slate-100 items-start`} ref={kanbanRef}>
+        <div className={`${!leadAtual && visaoAtual === 'kanban' ? 'flex' : 'hidden'} flex-1 flex-col overflow-hidden h-full bg-slate-100`}>
+          {/* ITEM 8: mesma barra de filtros/ordenação que já existe na visão Farmers */}
+          <div className="px-4 md:px-6 pt-4 md:pt-6 shrink-0">
+             <div className="w-full flex flex-wrap gap-2 bg-white p-3 rounded-2xl border border-slate-200 shadow-sm">
+                <div className="relative flex-1 min-w-[160px]">
+                   <input type="text" placeholder="🔍 Buscar por cidade..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroHunterCidade} onChange={e => setFiltroHunterCidade(e.target.value)} />
+                </div>
+                <div className="relative flex-1 min-w-[160px]">
+                   <input type="text" placeholder="🔍 Buscar por nome, CNPJ ou telefone..." className="w-full text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={busca} onChange={e => setBusca(e.target.value)} />
+                </div>
+                <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroHunterUf} onChange={e => setFiltroHunterUf(e.target.value)}>
+                   <option value="todas">Estado: Todos</option>
+                   {listaUfsHunters.map(uf => <option key={uf} value={uf}>{uf}</option>)}
+                </select>
+                <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroHunterEtapa} onChange={e => setFiltroHunterEtapa(e.target.value)}>
+                   <option value="todas">Etapa: Todas</option>
+                   {Object.values(ETAPAS).map(e => <option key={e} value={e}>{e}</option>)}
+                </select>
+                {/* Filtra os leads que precisam de contato numa data específica (proximo_contato) */}
+                <input type="date" title="Filtrar por data de retorno agendado" className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: filtroHunterDataContato ? BRAND.blueDark : BRAND.gray}} value={filtroHunterDataContato} onChange={e => setFiltroHunterDataContato(e.target.value)} />
+                <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none bg-blue-50" style={{color: BRAND.blueDark}} value={ordenacaoHunter} onChange={e => setOrdenacaoHunter(e.target.value)}>
+                   <option value="padrao">Ordenar: Padrão (urgência)</option>
+                   <option value="recentes">🆕 Mais recentes primeiro</option>
+                   <option value="antigos">📅 Mais antigos primeiro</option>
+                   <option value="sem_contato">🚨 Sem contato há mais tempo</option>
+                   <option value="nome_asc">🔤 Nome (A-Z)</option>
+                </select>
+                {(filtroHunterCidade || busca || filtroHunterUf !== 'todas' || filtroHunterEtapa !== 'todas' || filtroHunterDataContato || ordenacaoHunter !== 'padrao') && (
+                   <button onClick={() => { setFiltroHunterCidade(''); setBusca(''); setFiltroHunterUf('todas'); setFiltroHunterEtapa('todas'); setFiltroHunterDataContato(''); setOrdenacaoHunter('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
+                      ✕ Limpar
+                   </button>
+                )}
+             </div>
+          </div>
+
+          <div className="flex-1 flex overflow-x-auto overflow-y-hidden p-4 md:p-6 gap-4 md:gap-6 items-start" ref={kanbanRef}>
           {Object.values(ETAPAS).map(etapa => {
             const leadsEtapa = leadsFiltradosGeral.filter(l => {
               if (etapa === ETAPAS.FINALIZADO) return l.etapa_funil === ETAPAS.FINALIZADO;
@@ -3841,7 +4121,12 @@ function App() {
                   {leadsEtapa.map(lead => {
                     const urg = getUrgency(lead);
                     const distNome = getDistNome(lead);
-                    
+                    // ITEM 4: mesma lógica de contato que existia na visão Lista — pega o primeiro
+                    // número não marcado como inválido pra o WhatsApp; se todos estiverem inválidos
+                    // (sem WhatsApp), cai pro botão de ligação.
+                    const telefonesLead = listaTelefonesLead(lead);
+                    const telValido = telefonesLead.find(t => !(lead.telefones_invalidos || []).includes(t.numero));
+
                     let kanbanCardBg = 'bg-white';
                     let kanbanCardBorder = 'border-[#e2e8f0]';
                     if (lead.etapa_funil === ETAPAS.FINALIZADO) {
@@ -3865,11 +4150,24 @@ function App() {
                         
                         <h4 className="font-black text-sm md:text-base mb-2 md:mb-3 leading-tight truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h4>
                         <div className={`text-[10px] md:text-[11px] font-bold px-2 md:px-3 py-1 md:py-1.5 rounded-lg mb-3 md:mb-4 text-center border ${urg.css}`}>{urg.texto}</div>
-                        
-                        <div className="grid grid-cols-3 gap-1.5 md:gap-2">
-                          {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'perda', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">👎</button>}
-                          <button onClick={(e) => { e.stopPropagation(); abrirCardLead(lead.id); }} className={`py-1.5 md:py-2 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs transition-colors hover:text-white ${lead.etapa_funil === ETAPAS.FINALIZADO ? 'col-span-3' : ''}`} style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue}} onMouseEnter={e => e.target.style.backgroundColor = BRAND.blue} onMouseLeave={e => e.target.style.backgroundColor = `${BRAND.blue}10`} >Abrir</button>
-                          {lead.etapa_funil !== ETAPAS.FINALIZADO && <button onClick={(e) => { e.stopPropagation(); setModalFinalizar({type: 'ganho', lead}) }} className="py-1.5 md:py-2 bg-slate-50 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 rounded-lg md:rounded-xl font-bold text-[10px] md:text-xs">🏆</button>}
+
+                        {/* ITEM 4: os botões 👎 / Abrir / 🏆 saíram daqui e foram pra dentro do card aberto
+                            (ITEM 5), pra obrigar o vendedor a abrir o lead antes de finalizar. Na frente do
+                            card fica só o contato rápido. */}
+                        <div className="flex justify-between items-center gap-2">
+                          {telValido ? (
+                              <button onClick={(e) => { e.stopPropagation(); abrirWhatsApp(lead, telValido.numero); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-[#f0fdf4] text-[#166534] border-[#bbf7d0] hover:bg-[#dcfce7] transition-colors flex items-center gap-1 shadow-sm">
+                                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.015c-.198 0-.52.074-.792.347-.272.271-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                                  Chamar
+                              </button>
+                          ) : telefonesLead.length > 0 ? (
+                              <button onClick={(e) => { e.stopPropagation(); abrirLigacao(lead, telefonesLead[0].numero); }} className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase text-white shadow-sm flex items-center gap-1 transition-colors hover:opacity-90" style={{backgroundColor: BRAND.blue, borderColor: BRAND.blueDark}}>
+                                  📞 Ligar
+                              </button>
+                          ) : (
+                              <span className="px-2 md:px-2.5 py-1 text-[9px] md:text-[10px] font-extrabold rounded-lg border uppercase bg-slate-50 text-slate-500 border-slate-200">Sem Tel</span>
+                          )}
+                          <span className="text-[9px] md:text-[10px] font-extrabold uppercase px-2 py-1 rounded-lg border truncate" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blue, borderColor: `${BRAND.blue}30`}}>{lead.responsavel || 'SEM DONO'}</span>
                         </div>
                       </div>
                     );
@@ -3878,6 +4176,7 @@ function App() {
               </div>
             );
           })}
+          </div>
         </div>
 
         {/* OUTRAS VIEWS (Dash, Mapa, Appgas, Gerenciar) */}
@@ -4384,6 +4683,10 @@ function App() {
                 👍 Sim, deu certo
               </button>
             </div>
+            {/* ITEM 6: saída sem classificar — não grava histórico nem marca o número como inválido. */}
+            <button onClick={() => confirmarContato(null)} className="w-full mt-3 px-4 py-2.5 bg-slate-100 font-bold rounded-xl hover:bg-slate-200 text-xs md:text-sm transition-colors" style={{color: BRAND.gray}}>
+              Fechar sem classificar
+            </button>
           </div>
         </div>
       )}
@@ -4430,6 +4733,22 @@ function App() {
                               <option value="Não">Não</option>
                               <option value="Sim">Sim</option>
                           </select>
+                      </div>
+                  </div>
+
+                  {/* ITEM 5: registro de aprendizado da venda — o que funcionou e o que deu errado.
+                      Vai para a linha do tempo do lead (ver processarFinalizacao). */}
+                  <div className="pt-4 border-t border-slate-200">
+                      <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Aprendizados da Negociação</p>
+                      <div className="space-y-3">
+                          <div>
+                              <label className="block text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>✅ O que funcionou nessa venda?</label>
+                              <textarea rows="2" placeholder="Ex: abordagem por indicação, demonstração do app na primeira ligação..." className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm outline-none resize-none" value={onboardingForm.oQueFuncionou} onChange={e => setOnboardingForm({...onboardingForm, oQueFuncionou: e.target.value})} />
+                          </div>
+                          <div>
+                              <label className="block text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>⚠️ O que deu errado / travou no caminho?</label>
+                              <textarea rows="2" placeholder="Ex: demora na análise de crédito, dificuldade para falar com o sócio..." className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm outline-none resize-none" value={onboardingForm.oQueDeuErrado} onChange={e => setOnboardingForm({...onboardingForm, oQueDeuErrado: e.target.value})} />
+                          </div>
                       </div>
                   </div>
               </div>
