@@ -124,8 +124,16 @@ const getFarmerStatus = (revenda) => {
     return { key: 'desabilitada', text: '⚪ Desabilitada', bg: 'bg-slate-100', textCol: 'text-slate-600', border: 'border-slate-200' };
 };
 
-// NOVO: sinalização de follow-up agendado para uma revenda de Farmer — equivalente simplificado do
-// getUrgency dos Hunters, mas só olhando o proximo_contato (não existe "ghosting"/funil para revenda).
+// NOVO: as duas coleções guardam o documento em formatos diferentes — em `leads` o campo
+// "CPF/CNPJ" vem só com dígitos ("23537107000179") e em `carteira_ativa` o campo `cnpj` vem
+// formatado ("28.972.557/0001-03"). Para cruzar as duas bases, tudo passa por aqui e vira só
+// dígitos. Retorna '' quando não há documento ou quando o valor é curto demais para ser um CNPJ
+// válido (evita casar dois cadastros incompletos por engano).
+const normalizarCNPJ = (valor) => {
+    if (!valor) return '';
+    const digitos = String(valor).replace(/\D/g, '');
+    return digitos.length >= 11 ? digitos : '';
+};
 const getFarmerUrgency = (revenda) => {
     if (!revenda.proximo_contato) return null;
     const now = Date.now();
@@ -672,6 +680,12 @@ function App() {
 
   const [leads, setLeads] = useState([]);
   const [carteiraFarmers, setCarteiraFarmers] = useState([]);
+  // NOVO: status de sincronização da carteira_ativa, visível na UI — sem isso, se o carregamento
+  // falhar silenciosamente (permissão, rede, etc.) o vendedor não tem como saber que o alerta de
+  // "revenda já cadastrada" está rodando com a base vazia.
+  const [carteiraFarmersSincronizando, setCarteiraFarmersSincronizando] = useState(false);
+  const [carteiraFarmersUltimaSync, setCarteiraFarmersUltimaSync] = useState(null);
+  const [carteiraFarmersErro, setCarteiraFarmersErro] = useState('');
   // NOVO: Planos de Ação (metas quantitativas por revenda, ligadas às métricas já rastreadas)
   const [planosAcao, setPlanosAcao] = useState([]);
   const [planosAcaoCarregados, setPlanosAcaoCarregados] = useState(false);
@@ -723,6 +737,8 @@ function App() {
   const [filtroHunterUf, setFiltroHunterUf] = useState('todas');
   const [filtroHunterEtapa, setFiltroHunterEtapa] = useState('todas');
   const [filtroHunterDataContato, setFiltroHunterDataContato] = useState('');
+  // NOVO: filtra leads conforme já sejam/tenham sido revenda Appgas (cruzamento por CNPJ).
+  const [filtroHunterRevenda, setFiltroHunterRevenda] = useState('todos');
   const [ordenacaoHunter, setOrdenacaoHunter] = useState('padrao');
 
   // NOVO: filtros e ordenação da visão Farmers
@@ -872,13 +888,30 @@ function App() {
       return () => unsubLeads();
   }, [logado, isAdmin, vendedor, isFarmerProfile]);
 
-  const carregarCarteiraFarmers = async () => {
+  // ALTERADO: antes, qualquer erro que não fosse 'permission-denied' era engolido em silêncio —
+  // se a leitura falhasse por outro motivo (regra do Firestore, índice, rede), carteiraFarmers
+  // ficava vazia pra sempre e o alerta de "revenda já cadastrada" no Kanban de vendas nunca
+  // aparecia, sem nenhum sinal disso na tela. Agora todo erro fica visível em carteiraFarmersErro
+  // e, quando chamado pelo botão "Sincronizar" (manual=true), também num toast de confirmação.
+  const carregarCarteiraFarmers = async (manual = false) => {
+      setCarteiraFarmersSincronizando(true);
+      setCarteiraFarmersErro('');
       try {
           const qs = await getDocs(collection(db, "carteira_ativa"));
           const data = qs.docs.map(d => ({ id: d.id, ...d.data() }));
           setCarteiraFarmers(data);
+          setCarteiraFarmersUltimaSync(Date.now());
+          if (manual) mostrarMensagem(`✅ Carteira sincronizada: ${data.length} revendas carregadas.`);
       } catch (e) {
+          console.error('Erro ao carregar carteira_ativa:', e);
           if (e.code === 'permission-denied') setErroPermissaoFirebase(true);
+          const msg = e.code === 'permission-denied'
+              ? 'Sem permissão para ler a carteira_ativa — o alerta de revenda duplicada não vai funcionar.'
+              : `Erro ao carregar a carteira_ativa: ${e.message || e.code || 'erro desconhecido'}`;
+          setCarteiraFarmersErro(msg);
+          mostrarMensagem(`⚠️ ${msg}`, true);
+      } finally {
+          setCarteiraFarmersSincronizando(false);
       }
   };
 
@@ -940,13 +973,18 @@ function App() {
   };
 
   useEffect(() => {
-      if ((visaoAtual === 'performance' || visaoAtual === 'dashboard' || visaoAtual === 'planos_acao') && carteiraFarmers.length === 0) {
+      // Sem login ainda não há permissão de leitura no Firestore — sair cedo evita um
+      // permission-denied logo na abertura (o Kanban é a visão inicial do app).
+      if (!logado) return;
+      // NOVO: o 'kanban' (CRM de vendas) entrou nessa lista porque agora cruza os leads com a
+      // carteira_ativa por CNPJ, para avisar o vendedor quando a revenda já é/foi cliente Appgas.
+      if ((visaoAtual === 'kanban' || visaoAtual === 'performance' || visaoAtual === 'dashboard' || visaoAtual === 'planos_acao') && carteiraFarmers.length === 0) {
           carregarCarteiraFarmers();
       }
       if ((visaoAtual === 'performance' || visaoAtual === 'planos_acao') && !planosAcaoCarregados) {
           carregarPlanosAcao();
       }
-  }, [visaoAtual]);
+  }, [visaoAtual, logado]);
 
   const historicoDashCacheRef = useRef({ filtro: null, data: null });
 
@@ -1142,6 +1180,31 @@ function App() {
     return { status: 'novo', texto: '⭐ Novo Lead', css: 'bg-[#1B438F]/10 text-[#1B438F] border-[#1B438F]/30 font-bold', order: 3 };
   };
 
+  // NOVO: índice CNPJ -> revenda da carteira_ativa, montado uma vez por carga da carteira. Serve
+  // para o Kanban de vendas saber, em O(1) por card, se aquele lead já está (ou já esteve)
+  // cadastrado como revenda Appgas — sem nenhuma leitura extra no Firestore por card.
+  const revendasPorCNPJ = useMemo(() => {
+     const mapa = new Map();
+     carteiraFarmers.forEach(rev => {
+        const chave = normalizarCNPJ(rev.cnpj || rev.CNPJ || rev['CPF/CNPJ']);
+        if (chave) mapa.set(chave, rev);
+     });
+     return mapa;
+  }, [carteiraFarmers]);
+
+  // NOVO: dado um lead do CRM de vendas, devolve a revenda correspondente na carteira_ativa e o
+  // status dela (o mesmo getFarmerStatus usado no Kanban de Farmers), ou null quando o lead não
+  // tem CNPJ ou nunca foi cadastrado. `jaFoiCliente` distingue quem está ativo hoje de quem foi
+  // descredenciado/desabilitado — nos dois casos o vendedor precisa ser avisado antes de ligar.
+  const getRevendaExistente = (lead) => {
+     const chave = normalizarCNPJ(lead?.['CPF/CNPJ']);
+     if (!chave) return null;
+     const revenda = revendasPorCNPJ.get(chave);
+     if (!revenda) return null;
+     const status = getFarmerStatus(revenda);
+     return { revenda, status, ativa: status.key === 'habilitada', jaFoiCliente: status.key !== 'habilitada' };
+  };
+
   const leadsFiltradosGeral = useMemo(() => {
     const filtrados = leads.filter(l => {
       if (!isAdmin && (!l.responsavel || l.responsavel.toLowerCase() !== vendedor.toLowerCase())) return false;
@@ -1160,6 +1223,15 @@ function App() {
           if (iso !== filtroHunterDataContato) return false;
       }
 
+      // NOVO: isola (ou esconde) os leads cujo CNPJ já consta na carteira_ativa.
+      if (filtroHunterRevenda !== 'todos') {
+          const rev = getRevendaExistente(l);
+          if (filtroHunterRevenda === 'nao_cadastradas' && rev) return false;
+          if (filtroHunterRevenda === 'ja_cadastradas' && !rev) return false;
+          if (filtroHunterRevenda === 'ativas' && !(rev && rev.ativa)) return false;
+          if (filtroHunterRevenda === 'ex_clientes' && !(rev && rev.jaFoiCliente)) return false;
+      }
+
       if (!busca) return true;
       const termo = busca.toLowerCase();
       return (l.nome?.toLowerCase().includes(termo) || l['CPF/CNPJ']?.includes(termo) || l.cidade?.toLowerCase().includes(termo) || l.uf?.toLowerCase().includes(termo) || l.telefone?.includes(termo) || dist.toLowerCase().includes(termo));
@@ -1172,7 +1244,7 @@ function App() {
     if (ordenacaoHunter === 'antigos') return [...filtrados].sort((a, b) => (a.data_criacao || 0) - (b.data_criacao || 0));
     if (ordenacaoHunter === 'sem_contato') return [...filtrados].sort((a, b) => (a.ultima_interacao || 0) - (b.ultima_interacao || 0));
     return filtrados;
-  }, [leads, isAdmin, vendedor, filtroDistribuidora, busca, filtroHunterCidade, filtroHunterUf, filtroHunterEtapa, filtroHunterDataContato, ordenacaoHunter]);
+  }, [leads, isAdmin, vendedor, filtroDistribuidora, busca, filtroHunterCidade, filtroHunterUf, filtroHunterEtapa, filtroHunterDataContato, filtroHunterRevenda, revendasPorCNPJ, ordenacaoHunter]);
 
   // ITEM 8: lista de UFs presentes nos leads visíveis, pra montar o select de estado sem hardcode.
   const listaUfsHunters = useMemo(() => {
@@ -3193,6 +3265,57 @@ function App() {
                 ← Voltar
               </button>
 
+              {/* NOVO: alerta de revenda já cadastrada na carteira Appgas, cruzando o CNPJ deste lead
+                  com a coleção carteira_ativa. Fica no topo do card (antes de qualquer dado do lead)
+                  justamente para o vendedor ver antes de iniciar a abordagem. */}
+              {(() => {
+                  // NOVO: se a carteira ainda não sincronizou (0 revendas em memória), a checagem abaixo
+                  // não tem como funcionar — antes isso resultava em nada aparecer, sem explicação.
+                  // Agora avisamos e oferecemos o botão de sincronizar direto aqui.
+                  if (carteiraFarmers.length === 0) {
+                      return (
+                         <div className="mb-4 md:mb-6 p-3 md:p-4 rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 flex items-center justify-between gap-3 flex-wrap">
+                            <span className="text-xs md:text-sm font-bold" style={{color: BRAND.gray}}>
+                               {carteiraFarmersSincronizando ? '⏳ Verificando se esta revenda já é cliente Appgas...' : '⚠️ Carteira Appgas não sincronizada — não foi possível verificar se esta revenda já é cliente.'}
+                            </span>
+                            {!carteiraFarmersSincronizando && (
+                               <button onClick={() => carregarCarteiraFarmers(true)} className="text-xs font-bold px-3 py-2 rounded-xl text-white shadow-sm hover:opacity-90 transition-opacity shrink-0" style={{backgroundColor: BRAND.blue}}>
+                                  🔄 Sincronizar agora
+                               </button>
+                            )}
+                         </div>
+                      );
+                  }
+                  const revExistente = getRevendaExistente(leadAtual);
+                  if (!revExistente) return null;
+                  const { revenda, status, ativa } = revExistente;
+                  return (
+                     <div className={`mb-4 md:mb-6 p-4 md:p-5 rounded-2xl border-2 shadow-sm ${ativa ? 'bg-emerald-50 border-emerald-400' : 'bg-amber-50 border-amber-400'}`}>
+                        <div className="flex items-start gap-3">
+                           <span className="text-2xl md:text-3xl shrink-0">{ativa ? '⛔' : '⚠️'}</span>
+                           <div className="flex-1 min-w-0">
+                              <p className={`font-black text-sm md:text-base ${ativa ? 'text-emerald-900' : 'text-amber-900'}`}>
+                                 {ativa ? 'Atenção: esta revenda JÁ É cliente Appgas' : 'Atenção: esta revenda JÁ FOI cliente Appgas'}
+                              </p>
+                              <p className={`text-xs md:text-sm font-medium mt-1 ${ativa ? 'text-emerald-800' : 'text-amber-800'}`}>
+                                 {ativa
+                                    ? 'O CNPJ deste lead consta na carteira ativa com cadastro habilitado. Não prospecte como lead novo — confirme com o Farmer responsável antes de qualquer contato.'
+                                    : 'O CNPJ deste lead já teve cadastro na Appgas e hoje está inativo. Consulte o histórico da revenda antes de abordar, para não repetir uma conversa que já aconteceu.'}
+                              </p>
+                              <div className="flex flex-wrap gap-2 mt-3 items-center">
+                                 <span className={`text-[10px] md:text-xs font-bold px-2.5 py-1 rounded-lg border ${status.bg} ${status.textCol} ${status.border}`}>
+                                    {status.text}
+                                 </span>
+                                 {revenda.code && <span className="text-[10px] md:text-xs font-bold px-2.5 py-1 rounded-lg bg-white border border-slate-200" style={{color: BRAND.gray}}>Código: {revenda.code}</span>}
+                                 {(revenda.nome || revenda.razao_social) && <span className="text-[10px] md:text-xs font-bold px-2.5 py-1 rounded-lg bg-white border border-slate-200 truncate max-w-full" style={{color: BRAND.gray}}>{revenda.nome || revenda.razao_social}</span>}
+                                 {revenda.carteira && revenda.carteira !== 'Todas' && <span className="text-[10px] md:text-xs font-bold px-2.5 py-1 rounded-lg bg-white border border-slate-200" style={{color: BRAND.gray}}>Carteira: {revenda.carteira}</span>}
+                              </div>
+                           </div>
+                        </div>
+                     </div>
+                  );
+              })()}
+
               <div className="bg-white rounded-2xl md:rounded-[32px] shadow-sm border border-slate-200 overflow-hidden mb-6 md:mb-8 rounded-tl-[40px] rounded-br-[40px] rounded-tr-xl rounded-bl-xl">
                 <div className="h-2 md:h-2.5" style={{backgroundColor: BRAND.blue}}></div>
                 <div className="p-5 md:p-10">
@@ -4086,6 +4209,14 @@ function App() {
                    <option value="todas">Etapa: Todas</option>
                    {Object.values(ETAPAS).map(e => <option key={e} value={e}>{e}</option>)}
                 </select>
+                {/* NOVO: filtro pelo cruzamento com a carteira_ativa (CNPJ do lead x cnpj da revenda) */}
+                <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: BRAND.black}} value={filtroHunterRevenda} onChange={e => setFiltroHunterRevenda(e.target.value)}>
+                   <option value="todos">Revenda Appgas: Todos</option>
+                   <option value="nao_cadastradas">✅ Só leads novos (nunca foram)</option>
+                   <option value="ja_cadastradas">⚠️ Já é ou já foi revenda</option>
+                   <option value="ativas">⛔ Só clientes ativos hoje</option>
+                   <option value="ex_clientes">🔴 Só ex-clientes / bloqueadas</option>
+                </select>
                 {/* Filtra os leads que precisam de contato numa data específica (proximo_contato) */}
                 <input type="date" title="Filtrar por data de retorno agendado" className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none" style={{color: filtroHunterDataContato ? BRAND.blueDark : BRAND.gray}} value={filtroHunterDataContato} onChange={e => setFiltroHunterDataContato(e.target.value)} />
                 <select className="text-xs font-bold p-2.5 rounded-xl border border-slate-200 outline-none bg-blue-50" style={{color: BRAND.blueDark}} value={ordenacaoHunter} onChange={e => setOrdenacaoHunter(e.target.value)}>
@@ -4095,10 +4226,28 @@ function App() {
                    <option value="sem_contato">🚨 Sem contato há mais tempo</option>
                    <option value="nome_asc">🔤 Nome (A-Z)</option>
                 </select>
-                {(filtroHunterCidade || busca || filtroHunterUf !== 'todas' || filtroHunterEtapa !== 'todas' || filtroHunterDataContato || ordenacaoHunter !== 'padrao') && (
-                   <button onClick={() => { setFiltroHunterCidade(''); setBusca(''); setFiltroHunterUf('todas'); setFiltroHunterEtapa('todas'); setFiltroHunterDataContato(''); setOrdenacaoHunter('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
+                {(filtroHunterCidade || busca || filtroHunterUf !== 'todas' || filtroHunterEtapa !== 'todas' || filtroHunterDataContato || filtroHunterRevenda !== 'todos' || ordenacaoHunter !== 'padrao') && (
+                   <button onClick={() => { setFiltroHunterCidade(''); setBusca(''); setFiltroHunterUf('todas'); setFiltroHunterEtapa('todas'); setFiltroHunterDataContato(''); setFiltroHunterRevenda('todos'); setOrdenacaoHunter('padrao'); }} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors">
                       ✕ Limpar
                    </button>
+                )}
+             </div>
+
+             {/* NOVO: status da sincronização com a carteira_ativa, visível sempre. Antes, se o
+                 carregamento falhasse ou nunca disparasse, não havia nenhum sinal disso na tela —
+                 o alerta de "revenda já cadastrada" simplesmente não aparecia, sem explicação. */}
+             <div className="w-full flex flex-wrap items-center gap-2 mt-2 px-1">
+                <button onClick={() => carregarCarteiraFarmers(true)} disabled={carteiraFarmersSincronizando} className="text-[11px] font-bold px-3 py-1.5 rounded-lg border shadow-sm transition-colors flex items-center gap-1.5 disabled:opacity-60" style={{backgroundColor: `${BRAND.blue}10`, color: BRAND.blueDark, borderColor: `${BRAND.blue}30`}}>
+                   {carteiraFarmersSincronizando ? '⏳ Sincronizando...' : '🔄 Sincronizar Carteira Appgas'}
+                </button>
+                {carteiraFarmersErro ? (
+                   <span className="text-[11px] font-bold text-red-600">⚠️ {carteiraFarmersErro}</span>
+                ) : (
+                   <span className="text-[11px] font-medium" style={{color: BRAND.gray}}>
+                      {carteiraFarmers.length > 0
+                         ? `${carteiraFarmers.length} revendas na carteira${carteiraFarmersUltimaSync ? ` · sincronizado às ${new Date(carteiraFarmersUltimaSync).toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'})}` : ''}`
+                         : (carteiraFarmersSincronizando ? 'Carregando carteira Appgas...' : 'Carteira ainda não sincronizada — clique em "Sincronizar" para ativar o alerta de revenda duplicada.')}
+                   </span>
                 )}
              </div>
           </div>
@@ -4126,6 +4275,9 @@ function App() {
                     // (sem WhatsApp), cai pro botão de ligação.
                     const telefonesLead = listaTelefonesLead(lead);
                     const telValido = telefonesLead.find(t => !(lead.telefones_invalidos || []).includes(t.numero));
+                    // NOVO: cruza o CNPJ do lead com a carteira_ativa. Quando bate, a revenda já é
+                    // (ou já foi) cliente Appgas e o vendedor precisa saber ANTES de ligar.
+                    const revExistente = getRevendaExistente(lead);
 
                     let kanbanCardBg = 'bg-white';
                     let kanbanCardBorder = 'border-[#e2e8f0]';
@@ -4140,9 +4292,29 @@ function App() {
                     } else if (urg.status === 'atrasado' || urg.status === 'ocioso' || urg.status === 'vacuo') {
                         kanbanCardBorder = 'border-red-400';
                     }
+                    // A borda do alerta tem prioridade sobre a de urgência: não faz sentido cobrar
+                    // follow-up de uma revenda que o vendedor nem deveria estar prospectando.
+                    if (revExistente && lead.etapa_funil !== ETAPAS.FINALIZADO) {
+                        kanbanCardBorder = revExistente.ativa ? 'border-emerald-500' : 'border-amber-500';
+                    }
 
                     return (
                       <div key={lead.id} onClick={() => abrirCardLead(lead.id)} draggable onDragStart={(e) => setDraggedLeadId(lead.id)} className={`${kanbanCardBg} p-4 md:p-5 rounded-xl md:rounded-2xl border-2 shadow-sm cursor-pointer hover:shadow-md transition-shadow ${kanbanCardBorder}`}>
+                        {/* NOVO: faixa de alerta — revenda já cadastrada na carteira Appgas. Verde = cliente
+                            ativo hoje (não prospectar); âmbar = já foi cliente e hoje está descredenciada
+                            ou bloqueada (abordar com contexto, não como lead frio). */}
+                        {revExistente && (
+                           <div className={`mb-2 px-2 py-1.5 rounded-lg border text-[9px] md:text-[10px] font-black uppercase leading-tight ${revExistente.ativa ? 'bg-emerald-50 text-emerald-800 border-emerald-300' : 'bg-amber-50 text-amber-800 border-amber-300'}`}>
+                              <div className="flex items-center gap-1">
+                                 <span>{revExistente.ativa ? '⛔' : '⚠️'}</span>
+                                 <span className="truncate">{revExistente.ativa ? 'Já é revenda Appgas' : 'Já foi revenda Appgas'}</span>
+                              </div>
+                              <div className="mt-0.5 font-bold normal-case opacity-90 truncate">
+                                 {revExistente.status.text}
+                                 {revExistente.revenda.code ? ` · cód. ${revExistente.revenda.code}` : ''}
+                              </div>
+                           </div>
+                        )}
                         <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-slate-50/50 px-2 py-1 rounded-md mb-2">
                            <span className="truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</span>
                            {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
