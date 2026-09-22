@@ -176,6 +176,23 @@ const METRICAS_PLANO_ACAO = [
       obterValorDoHistorico: (m) => (m?.total_orders === undefined || m?.total_orders === null) ? null : Number(m.total_orders) },
 ];
 
+// NOVO: campos de data/hora na coleção carteira_ativa/ranking_metricas podem vir em dois formatos —
+// string ISO (quando gravados pelo próprio app, ex. import manual de métricas) ou Timestamp nativo
+// do Firestore (quando gravados pela sincronização via n8n, que converte strings parecidas com data
+// automaticamente). Essa função aceita os dois formatos e sempre devolve milissegundos.
+const paraTimestampMs = (valor) => {
+    if (!valor) return 0;
+    if (typeof valor === 'number') return valor;
+    if (typeof valor === 'string') {
+        const ms = new Date(valor).getTime();
+        return isNaN(ms) ? 0 : ms;
+    }
+    if (typeof valor.toDate === 'function') return valor.toDate().getTime(); // Timestamp do Firestore (client SDK)
+    if (typeof valor.seconds === 'number') return valor.seconds * 1000; // {seconds, nanoseconds}
+    if (typeof valor._seconds === 'number') return valor._seconds * 1000; // variante com underscore
+    return 0;
+};
+
 // CORREÇÃO (Bug 1 — "Valor Atual em 0%" / "Meta calculada: 0.0%"): resolve o valor atual de uma
 // métrica com prioridade em 3 camadas:
 //   1) o registro diário mais recente feito pelo farmer dentro do PRÓPRIO plano (plano.andamento)
@@ -194,7 +211,12 @@ const obterValorAtualPlano = (metricaInfo, revenda, historico, plano, metricaCha
     const registros = (plano?.andamento || []).filter(a => a.valor !== null && a.valor !== undefined && (!a.metrica || a.metrica === chaveAlvo));
     if (registros.length > 0) {
         const ultimoRegistro = registros[registros.length - 1];
-        const dataApuracaoOficial = revenda?.ultima_atualizacao_metricas ? new Date(revenda.ultima_atualizacao_metricas).getTime() : 0;
+        // CORREÇÃO: usa paraTimestampMs em vez de new Date(...) direto — desde que a sincronização
+        // diária via n8n passou a gravar ultima_atualizacao_metricas como Timestamp nativo do
+        // Firestore (em vez de string ISO), new Date(objetoTimestamp) resultava em "Invalid Date" e
+        // essa comparação nunca dava certo, fazendo o registro diário do farmer nunca "ganhar" da
+        // apuração oficial mesmo quando deveria.
+        const dataApuracaoOficial = paraTimestampMs(revenda?.ultima_atualizacao_metricas);
         if (ultimoRegistro.timestamp >= dataApuracaoOficial) {
             return { valor: Number(ultimoRegistro.valor), fonte: 'diario', dataFonte: ultimoRegistro.timestamp };
         }
@@ -2192,7 +2214,9 @@ function App() {
         });
 
         data.sort((a, b) => { if (b.year !== a.year) return b.year - a.year; return b.month - a.month; });
-        setMetricasFarmerHistorico(data.slice(0, 3)); 
+        // NOVO: agora traz 4 meses em vez de 3 — os 3 últimos meses já fechados + o mês atual em
+        // andamento (que o job diário de rankings mantém sempre atualizado "até o dia anterior").
+        setMetricasFarmerHistorico(data.slice(0, 4)); 
     } catch (e) { mostrarMensagem("Erro ao carregar histórico", true); } finally { setCarregandoMetricas(false); }
   };
 
@@ -3826,8 +3850,13 @@ function App() {
                                  else if (rankHistorico === 'Bronze') { bgClass = 'bg-orange-50'; borderClass = 'border-orange-200'; textRankClass = 'text-orange-700'; icon = "🥉"; }
                                  else if (rankHistorico === 'Desclassificado') { bgClass = 'bg-red-50'; borderClass = 'border-red-200'; textRankClass = 'text-red-700'; icon = "🚨"; }
 
+                                 // NOVO: identifica se este card é o mês atual (ainda em andamento, atualizado
+                                 // diariamente pelo job de rankings) em vez de um mês já fechado.
+                                 const agora = new Date();
+                                 const ehMesAtual = Number(m.month) === (agora.getMonth() + 1) && Number(m.year) === agora.getFullYear();
+
                                  return (
-                                     <div key={m.id} className={`p-5 rounded-2xl border-2 ${bgClass} ${borderClass} shadow-sm transition-all hover:shadow-md`}>
+                                     <div key={m.id} className={`p-5 rounded-2xl border-2 ${bgClass} ${borderClass} shadow-sm transition-all hover:shadow-md ${ehMesAtual ? 'ring-2 ring-blue-300' : ''}`}>
                                          <div className="flex flex-col sm:flex-row justify-between sm:items-center border-b border-black/5 pb-4 mb-4 gap-4">
                                              <div className="flex items-center gap-4">
                                                  <div className="w-14 h-14 rounded-xl bg-white border border-slate-200 flex flex-col items-center justify-center shadow-sm">
@@ -3835,7 +3864,10 @@ function App() {
                                                      <span className="text-sm font-black text-slate-700">{m.month}/{String(m.year).slice(-2)}</span>
                                                  </div>
                                                  <div>
-                                                     <p className="text-[10px] uppercase font-bold text-slate-400">Rank do Mês</p>
+                                                     <p className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1.5">
+                                                         Rank do Mês
+                                                         {ehMesAtual && <span className="text-[9px] font-black px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 normal-case">🔄 Em andamento (até ontem)</span>}
+                                                     </p>
                                                      <p className={`text-2xl font-black ${textRankClass} flex items-center gap-1`}>{icon} {rankHistorico}</p>
                                                  </div>
                                              </div>
@@ -4066,7 +4098,7 @@ function App() {
                                    
                                    <div className="flex justify-between items-center bg-slate-50 p-2 rounded-xl border border-slate-100">
                                       <div className="text-center w-1/2 border-r border-slate-200">
-                                          <p className="text-[9px] font-bold text-slate-400 uppercase">Score</p>
+                                          <p className="text-[9px] font-bold text-slate-400 uppercase" title="Mês atual, acumulado até ontem">Score (até ontem)</p>
                                           <p className={`text-sm font-black ${scoreAtual>=50?'text-emerald-600':'text-red-500'}`}>{scoreAtual}</p>
                                       </div>
                                       <div className="text-center w-1/2">
