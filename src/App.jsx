@@ -82,6 +82,19 @@ const calcularRankingPelaRegra = (score, orders) => {
     return 'Desclassificado';
 };
 
+// NOVO: a CLASSIFICAÇÃO (em qual coluna do Kanban a revenda cai) precisa ficar estável durante o
+// mês — por isso passa a seguir o ÚLTIMO MÊS FECHADO (score_anterior/orders_anterior, mantidos
+// pela sincronização diária de rankings), e não mais o total_score/total_orders do mês ATUAL, que
+// muda todo dia e sempre começa zerado (faria a revenda "pular" de coluna sem motivo real).
+// Ex: em setembro, a classificação usada é a de agosto — o mês anterior mais recente já fechado.
+const obterRankingClassificacao = (rev) => {
+    if (rev.score_anterior !== undefined && rev.score_anterior !== null && rev.orders_anterior !== undefined && rev.orders_anterior !== null) {
+        return calcularRankingPelaRegra(rev.score_anterior, rev.orders_anterior);
+    }
+    // Revenda sem mês fechado registrado ainda (ex: acabou de entrar) — cai no campo espelhado atual.
+    return rev.ranking_level || 'Sem volume';
+};
+
 // NOVO: ordem crescente dos rankings, usada tanto no card do Kanban quanto no detalhe da revenda
 // pra saber se uma mudança de ranking foi uma subida ou uma queda.
 const RANKING_ORDEM = { 'Sem volume': 0, 'Desclassificado': 1, 'Bronze': 2, 'Prata': 3, 'Ouro': 4, 'Diamante': 5 };
@@ -813,6 +826,9 @@ function App() {
   const [buscandoCNPJ, setBuscandoCNPJ] = useState(false);
   
   const [modalFinalizar, setModalFinalizar] = useState(null); 
+  // NOVO: pergunta exibida quando o CNPJ do lead já existe (ou já existiu) como revenda cadastrada,
+  // antes de decidir se conta como venda de verdade ou é só correção de sistema.
+  const [modalPerguntaReativacao, setModalPerguntaReativacao] = useState(null);
   const [motivoPerda, setMotivoPerda] = useState('');
   // ITEM 5: `oQueFuncionou` e `oQueDeuErrado` são o registro de sucesso/erro preenchido no popup do 🏆.
   const [onboardingForm, setOnboardingForm] = useState({ dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não', oQueFuncionou: '', oQueDeuErrado: '' });
@@ -2466,12 +2482,67 @@ function App() {
     } catch (err) { mostrarMensagem('Erro ao mover lead.', true); }
   };
 
+  // NOVO: antes de abrir a tela de Onboarding, reaproveita getRevendaExistente (a mesma checagem que
+  // já mostra o aviso "Já é/Já foi revenda Appgas" no card) pra saber se o CNPJ do lead já existe na
+  // carteira_ativa — cobre os dois casos ("já é" cliente ativo e "já foi" desabilitado/descredenciado)
+  // com a MESMA lógica, em vez de duplicar a busca. Se achar, pergunta se é uma reativação de cadastro
+  // de verdade ou só uma correção no sistema, antes de seguir o fluxo normal.
+  const iniciarFechamentoGanho = async (lead) => {
+    // Garante que a carteira_ativa está carregada, mesmo que o vendedor nunca tenha aberto a aba de
+    // Dashboard/Farmers nesta sessão — sem isso, getRevendaExistente não teria como saber.
+    if (carteiraFarmers.length === 0) {
+        await carregarCarteiraFarmers();
+    }
+    const revExistente = getRevendaExistente(lead);
+    if (revExistente) {
+        setModalPerguntaReativacao({ lead, revenda: revExistente.revenda });
+    } else {
+        setModalFinalizar({ type: 'ganho', lead });
+    }
+  };
+
+  // NOVO: trata a escolha do popup de Reativação/Correção.
+  // - "Reativação de Cadastro": segue pro Onboarding normal e CONTA em todos os indicadores.
+  // - "Correção do Sistema": finaliza direto (sem Onboarding, sem tarefa no Bitrix) e NÃO conta em
+  //   nenhum indicador — só marca o lead como resolvido, com a observação de que a revenda já existe.
+  const confirmarTipoFechamento = async (tipo) => {
+    const { lead, revenda } = modalPerguntaReativacao;
+    setModalPerguntaReativacao(null);
+    if (tipo === 'reativacao') {
+        setModalFinalizar({ type: 'ganho', lead, motivoEspecial: 'reativacao_cadastro' });
+        return;
+    }
+    const timestamp = Date.now();
+    const nomeRevenda = revenda.nome || revenda.razao_social || revenda.code || 'sem nome';
+    try {
+        await addDoc(collection(db, "historico"), {
+            id_lead: lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp,
+            vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático',
+            observacao: `✅ Cadastro corrigido no sistema — revenda já reativada (${nomeRevenda}). Não contabilizado nos indicadores de vendas.`
+        });
+        await updateDoc(doc(db, "leads", lead.id), {
+            etapa_funil: ETAPAS.FINALIZADO,
+            status_venda: 'Ganho',
+            motivo_fechamento: 'correcao_sistema',
+            contabiliza_metricas: false,
+            data_conclusao: timestamp
+        });
+        if (leadAtual?.id === lead.id) buscarHistoricoCard(lead.id);
+        mostrarMensagem('Cadastro corrigido — revenda reativada, sem contar nos indicadores.');
+    } catch (e) {
+        mostrarMensagem('Erro ao finalizar.', true);
+    }
+  };
+
   const processarFinalizacao = async () => {
     const timestamp = Date.now(); let obs = '';
     if (modalFinalizar.type === 'perda') { if (!motivoPerda) return mostrarMensagem('Selecione o motivo.', true); obs = `❌ Negócio Perdido: ${motivoPerda}`;
     } else {
         if (!onboardingForm.dataHora || !onboardingForm.gestor || !onboardingForm.telefone) return mostrarMensagem('Preencha os campos de Onboarding!', true);
         obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`;
+        // NOVO: quando vem do fluxo "Reativação de Cadastro" (CNPJ já existia como revenda), deixa
+        // isso registrado na própria observação do fechamento.
+        if (modalFinalizar.motivoEspecial === 'reativacao_cadastro') obs += `\n\n🔄 Reativação de Cadastro (CNPJ já existia como revenda).`;
         // ITEM 5: registra na linha do tempo o que funcionou e o que deu errado nessa venda, pra
         // virar histórico de aprendizado do time (e não só um "ganho" sem contexto).
         if (onboardingForm.oQueFuncionou) obs += `\n\n✅ O que funcionou: ${onboardingForm.oQueFuncionou}`;
@@ -2493,7 +2564,7 @@ function App() {
     }
     try {
       await addDoc(collection(db, "historico"), { id_lead: modalFinalizar.lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: obs });
-      await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, data_conclusao: timestamp });
+      await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, motivo_fechamento: modalFinalizar.motivoEspecial || null, contabiliza_metricas: true, data_conclusao: timestamp });
       if(leadAtual?.id === modalFinalizar.lead.id) buscarHistoricoCard(modalFinalizar.lead.id); setModalFinalizar(null); setMotivoPerda(''); mostrarMensagem(modalFinalizar.type === 'ganho' ? 'Dá um Appgas! Venda Fechada e Tarefa Criada!' : 'Perda registrada.');
     } catch(e) { mostrarMensagem('Erro ao gravar no CRM.', true); }
   };
@@ -2518,7 +2589,7 @@ function App() {
     let baseLeads = leads.filter(l => { if (!isAdmin) return l.responsavel && l.responsavel.toLowerCase() === vendedor.toLowerCase(); if (filtroVendedorDash === 'todos') return true; return l.responsavel && l.responsavel.toLowerCase() === filtroVendedorDash.toLowerCase(); });
 
     const leadsAtivos = baseLeads.filter(l => l.etapa_funil !== ETAPAS.FINALIZADO);
-    const leadsConvertidos = baseLeads.filter(l => l.status_venda === 'Ganho' && checkTime(l.data_conclusao));
+    const leadsConvertidos = baseLeads.filter(l => l.status_venda === 'Ganho' && l.contabiliza_metricas !== false && checkTime(l.data_conclusao));
     const leadsPerdidos = baseLeads.filter(l => l.status_venda === 'Perdido' && checkTime(l.data_conclusao));
     const leadsTrabalhados = leadsConvertidos.length + leadsPerdidos.length;
     const taxaConversao = leadsTrabalhados > 0 ? ((leadsConvertidos.length / leadsTrabalhados) * 100).toFixed(0) : 0;
@@ -2581,12 +2652,12 @@ function App() {
         if (!statsPorCidade[chave]) statsPorCidade[chave] = { name: chave, total: 0, ganhos: 0, perdidos: 0, captados: 0, etapas: {} };
         const s = statsPorCidade[chave];
         s.total++;
-        if (l.status_venda === 'Ganho') s.ganhos++;
+        if (l.status_venda === 'Ganho' && l.contabiliza_metricas !== false) s.ganhos++;
         if (l.status_venda === 'Perdido') s.perdidos++;
         // "Captação" = leads que ENTRARAM na base dentro do período selecionado.
         if (checkTime(l.data_criacao)) s.captados++;
         const etapa = l.etapa_funil === ETAPAS.FINALIZADO
-            ? (l.status_venda === 'Ganho' ? 'Ganhos' : 'Perdidos')
+            ? (l.status_venda === 'Ganho' ? (l.contabiliza_metricas !== false ? 'Ganhos' : 'Correção de Sistema') : 'Perdidos')
             : (l.etapa_funil || ETAPAS.LEAD);
         s.etapas[etapa] = (s.etapas[etapa] || 0) + 1;
     });
@@ -2776,7 +2847,7 @@ function App() {
 
     const dataRanking = ['Diamante', 'Ouro', 'Prata', 'Bronze', 'Desclassificado', 'Sem volume'].map(nivel => ({
         name: nivel,
-        qtde: baseFarmers.filter(f => (f.ranking_level || 'Sem volume') === nivel).length
+        qtde: baseFarmers.filter(f => obterRankingClassificacao(f) === nivel).length
     }));
 
     const statusCount = {};
@@ -2806,7 +2877,7 @@ function App() {
     historicoFarmers.forEach(h => {
         canalCount[h.canal] = (canalCount[h.canal] || 0) + 1;
         const revenda = farmersPorId.get(h.id_lead);
-        const nivel = revenda ? (revenda.ranking_level || 'Sem volume') : 'Desconhecido';
+        const nivel = revenda ? obterRankingClassificacao(revenda) : 'Desconhecido';
         rankingContatoCount[nivel] = (rankingContatoCount[nivel] || 0) + 1;
         // NOVO: mesma lógica da "Evolução Diária de Contatos (Canal)" que já existe no dashboard de
         // Hunters, agrupando por data e canal.
@@ -3527,7 +3598,7 @@ function App() {
                            <button onClick={() => setModalFinalizar({type: 'perda', lead: leadAtual})} className="flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-colors">
                               👎 Registrar Perda
                            </button>
-                           <button onClick={() => setModalFinalizar({type: 'ganho', lead: leadAtual})} className="flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">
+                           <button onClick={() => iniciarFechamentoGanho(leadAtual)} className="flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors">
                               🏆 Registrar Venda
                            </button>
                         </div>
@@ -4035,6 +4106,20 @@ function App() {
                      <button onClick={() => setFarmerVisualizacao('kanban')} className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-colors ${farmerVisualizacao === 'kanban' ? 'bg-white shadow-sm' : ''}`} style={{color: farmerVisualizacao === 'kanban' ? BRAND.blue : BRAND.gray}}>🗂️ Kanban</button>
                      <button onClick={() => setFarmerVisualizacao('lista')} className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-colors ${farmerVisualizacao === 'lista' ? 'bg-white shadow-sm' : ''}`} style={{color: farmerVisualizacao === 'lista' ? BRAND.blue : BRAND.gray}}>📋 Lista</button>
                   </div>
+                  {/* NOVO: deixa claro qual mês fechado está sendo usado pra classificar as revendas —
+                      evita a dúvida de "por que ela não mudou de coluna" quando o mês está em andamento. */}
+                  {(() => {
+                      const agora = new Date();
+                      let mesRef = agora.getMonth(); // já é o mês anterior em 1-indexado (set. -> 8 = ago.)
+                      let anoRef = agora.getFullYear();
+                      if (mesRef === 0) { mesRef = 12; anoRef -= 1; }
+                      const nomesMeses = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+                      return (
+                          <span className="text-[10px] font-bold px-2.5 py-1.5 rounded-lg bg-blue-50 text-blue-700 border border-blue-200" title="A classificação por ranking segue o último mês fechado, pra não mudar de coluna dia a dia enquanto o mês atual está em andamento.">
+                              📌 Classificação: {nomesMeses[mesRef - 1]}/{anoRef}
+                          </span>
+                      );
+                  })()}
                 </div>
 
                 {farmerVisualizacao === 'kanban' ? (
@@ -4045,7 +4130,7 @@ function App() {
                     // ranking excluem essas revendas, pra não aparecerem duplicadas em duas colunas.
                     const leadsNivel = nivel === 'Descredenciados'
                         ? carteiraFarmersExibida.filter(l => getFarmerStatus(l).key === 'descredenciada').sort(compararFarmers)
-                        : carteiraFarmersExibida.filter(l => (l.ranking_level || 'Sem volume') === nivel && getFarmerStatus(l).key !== 'descredenciada').sort(compararFarmers);
+                        : carteiraFarmersExibida.filter(l => obterRankingClassificacao(l) === nivel && getFarmerStatus(l).key !== 'descredenciada').sort(compararFarmers);
                     
                     let borderColor = 'border-slate-200/60'; let headerColor = 'bg-slate-200/80'; let icon = '⚪';
                     if(nivel === 'Diamante') { borderColor = 'border-cyan-200'; headerColor = 'bg-cyan-100/80 text-cyan-800'; icon = '💎'; }
@@ -4181,7 +4266,7 @@ function App() {
                                      <span className="text-[9px] font-bold text-slate-400 uppercase">Ranking:</span>
                                      <span className="text-xs font-black" style={{color: BRAND.black}}>
                                         {(() => {
-                                            const nivel = rev.ranking_level || 'Sem volume';
+                                            const nivel = obterRankingClassificacao(rev);
                                             const icones = { 'Diamante': '💎', 'Ouro': '🥇', 'Prata': '🥈', 'Bronze': '🥉', 'Desclassificado': '🚨', 'Sem volume': '⚪' };
                                             return `${icones[nivel] || '⚪'} ${nivel}`;
                                         })()}
@@ -4400,7 +4485,7 @@ function App() {
                 </div>
                 <div className="p-3 md:p-4 rounded-xl border shadow-sm min-w-[120px] flex-1" style={{backgroundColor: `${BRAND.yellow}10`, borderColor: `${BRAND.yellow}30`}}>
                    <p className="text-[10px] md:text-xs font-bold uppercase" style={{color: BRAND.black}}>🏆 Fechados</p>
-                   <p className="text-xl md:text-2xl font-black" style={{color: BRAND.black}}>{leadsFiltradosGeral.filter(l => l.status_venda === 'Ganho').length}</p>
+                   <p className="text-xl md:text-2xl font-black" style={{color: BRAND.black}}>{leadsFiltradosGeral.filter(l => l.status_venda === 'Ganho' && l.contabiliza_metricas !== false).length}</p>
                 </div>
                 <div className="bg-slate-50 p-3 md:p-4 rounded-xl border border-slate-200 shadow-sm min-w-[120px] flex-1">
                    <p className="text-[10px] md:text-xs font-bold uppercase" style={{color: BRAND.gray}}>Leads Frios</p>
@@ -4895,11 +4980,36 @@ function App() {
         </div>
       )}
 
+      {modalPerguntaReativacao && (
+        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
+          <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl border-t-8" style={{borderTopColor: BRAND.yellow}}>
+            <h3 className="text-xl md:text-2xl font-black mb-2 flex items-center gap-2" style={{color: BRAND.black}}>⚠️ CNPJ já cadastrado</h3>
+            <p className="text-sm mb-6 font-medium" style={{color: BRAND.gray}}>
+              Esse CNPJ já existe (ou já existiu) como revenda na base: <strong style={{color: BRAND.black}}>{modalPerguntaReativacao.revenda.nome || modalPerguntaReativacao.revenda.razao_social || modalPerguntaReativacao.revenda.code || 'sem nome'}</strong>. O que é esse fechamento?
+            </p>
+            <div className="space-y-3">
+              <button onClick={() => confirmarTipoFechamento('reativacao')} className="w-full py-3.5 px-4 rounded-xl font-bold text-sm bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-600 hover:text-white transition-colors text-left">
+                🔄 Reativação de Cadastro
+                <span className="block text-[11px] font-medium normal-case mt-0.5 opacity-80">É uma venda de verdade — segue pro Onboarding e conta em todos os indicadores.</span>
+              </button>
+              <button onClick={() => confirmarTipoFechamento('correcao')} className="w-full py-3.5 px-4 rounded-xl font-bold text-sm bg-slate-50 text-slate-600 border border-slate-200 hover:bg-slate-600 hover:text-white transition-colors text-left">
+                🛠️ Correção do Sistema
+                <span className="block text-[11px] font-medium normal-case mt-0.5 opacity-80">Só ajuste de cadastro — finaliza direto, sem Onboarding e sem contar nos indicadores.</span>
+              </button>
+            </div>
+            <button onClick={() => setModalPerguntaReativacao(null)} className="w-full mt-4 px-4 py-2 text-slate-400 font-bold text-xs hover:text-slate-600 transition-colors">Cancelar</button>
+          </div>
+        </div>
+      )}
+
       {modalFinalizar && (
         <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[60] p-4 backdrop-blur-sm">
           <div className="bg-white p-6 md:p-8 rounded-3xl max-w-md w-full shadow-2xl">
-            <h3 className={`text-xl md:text-2xl font-black mb-2 ${modalFinalizar.type === 'ganho' ? 'text-emerald-600' : 'text-red-600'}`}>
+            <h3 className={`text-xl md:text-2xl font-black mb-2 flex items-center gap-2 flex-wrap ${modalFinalizar.type === 'ganho' ? 'text-emerald-600' : 'text-red-600'}`}>
               {modalFinalizar.type === 'ganho' ? '🏆 Registrar Venda' : '👎 Registrar Perda'}
+              {modalFinalizar.motivoEspecial === 'reativacao_cadastro' && (
+                <span className="text-[10px] font-bold px-2 py-1 rounded-md bg-yellow-100 text-yellow-800 border border-yellow-300 normal-case">🔄 Reativação de Cadastro</span>
+              )}
             </h3>
             <p className="text-slate-500 mb-6 font-medium text-sm md:text-base truncate">{modalFinalizar.lead.nome}</p>
             
