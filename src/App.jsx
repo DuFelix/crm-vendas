@@ -21,6 +21,7 @@ const BITRIX_ID_EDUARDO = 1;
 const BITRIX_ID_CAMILA = 9;
 
 const ETAPAS = {
+  FILA_ESPERA: '0. Fila de Espera',
   LEAD: '1. Lead',
   PRIMEIRO_CONTATO: 'Primeiro contato',
   AGUARDANDO_RESPOSTA: '2. Aguardando resposta', 
@@ -62,6 +63,10 @@ const DEFAULT_MOTIVOS_PERDA = [
   '[FINANCEIRO] Prazo de repasse',
   '[OPERACIONAL] Exclusividade com a bandeira da distribuidora'
 ];
+
+// NOVO: canal de captação da revenda, preenchido no fechamento da venda (🏆 Registrar Venda) —
+// alimenta o gráfico "Revendas por Canal de Captação" no Dashboard.
+const CANAIS_CAPTACAO = ['Captação ativa', 'Site', 'Redes sociais', 'Indicação'];
 
 const BRAND = {
   blue: '#2D6FEF', blueDark: '#1B438F', blueLight: '#81A9F5',
@@ -761,6 +766,9 @@ function App() {
   const [vendedores, setVendedores] = useState([]);
   const [motivosPerda, setMotivosPerda] = useState(DEFAULT_MOTIVOS_PERDA);
   const [guiaMunicipios, setGuiaMunicipios] = useState({});
+  // NOVO: lista ordenada de cidades prioritárias (índice 0 = prioridade 1º), configurável pelo admin.
+  const [prioridadeCidades, setPrioridadeCidades] = useState([]);
+  const [novaCidadePrioridade, setNovaCidadePrioridade] = useState('');
   
   const [leadSelecionadoId, setLeadSelecionadoId] = useState(null);
   const [busca, setBusca] = useState('');
@@ -831,7 +839,7 @@ function App() {
   const [modalPerguntaReativacao, setModalPerguntaReativacao] = useState(null);
   const [motivoPerda, setMotivoPerda] = useState('');
   // ITEM 5: `oQueFuncionou` e `oQueDeuErrado` são o registro de sucesso/erro preenchido no popup do 🏆.
-  const [onboardingForm, setOnboardingForm] = useState({ dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não', oQueFuncionou: '', oQueDeuErrado: '' });
+  const [onboardingForm, setOnboardingForm] = useState({ dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não', oQueFuncionou: '', oQueDeuErrado: '', canalCaptacao: '' });
 
   const [draggedLeadId, setDraggedLeadId] = useState(null);
   const [leadParaExcluir, setLeadParaExcluir] = useState(null);
@@ -897,7 +905,13 @@ function App() {
         setGuiaMunicipios(map);
     }, lidarComErroFirebase);
 
-    return () => { unsubVend(); unsubMotivos(); unsubGuia(); };
+    // NOVO: priorização de cidades — lista ordenada (índice 0 = maior prioridade), configurável
+    // pelo admin, usada pra sinalizar nos cards quais leads merecem atenção primeiro.
+    const unsubPrioridadeCidades = onSnapshot(doc(db, "config", "prioridade_cidades"), (docSnap) => {
+        if (docSnap.exists() && docSnap.data().lista) setPrioridadeCidades(docSnap.data().lista);
+    }, lidarComErroFirebase);
+
+    return () => { unsubVend(); unsubMotivos(); unsubGuia(); unsubPrioridadeCidades(); };
   }, []);
 
   useEffect(() => {
@@ -1197,11 +1211,59 @@ function App() {
 
   const getDistNome = (l) => { const d = l.distribuidora || l.bandeira || l.Distribuidora || l.Bandeira; return d ? String(d).trim() : ''; };
 
+  // NOVO: retorna o RANK (1-indexado) da cidade do lead na lista de priorização, ou null se a
+  // cidade não estiver priorizada. Compara normalizado (sem acento/caixa), pra bater mesmo com
+  // pequenas diferenças de grafia entre o que o admin cadastrou e o que está salvo no lead.
+  const obterPrioridadeCidade = (cidade) => {
+      if (!cidade || prioridadeCidades.length === 0) return null;
+      const cidadeNorm = normalizarTexto(cidade);
+      const idx = prioridadeCidades.findIndex(c => normalizarTexto(c) === cidadeNorm);
+      return idx >= 0 ? idx + 1 : null;
+  };
+
+  // NOVO: CRUD da lista de priorização de cidades — sempre reescreve a lista inteira em
+  // config/prioridade_cidades (mesmo padrão já usado pra motivos de perda).
+  const adicionarCidadePrioridade = async () => {
+      if (!novaCidadePrioridade.trim()) return;
+      const nova = novaCidadePrioridade.trim();
+      if (prioridadeCidades.some(c => normalizarTexto(c) === normalizarTexto(nova))) {
+          mostrarMensagem('Essa cidade já está na lista de priorização.', true);
+          return;
+      }
+      try {
+          await setDoc(doc(db, "config", "prioridade_cidades"), { lista: [...prioridadeCidades, nova] });
+          setNovaCidadePrioridade('');
+          mostrarMensagem('Cidade adicionada à priorização!');
+      } catch (e) { mostrarMensagem('Erro ao salvar.', true); }
+  };
+
+  const moverCidadePrioridade = async (idx, direcao) => {
+      const novaLista = [...prioridadeCidades];
+      const alvo = idx + direcao;
+      if (alvo < 0 || alvo >= novaLista.length) return;
+      [novaLista[idx], novaLista[alvo]] = [novaLista[alvo], novaLista[idx]];
+      try {
+          await setDoc(doc(db, "config", "prioridade_cidades"), { lista: novaLista });
+      } catch (e) { mostrarMensagem('Erro ao reordenar.', true); }
+  };
+
+  const removerCidadePrioridade = async (idx) => {
+      try {
+          await setDoc(doc(db, "config", "prioridade_cidades"), { lista: prioridadeCidades.filter((_, i) => i !== idx) });
+          mostrarMensagem('Cidade removida da priorização!');
+      } catch (e) { mostrarMensagem('Erro ao remover.', true); }
+  };
+
   const getUrgency = (lead) => {
     if (lead.status_venda === 'Ganho' || lead.status_venda === 'Perdido') return { status: 'finalizado', texto: 'Encerrado', css: 'bg-slate-100 text-[#767676] border-slate-200', order: 6 };
+    // NOVO: revendas na Fila de Espera são deixadas de lado de propósito — não fazem sentido sinalizadas
+    // como "sem retorno"/"ociosas" só pelo tempo parado, já que ninguém está trabalhando elas ainda.
+    if (lead.etapa_funil === ETAPAS.FILA_ESPERA) return { status: 'fila_espera', texto: '⏸️ Fila de Espera', css: 'bg-slate-100 text-slate-500 border-slate-300 font-bold', order: 7 };
     const now = Date.now(); const horasSemResposta = lead.ultima_interacao ? Math.floor((now - lead.ultima_interacao) / (1000 * 60 * 60)) : 0; const diasSemResposta = Math.floor(horasSemResposta / 24);
-    const estaNoVacuo = lead.ultimo_remetente === 'vendedor' && horasSemResposta >= 24; const esperandoResposta = lead.ultimo_remetente === 'vendedor' && horasSemResposta < 24;
-    if (estaNoVacuo) return { status: 'vacuo', texto: `⚠️ Vácuo (${diasSemResposta > 0 ? diasSemResposta + 'd' : horasSemResposta + 'h'})`, css: 'bg-orange-100 text-orange-700 border-orange-500 font-bold animate-pulse', order: 0 };
+    const esperandoResposta = lead.ultimo_remetente === 'vendedor' && horasSemResposta < 24;
+    // CORREÇÃO (item 4): "Vácuo" foi removido — "Retorno Atrasado" agora só existe quando o vendedor
+    // agenda um Follow-up explícito (proximo_contato) e essa data já passou, nunca por inferência de
+    // silêncio/inatividade.
     if (lead.proximo_contato) {
       if (lead.proximo_contato - now < 0) return { status: 'atrasado', texto: '🚨 Retorno Atrasado', css: 'bg-red-100 text-red-700 border-red-500 font-bold animate-pulse', order: 1 };
       if (new Date(lead.proximo_contato).toDateString() === new Date().toDateString()) return { status: 'hoje', texto: '📅 Retorno Hoje', css: 'bg-[#F0B42E]/20 text-[#101011] border-[#F0B42E] font-bold', order: 2 };
@@ -2539,7 +2601,9 @@ function App() {
     if (modalFinalizar.type === 'perda') { if (!motivoPerda) return mostrarMensagem('Selecione o motivo.', true); obs = `❌ Negócio Perdido: ${motivoPerda}`;
     } else {
         if (!onboardingForm.dataHora || !onboardingForm.gestor || !onboardingForm.telefone) return mostrarMensagem('Preencha os campos de Onboarding!', true);
+        if (!onboardingForm.canalCaptacao) return mostrarMensagem('Selecione o Canal de Captação!', true);
         obs = `🏆 Negócio Fechado com Sucesso!\nOnboarding agendado para: ${new Date(onboardingForm.dataHora).toLocaleString('pt-BR')}`;
+        obs += `\n📡 Canal de Captação: ${onboardingForm.canalCaptacao}`;
         // NOVO: quando vem do fluxo "Reativação de Cadastro" (CNPJ já existia como revenda), deixa
         // isso registrado na própria observação do fechamento.
         if (modalFinalizar.motivoEspecial === 'reativacao_cadastro') obs += `\n\n🔄 Reativação de Cadastro (CNPJ já existia como revenda).`;
@@ -2564,8 +2628,8 @@ function App() {
     }
     try {
       await addDoc(collection(db, "historico"), { id_lead: modalFinalizar.lead.id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: timestamp, vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: obs });
-      await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, motivo_fechamento: modalFinalizar.motivoEspecial || null, contabiliza_metricas: true, data_conclusao: timestamp });
-      if(leadAtual?.id === modalFinalizar.lead.id) buscarHistoricoCard(modalFinalizar.lead.id); setModalFinalizar(null); setMotivoPerda(''); mostrarMensagem(modalFinalizar.type === 'ganho' ? 'Dá um Appgas! Venda Fechada e Tarefa Criada!' : 'Perda registrada.');
+      await updateDoc(doc(db, "leads", modalFinalizar.lead.id), { etapa_funil: ETAPAS.FINALIZADO, status_venda: modalFinalizar.type === 'ganho' ? 'Ganho' : 'Perdido', motivo_perda: modalFinalizar.type === 'perda' ? motivoPerda : null, motivo_fechamento: modalFinalizar.motivoEspecial || null, contabiliza_metricas: true, canal_captacao: modalFinalizar.type === 'ganho' ? (onboardingForm.canalCaptacao || null) : null, data_conclusao: timestamp });
+      if(leadAtual?.id === modalFinalizar.lead.id) buscarHistoricoCard(modalFinalizar.lead.id); setModalFinalizar(null); setMotivoPerda(''); setOnboardingForm({ dataHora: '', gestor: '', telefone: '', formato: 'Ligação', outroCadastro: 'Não', oQueFuncionou: '', oQueDeuErrado: '', canalCaptacao: '' }); mostrarMensagem(modalFinalizar.type === 'ganho' ? 'Dá um Appgas! Venda Fechada e Tarefa Criada!' : 'Perda registrada.');
     } catch(e) { mostrarMensagem('Erro ao gravar no CRM.', true); }
   };
 
@@ -2573,11 +2637,19 @@ function App() {
     if (loteSelecionados.length === 0) return mostrarMensagem('Selecione ao menos 1 lead.', true);
     if (!loteNovoResponsavel) return mostrarMensagem('Selecione o novo dono.', true);
     setUploadProgresso('Transferindo...'); const batch = writeBatch(db);
+    const novoResponsavelValor = loteNovoResponsavel === 'SEM_DONO' ? '' : loteNovoResponsavel;
     loteSelecionados.forEach(id => {
-      batch.update(doc(db, "leads", id), { responsavel: loteNovoResponsavel === 'SEM_DONO' ? '' : loteNovoResponsavel });
+      batch.update(doc(db, "leads", id), { responsavel: novoResponsavelValor });
       batch.set(doc(collection(db, "historico")), { id_lead: id, data_hora: new Date().toLocaleString('pt-BR'), timestamp: Date.now(), vendedor: vendedor, contato: 'SISTEMA', canal: 'Automático', observacao: `🔄 Transferido em Lote para: ${loteNovoResponsavel === 'SEM_DONO' ? 'Sem Dono' : loteNovoResponsavel}` });
     });
-    try { await batch.commit(); setModalLote(false); setLoteSelecionados([]); setUploadProgresso(''); mostrarMensagem(`Transferência de ${loteSelecionados.length} concluída!`); } catch(e) { setUploadProgresso(''); mostrarMensagem('Erro na transferência.', true); }
+    try {
+      await batch.commit();
+      // NOVO: aplica a mudança no estado local NA HORA (otimista), em vez de esperar o snapshot do
+      // Firestore propagar — corrige o card continuar mostrando "Sem Dono" logo após a transferência.
+      const idsTransferidos = new Set(loteSelecionados);
+      setLeads(prev => prev.map(l => idsTransferidos.has(l.id) ? { ...l, responsavel: novoResponsavelValor } : l));
+      setModalLote(false); setLoteSelecionados([]); setUploadProgresso(''); mostrarMensagem(`Transferência de ${loteSelecionados.length} concluída!`);
+    } catch(e) { setUploadProgresso(''); mostrarMensagem('Erro na transferência.', true); }
   };
 
   const renderDashboard = () => {
@@ -2596,13 +2668,13 @@ function App() {
     const taxaDescarte = leadsTrabalhados > 0 ? ((leadsPerdidos.length / leadsTrabalhados) * 100).toFixed(0) : 0;
 
     let totalAtrasados = 0; let totalOciosos = 0; let maisAtrasado = null; let maxDaysOcioso = -1;
-    leadsAtivos.forEach(l => { const urg = getUrgency(l); if (urg.status === 'atrasado' || urg.status === 'vacuo') totalAtrasados++; if (urg.status === 'ocioso') totalOciosos++; const lastInt = l.ultima_interacao || l.data_criacao; if (lastInt) { const bDays = getBusinessDaysDiff(lastInt, Date.now()); if (bDays > maxDaysOcioso) { maxDaysOcioso = bDays; maisAtrasado = l; } } });
+    leadsAtivos.forEach(l => { const urg = getUrgency(l); if (urg.status === 'atrasado') totalAtrasados++; if (urg.status === 'ocioso') totalOciosos++; const lastInt = l.ultima_interacao || l.data_criacao; if (lastInt) { const bDays = getBusinessDaysDiff(lastInt, Date.now()); if (bDays > maxDaysOcioso) { maxDaysOcioso = bDays; maisAtrasado = l; } } });
 
     let sumCiclo = 0; let fechamentos = 0;
     baseLeads.filter(l => l.status_venda && l.data_conclusao).forEach(l => { sumCiclo += (l.data_conclusao - l.data_criacao) / (1000 * 60 * 60 * 24); fechamentos++; });
     const cicloMedio = fechamentos > 0 ? (sumCiclo/fechamentos).toFixed(1) : 0;
 
-    const dataFunil = [ { name: '1. Lead', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.LEAD || !l.etapa_funil).length }, { name: 'P. Contato', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.PRIMEIRO_CONTATO).length }, { name: '2. Aguardando', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.AGUARDANDO_RESPOSTA).length }, { name: '3. Negociação', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.NEGOCIACAO).length }, { name: '4. Lançamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.CADASTRO).length }, { name: '5. Treinamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.TREINAMENTO).length }, ];
+    const dataFunil = [ { name: 'Fila de Espera', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.FILA_ESPERA).length }, { name: '1. Lead', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.LEAD || !l.etapa_funil).length }, { name: 'P. Contato', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.PRIMEIRO_CONTATO).length }, { name: '2. Aguardando', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.AGUARDANDO_RESPOSTA).length }, { name: '3. Negociação', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.NEGOCIACAO).length }, { name: '4. Lançamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.CADASTRO).length }, { name: '5. Treinamento', qtde: baseLeads.filter(l => l.etapa_funil === ETAPAS.TREINAMENTO).length }, ];
 
     let contagensCanais = {}; let timelineData = {}; let temposPorEtapa = {};
     let intencaoContato = { total: 0, sucessoTotal: 0, falhaTotal: 0, sucesso: { WhatsApp: 0, Ligação: 0, Outros: 0 }, falha: { WhatsApp: 0, Ligação: 0, Outros: 0 } };
@@ -2612,6 +2684,13 @@ function App() {
 
     const motivosCount = {}; leadsPerdidos.forEach(l => { const m = l.motivo_perda || 'Não informado'; motivosCount[m] = (motivosCount[m] || 0) + 1; });
     const dataMotivos = Object.keys(motivosCount).map(k => ({ name: k, qtde: motivosCount[k] })).sort((a,b) => b.qtde - a.qtde).slice(0, 5);
+
+    // NOVO: total de revendas fechadas por Canal de Captação (Captação ativa/Site/Redes sociais/
+    // Indicação), preenchido no fechamento da venda — usa leadsConvertidos, que já exclui os
+    // fechamentos de "Correção do Sistema" (contabiliza_metricas: false).
+    const canalCaptacaoCount = {};
+    leadsConvertidos.forEach(l => { const c = l.canal_captacao || 'Não informado'; canalCaptacaoCount[c] = (canalCaptacaoCount[c] || 0) + 1; });
+    const dataCanalCaptacao = Object.keys(canalCaptacaoCount).map(k => ({ name: k, value: canalCaptacaoCount[k] })).sort((a, b) => b.value - a.value);
 
     historicoDash.forEach(h => {
        const leadMatch = baseLeads.find(l => l.id === h.id_lead);
@@ -2726,7 +2805,7 @@ function App() {
 
          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6 mb-6">
             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4 flex flex-col" style={{borderLeftColor: BRAND.blueLight}}><h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Conversão p/ 2. Aguardando</h3><div className="flex justify-between items-center mb-4 px-2"><div className="text-center"><p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>Sucesso (Wpp/Lig)</p><p className="text-2xl md:text-3xl font-black" style={{color: BRAND.black}}>{totalLeadsSucesso}</p></div><div className="text-slate-300"><svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg></div><div className="text-center"><p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.blue}}>Aguardando</p><p className="text-2xl md:text-3xl font-black" style={{color: BRAND.blue}}>{totalLeadsAguardando}</p></div></div><div className="mt-auto pt-3 border-t border-slate-100 flex justify-between items-center"><span className="text-[10px] md:text-xs font-bold" style={{color: BRAND.gray}}>Drop (Perda de Interesse):</span><span className="text-sm font-black text-red-500">{taxaDrop}%</span></div></div>
-            <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4" style={{borderLeftColor: BRAND.yellow}}><h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Termômetro de Follow-up</h3><div className="grid grid-cols-2 gap-3 md:gap-4 mb-4"><div className="bg-slate-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>Ociosos</p><p className="text-xl md:text-2xl font-black" style={{color: BRAND.black}}>{totalOciosos}</p></div><div className="bg-red-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold text-red-400 mb-1">Atrasados/Vácuo</p><p className="text-xl md:text-2xl font-black text-red-700">{totalAtrasados}</p></div></div>{maisAtrasado && maxDaysOcioso > 2 && (<div className="p-3 rounded-lg flex items-center gap-3 border" style={{backgroundColor: `${BRAND.yellow}20`, borderColor: BRAND.yellow}}><span className="text-xl">🚨</span><div className="min-w-0"><p className="text-[9px] md:text-[10px] font-black uppercase" style={{color: BRAND.black}}>Revenda Mais Crítica</p><p className="text-sm font-bold truncate" style={{color: BRAND.black}}>{maisAtrasado.nome}</p><p className="text-xs font-medium truncate" style={{color: BRAND.gray}}>Esquecido há {maxDaysOcioso} dias úteis</p></div></div>)}</div>
+            <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4" style={{borderLeftColor: BRAND.yellow}}><h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-4" style={{color: BRAND.gray}}>Termômetro de Follow-up</h3><div className="grid grid-cols-2 gap-3 md:gap-4 mb-4"><div className="bg-slate-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>Ociosos</p><p className="text-xl md:text-2xl font-black" style={{color: BRAND.black}}>{totalOciosos}</p></div><div className="bg-red-50 p-3 md:p-4 rounded-xl"><p className="text-[10px] md:text-xs font-bold text-red-400 mb-1">Atrasados</p><p className="text-xl md:text-2xl font-black text-red-700">{totalAtrasados}</p></div></div>{maisAtrasado && maxDaysOcioso > 2 && (<div className="p-3 rounded-lg flex items-center gap-3 border" style={{backgroundColor: `${BRAND.yellow}20`, borderColor: BRAND.yellow}}><span className="text-xl">🚨</span><div className="min-w-0"><p className="text-[9px] md:text-[10px] font-black uppercase" style={{color: BRAND.black}}>Revenda Mais Crítica</p><p className="text-sm font-bold truncate" style={{color: BRAND.black}}>{maisAtrasado.nome}</p><p className="text-xs font-medium truncate" style={{color: BRAND.gray}}>Esquecido há {maxDaysOcioso} dias úteis</p></div></div>)}</div>
             <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm border-l-4 flex flex-col justify-center" style={{borderLeftColor: BRAND.blue}}><h3 className="text-xs md:text-sm font-bold uppercase tracking-widest mb-2" style={{color: BRAND.gray}}>Ciclo Médio de Vendas</h3><p className="text-xs md:text-sm mb-4" style={{color: BRAND.gray}}>Tempo desde a criação até o final (Ganho/Perda)</p><div className="flex items-end gap-2"><span className="text-5xl md:text-6xl font-light" style={{color: BRAND.black}}>{cicloMedio}</span><span className="text-lg md:text-xl font-medium mb-2" style={{color: BRAND.gray}}>dias</span></div></div>
          </div>
 
@@ -2735,6 +2814,13 @@ function App() {
          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-6">
             <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm"><div className="flex justify-between items-start mb-6"><div><h3 className="text-base md:text-lg font-bold" style={{color: BRAND.black}}>Tempo Médio por Etapa</h3><p className="text-[10px] text-slate-500 mt-1">Calculado a partir da data de upload/criação do lead no sistema até hoje.</p></div></div><div className="h-56 md:h-64"><ResponsiveContainer width="100%" height="100%"><BarChart data={dataTempos} margin={{ left: -20, right: 10, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0"/><XAxis dataKey="name" tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} /><YAxis tick={{fontSize: 10, fill: BRAND.gray}} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="dias" fill={BRAND.blueLight} radius={[4, 4, 0, 0]}><LabelList dataKey="dias" position="top" fill={BRAND.gray} fontSize={10} fontWeight="bold" formatter={(val) => `${val}d`} /></Bar></BarChart></ResponsiveContainer></div></div>
             <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm"><h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Motivos de Perda (Top 5)</h3><div className="h-56 md:h-64">{dataMotivos.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><BarChart data={dataMotivos} layout="vertical" margin={{ left: 10, right: 30, top: 10, bottom: 10 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0"/><XAxis type="number" hide /><YAxis dataKey="name" type="category" width={150} tick={{fontSize: 10, fill: BRAND.gray, fontWeight: 'bold'}} interval={0} /><Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Bar dataKey="qtde" fill="#ef4444" radius={[0, 4, 4, 0]}><LabelList dataKey="qtde" position="right" fill={BRAND.gray} fontSize={12} fontWeight="bold" /></Bar></BarChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Nenhuma perda registrada</div>}</div></div>
+         </div>
+
+         {/* NOVO: total de revendas fechadas por Canal de Captação (Captação ativa/Site/Redes
+             sociais/Indicação), preenchido no popup de Onboarding ao fechar a venda. */}
+         <div className="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm mb-6">
+            <h3 className="text-base md:text-lg font-bold mb-6" style={{color: BRAND.black}}>Revendas por Canal de Captação</h3>
+            <div className="h-56 md:h-64">{dataCanalCaptacao.length > 0 ? (<ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={dataCanalCaptacao} cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={5} dataKey="value">{dataCanalCaptacao.map((entry, index) => <Cell key={`cell-${index}`} fill={CORES_GRAFICO[index % CORES_GRAFICO.length]} />)}</Pie><Tooltip contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} /><Legend wrapperStyle={{fontSize: '11px', fontWeight: 'bold'}} /></PieChart></ResponsiveContainer>) : <div className="h-full flex items-center justify-center font-medium text-sm" style={{color: BRAND.gray}}>Nenhuma venda fechada no período</div>}</div>
          </div>
 
          {/* ITEM 9: análises geográficas, montadas a partir dos campos `cidade` e `uf` da coleção `leads`. */}
@@ -3635,7 +3721,7 @@ function App() {
                                     <span className="text-2xl">{horasSemResposta >= 24 ? '⚠️' : '⏱️'}</span>
                                     <span>
                                         {horasSemResposta >= 24 
-                                            ? `Alerta de Vácuo: O cliente não responde há ${diasSemResposta > 0 ? `${diasSemResposta} dia(s)` : `${horasSemResposta} horas`}. Faça um follow-up!` 
+                                            ? `Cliente sem resposta há ${diasSemResposta > 0 ? `${diasSemResposta} dia(s)` : `${horasSemResposta} horas`}. Faça um follow-up!` 
                                             : `Aguardando resposta do cliente há ${horasSemResposta} hora(s)...`}
                                     </span>
                                 </div>
@@ -4396,6 +4482,9 @@ function App() {
                     // (ou já foi) cliente Appgas e o vendedor precisa saber ANTES de ligar.
                     const revExistente = getRevendaExistente(lead);
 
+                    // NOVO: se a cidade do lead estiver na lista de priorização, mostra o rank pro vendedor.
+                    const prioridadeCidade = obterPrioridadeCidade(lead.cidade);
+
                     let kanbanCardBg = 'bg-white';
                     let kanbanCardBorder = 'border-[#e2e8f0]';
                     if (lead.etapa_funil === ETAPAS.FINALIZADO) {
@@ -4406,7 +4495,7 @@ function App() {
                             kanbanCardBg = 'bg-[#fee2e2]';
                             kanbanCardBorder = 'border-[#fca5a5]';
                         }
-                    } else if (urg.status === 'atrasado' || urg.status === 'ocioso' || urg.status === 'vacuo') {
+                    } else if (urg.status === 'atrasado' || urg.status === 'ocioso') {
                         kanbanCardBorder = 'border-red-400';
                     }
                     // A borda do alerta tem prioridade sobre a de urgência: não faz sentido cobrar
@@ -4434,7 +4523,12 @@ function App() {
                         )}
                         <div className="flex justify-between items-center text-[9px] md:text-[10px] font-black uppercase bg-slate-50/50 px-2 py-1 rounded-md mb-2">
                            <span className="truncate" style={{color: BRAND.gray}}>📍 {lead.cidade} - {lead.uf}</span>
-                           {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
+                           <div className="flex items-center gap-1 shrink-0">
+                              {prioridadeCidade && (
+                                 <span className="px-1.5 py-0.5 rounded font-black" style={{backgroundColor: `${BRAND.yellow}30`, color: BRAND.blueDark}} title={`Cidade priorizada — ${prioridadeCidade}º lugar na lista`}>🔥 #{prioridadeCidade}</span>
+                              )}
+                              {distNome && <span className="truncate font-bold ml-1" style={{color: BRAND.blue}}>🏢 {distNome}</span>}
+                           </div>
                         </div>
                         
                         <h4 className="font-black text-sm md:text-base mb-2 md:mb-3 leading-tight truncate" style={{color: BRAND.black}}>{lead.nome || 'Sem Nome'}</h4>
@@ -4731,6 +4825,35 @@ function App() {
                            </div>
                         ))}
                      </div>
+                 </div>
+             </div>
+
+             {/* NOVO: Priorização de Cidades — lista ordenada, com botões de subir/descer, que
+                 alimenta o badge "🔥 #N" mostrado nos cards do Kanban de Hunters. */}
+             <div className="mt-6 md:mt-8">
+                 <h3 className="text-lg md:text-xl font-bold mb-2" style={{color: BRAND.black}}>📍 Priorização de Cidades</h3>
+                 <p className="text-xs md:text-sm mb-4" style={{color: BRAND.gray}}>A ordem abaixo define o destaque mostrado no card do lead — 1º lugar é a maior prioridade.</p>
+                 <div className="flex gap-2 mb-4">
+                     <input type="text" className="flex-1 p-3 rounded-xl border outline-none font-bold text-sm" style={{color: BRAND.black}} placeholder="Nome da cidade (Ex: São Paulo)" value={novaCidadePrioridade} onChange={e => setNovaCidadePrioridade(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') adicionarCidadePrioridade(); }} />
+                     <button onClick={adicionarCidadePrioridade} className="text-white px-5 md:px-6 rounded-xl font-bold text-sm" style={{backgroundColor: BRAND.blue}}>Add</button>
+                 </div>
+                 <div className="bg-white rounded-2xl border overflow-hidden max-w-xl">
+                     {prioridadeCidades.length === 0 && (
+                         <p className="p-4 text-xs md:text-sm font-medium" style={{color: BRAND.gray}}>Nenhuma cidade priorizada ainda.</p>
+                     )}
+                     {prioridadeCidades.map((cidade, idx) => (
+                         <div key={idx} className="p-3 md:p-4 border-b last:border-0 flex justify-between items-center bg-white hover:bg-slate-50 gap-2">
+                             <div className="flex items-center gap-3 min-w-0">
+                                 <span className="shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-xs font-black text-white" style={{backgroundColor: BRAND.yellow, color: BRAND.black}}>{idx + 1}º</span>
+                                 <span className="font-bold text-xs md:text-sm truncate" style={{color: BRAND.black}}>{cidade}</span>
+                             </div>
+                             <div className="flex items-center gap-1 shrink-0">
+                                 <button onClick={() => moverCidadePrioridade(idx, -1)} disabled={idx === 0} className="w-8 h-8 rounded-lg border border-slate-200 font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:bg-slate-100 transition-colors" style={{color: BRAND.gray}} title="Subir prioridade">▲</button>
+                                 <button onClick={() => moverCidadePrioridade(idx, 1)} disabled={idx === prioridadeCidades.length - 1} className="w-8 h-8 rounded-lg border border-slate-200 font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:bg-slate-100 transition-colors" style={{color: BRAND.gray}} title="Descer prioridade">▼</button>
+                                 <button onClick={() => removerCidadePrioridade(idx)} className="text-red-500 hover:text-red-700 text-xs md:text-sm font-bold px-2">Excluir</button>
+                             </div>
+                         </div>
+                     ))}
                  </div>
              </div>
           </div>
@@ -5055,6 +5178,13 @@ function App() {
                   <div className="pt-4 border-t border-slate-200">
                       <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Aprendizados da Negociação</p>
                       <div className="space-y-3">
+                          <div>
+                              <label className="block text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>📡 Canal de Captação</label>
+                              <select className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm outline-none" style={{color: BRAND.black}} value={onboardingForm.canalCaptacao} onChange={e => setOnboardingForm({...onboardingForm, canalCaptacao: e.target.value})}>
+                                  <option value="">Selecione...</option>
+                                  {CANAIS_CAPTACAO.map(c => <option key={c} value={c}>{c}</option>)}
+                              </select>
+                          </div>
                           <div>
                               <label className="block text-[10px] md:text-xs font-bold mb-1" style={{color: BRAND.gray}}>✅ O que funcionou nessa venda?</label>
                               <textarea rows="2" placeholder="Ex: abordagem por indicação, demonstração do app na primeira ligação..." className="w-full border-2 border-slate-200 p-3 rounded-xl text-sm outline-none resize-none" value={onboardingForm.oQueFuncionou} onChange={e => setOnboardingForm({...onboardingForm, oQueFuncionou: e.target.value})} />
