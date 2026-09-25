@@ -5,11 +5,13 @@ import { getFirestore, collection, onSnapshot, addDoc, updateDoc, doc, writeBatc
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: "crm-vendas-4f4d2.firebaseapp.com",
-  projectId: "crm-vendas-4f4d2",
-  storageBucket: "crm-vendas-4f4d2.firebasestorage.app",
-  messagingSenderId: "602048749228",
-  appId: "1:602048749228:web:bd93de7fe0d618938f0909"
+  authDomain: "appgas-5fa9c.firebaseapp.com",
+  databaseURL: "https://appgas-5fa9c.firebaseio.com",
+  projectId: "appgas-5fa9c",
+  storageBucket: "appgas-5fa9c.appspot.com",
+  messagingSenderId: "419305312083",
+  appId: "1:419305312083:web:473c29e5778d772567dba6",
+  measurementId: "G-6JWQJYJCMT"
 };
 
 const app = initializeApp(firebaseConfig);
