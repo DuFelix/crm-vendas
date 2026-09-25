@@ -1194,15 +1194,16 @@ function App() {
     if (!vendedor.trim()) return mostrarMensagem('Digite o nome do usuário.', true);
     if (!senha.trim()) return mostrarMensagem('Digite a senha.', true);
     const nomeLimpo = vendedor.trim().toLowerCase();
-    
+
+    const vend = vendedores.find(v => v.nome.toLowerCase() === nomeLimpo);
     if (nomeLimpo === 'admin') { 
-        if (senha === 'admin') { setVendedor('admin'); setLogado(true); return; } else return mostrarMensagem('Senha de Admin incorreta.', true); 
+        if (senha === vend.senha) { setVendedor('admin'); setLogado(true); return; } else return mostrarMensagem('Senha de Admin incorreta.', true);
     }
     
     const vend = vendedores.find(v => v.nome.toLowerCase() === nomeLimpo);
     if (!vend) return mostrarMensagem('Usuário não encontrado.', true);
     if (!vend.ativo) return mostrarMensagem('Seu acesso está bloqueado.', true);
-    if (senha !== (vend.senha || '123456')) return mostrarMensagem('Senha incorreta.', true);
+    if (senha !== vend.senha) return mostrarMensagem('Senha incorreta.', true);
     
     setVendedor(vend.nome);
     setLogado(true);
